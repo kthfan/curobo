@@ -50,6 +50,20 @@ class TrajOptSolverResult(BaseSolverResult):
     maximum_trajectory_dt: Optional[torch.Tensor] = None
     minimum_trajectory_dt: Optional[torch.Tensor] = None
 
+    #: Position tolerance for non-terminal trajectory steps (meters).
+    #: When > 0, non-terminal steps are validated against this threshold.
+    position_tolerance_traj: float = 0.0
+
+    #: Orientation tolerance for non-terminal trajectory steps (radians).
+    #: When > 0, non-terminal steps are validated against this threshold.
+    orientation_tolerance_traj: float = 0.0
+
+    #: Boolean tensor of shape ``(horizon,)`` controlling which non-terminal
+    #: steps are checked.  ``True`` means the step is validated; ``False``
+    #: means it is skipped.  When ``None``, all non-terminal steps are
+    #: checked if the trajectory tolerances are set.
+    check_traj: Optional[torch.Tensor] = None
+
     def copy_at_batch_indices(self, other: "TrajOptSolverResult", mask: torch.Tensor) -> None:
         """Extend base method to also copy interpolated trajectory fields."""
         super().copy_at_batch_indices(other, mask)
@@ -127,6 +141,11 @@ class TrajOptSolverResult(BaseSolverResult):
             feasible=base_clone.feasible,
             cspace_error=base_clone.cspace_error,
             solution_state=base_clone.solution_state,
+            position_tolerance_traj=self.position_tolerance_traj,
+            orientation_tolerance_traj=self.orientation_tolerance_traj,
+            check_traj=(
+                self.check_traj.clone() if self.check_traj is not None else None
+            ),
         )
 
     @profiler.record_function("trajopt_solver_result/get_interpolated_plan")
@@ -156,7 +175,9 @@ class TrajOptSolverResult(BaseSolverResult):
             include_all_hybrid=False,
             sum_horizon=True,  # Checks constraints over horizon
         )
-        # 2. Check Convergence (Position and Orientation at the *last* timestep)
+        # 2. Check Convergence (Position and Orientation)
+        # Mirrors cuRoboV1's jit_feasible_success: validates goal (last step)
+        # AND optionally non-terminal steps when trajectory tolerances are set.
         converge_list = []
         cost_list = []
         goalset_index_list = []
@@ -164,28 +185,58 @@ class TrajOptSolverResult(BaseSolverResult):
             metric_name = self.metrics.convergence.names[k]
             # Values shape: (batch*num_seeds, horizon, num_links) or (batch*num_seeds, horizon)
             metric_values = self.metrics.convergence.values[k]
-
-            # Check convergence only at the last timestep (index -1)
-            last_step_values = metric_values[
-                :, -1:
-            ]  # Keep dim: (batch*num_seeds, 1, num_links) or (batch*num_seeds, 1)
+            horizon = metric_values.shape[1]
 
             if "position_tolerance" in metric_name:
+                # --- Goal convergence (last timestep) ---
+                last_step_values = metric_values[:, -1:]
                 cost_list.append(last_step_values)
-                converged = last_step_values < self.position_tolerance
-                converge_list.append(converged)
+                converged_goal = last_step_values < self.position_tolerance
+                converge_list.append(converged_goal)
+
+                # --- Trajectory convergence (non-terminal steps) ---
+                if self.position_tolerance_traj > 0.0 and horizon > 1:
+                    non_terminal_values = metric_values[:, :-1]
+                    converged_traj = non_terminal_values < self.position_tolerance_traj
+                    if self.check_traj is not None:
+                        # check_traj shape: (horizon,) or broadcastable; # True = check this step, False = skip
+                        traj_mask = self.check_traj[:horizon - 1]
+                        # Where traj_mask is False, force converged to True (skip check)
+                        converged_traj = converged_traj | ~traj_mask.view(1, -1, 1)
+                    # All non-terminal steps and links must pass
+                    converged_traj_all = torch.all(
+                        converged_traj.view(batch_size * num_seeds, -1), dim=-1
+                    ).unsqueeze(-1)  # Shape: (batch*num_seeds, 1)
+                    converge_list.append(converged_traj_all)
+
             elif "orientation_tolerance" in metric_name:
+                # --- Goal convergence (last timestep) ---
+                last_step_values = metric_values[:, -1:]
                 cost_list.append(last_step_values)
-                converged = last_step_values < self.orientation_tolerance
-                converge_list.append(converged)
+                converged_goal = last_step_values < self.orientation_tolerance
+                converge_list.append(converged_goal)
+
+                # --- Trajectory convergence (non-terminal steps) ---
+                if self.orientation_tolerance_traj > 0.0 and horizon > 1:
+                    non_terminal_values = metric_values[:, :-1]
+                    converged_traj = non_terminal_values < self.orientation_tolerance_traj
+                    if self.check_traj is not None:
+                        traj_mask = self.check_traj[:horizon - 1]
+                        converged_traj = converged_traj | ~traj_mask.view(1, -1, 1)
+                    converged_traj_all = torch.all(
+                        converged_traj.view(batch_size * num_seeds, -1), dim=-1
+                    ).unsqueeze(-1)
+                    converge_list.append(converged_traj_all)
+
             elif "goalset_index" in metric_name:
+                last_step_values = metric_values[:, -1:]
                 goalset_index_list.append(last_step_values)  # Keep last step index
 
         # Combine convergence criteria
         if converge_list:
             converged_all_links = torch.cat(
                 converge_list, dim=-1
-            )  # Shape: (batch*num_seeds, 1, num_links * 2)
+            )  # Shape: (batch*num_seeds, 1, num_checks)
             converged = torch.all(converged_all_links, dim=-1).squeeze(
                 -1
             )  # Shape: (batch*num_seeds,)

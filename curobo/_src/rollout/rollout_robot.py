@@ -80,10 +80,11 @@ class RobotRollout:
         """Create transition models, sampler, cost managers, and collision checker."""
         # Transition models: one for optimization, one for metrics
         self.transition_model = self.config.transition_model_cfg.class_type(
-            self.config.transition_model_cfg
+            self.config.transition_model_cfg, 
         )
+        compute_link_transforms = self.config.constraint_cfg.mesh_collision_cfg is not None
         self.metrics_transition_model = self.config.transition_model_cfg.class_type(
-            self.config.transition_model_cfg
+            self.config.transition_model_cfg, compute_link_transforms=compute_link_transforms ,
         )
 
         # Halton sampler

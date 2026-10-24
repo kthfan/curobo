@@ -1,4 +1,5 @@
 # Editors / IDEs
+# Editors / IDEs
 .vscode*
 *.code-workspace
 *swp
@@ -6,12 +7,14 @@
 \#*\#
 .\#*
 *Flymake log*
+.vs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
 
 # Distribution / packaging
 .Python
@@ -32,6 +35,11 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+nvidia_curobo*/
+
+# uv (library project — lockfile is intentionally not committed)
+uv.lock
+requirements.txt
 nvidia_curobo*/
 
 # uv (library project — lockfile is intentionally not committed)
@@ -67,12 +75,23 @@ dmypy.json
 .pyre/
 .pytype/
 
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
 # Translations
 *.mo
 *.pot
 
 # Logs
+# Logs
 *.log
+*logs/
+log/*
+benchmark/log/*
 *logs/
 log/*
 benchmark/log/*
@@ -80,7 +99,16 @@ local_settings.py
 
 # Sphinx / docs
 _build/
+# Sphinx / docs
+_build/
 docs/_source/
+docs/cpp_api/
+docs/api/*
+docs/modules.rst
+docs/setup.rst
+docs/install_instructions.rst
+docs/doxygen/html/*
+docs/doxygen/xml/*
 docs/cpp_api/
 docs/api/*
 docs/modules.rst
@@ -94,10 +122,12 @@ docs/doxygen/xml/*
 target/
 
 # Jupyter / IPython
+# Jupyter / IPython
 .ipynb_checkpoints
 profile_default/
 ipython_config.py
 
+# PEP 582
 # PEP 582
 __pypackages__/
 
@@ -114,13 +144,25 @@ venv.bak/
 .ropeproject
 
 # mkdocs
+# mkdocs
 /site
 
+# Cython debug
 # Cython debug
 cython_debug/
 
 # Project-specific outputs
+# Project-specific outputs
 experiments/
+**/outputs/
+**/datasets/
+external/*
+public/*
+docker/pkgs/*
+
+# Profiling / tracing
+*.ncu*
+*.nsys*
 **/outputs/
 **/datasets/
 external/*
@@ -139,7 +181,19 @@ docker/pkgs/*
 # Data / asset files (large or generated)
 *.hdf5
 *.npy
+*.nvcudmp
+*.profile
+*.etli
+
+# Data / asset files (large or generated)
+*.hdf5
+*.npy
 *.npz
+*.zip
+*.tar
+*.t
+*.p
+*.pt
 *.zip
 *.tar
 *.t
@@ -152,10 +206,15 @@ docker/pkgs/*
 *.glb
 *.onnx
 *.usd
+*.usd
 *.usda
 *.csv
 *.json
+*.csv
+*.json
 *.SLDPRT
+*.xacro
+*.gazebo
 *.xacro
 *.gazebo
 *tfevents*
@@ -165,3 +224,12 @@ docker/pkgs/*
 *.svg
 *.SVG
 !docs/images/*.svg
+
+/examples/*.stl
+
+# Generated images (allow tracked docs assets)
+*.svg
+*.SVG
+!docs/images/*.svg
+
+.crosshost/

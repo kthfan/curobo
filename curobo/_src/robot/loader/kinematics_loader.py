@@ -17,9 +17,10 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.autograd.profiler as profiler
+import trimesh
 
 from curobo._src.curobolib.cuda_ops.kinematics import KinematicsFusedFunction
-from curobo._src.geom.types import tensor_sphere
+from curobo._src.geom.types import Mesh, tensor_sphere
 from curobo._src.robot.loader.kinematics_loader_cfg import KinematicsLoaderCfg
 from curobo._src.robot.parser.parser_urdf import UrdfRobotParser
 from curobo._src.robot.types.cspace_params import CSpaceParams
@@ -36,7 +37,7 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.state.state_joint_ops import append_joints_to_state
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
-from curobo._src.util.logging import log_and_raise
+from curobo._src.util.logging import log_and_raise, log_warn
 
 
 class KinematicsLoader(KinematicsLoaderCfg):
@@ -168,10 +169,77 @@ class KinematicsLoader(KinematicsLoaderCfg):
             link_inertias=self._link_inertias,
             device_cfg=self.device_cfg,
             grasp_contact_link_names=self.grasp_contact_link_names,
+            max_triangles_per_link=self.max_triangles_per_link,
+            extra_collision_meshes=self.extra_collision_meshes,
+            mesh_collision_ignored_link_names=self.mesh_collision_ignored_link_names,
         )
         self._kinematics_config.make_contiguous()
         if self.asset_root_path is not None and self.asset_root_path != "":
             self._kinematics_parser.add_absolute_path_to_link_meshes(self.asset_root_path)
+        if self.load_collision_meshes:
+            # Must run after mesh asset paths are made absolute above.
+            self._kinematics_config.link_collision_meshes = self._load_link_collision_meshes()
+
+    def _load_link_collision_meshes(self) -> Dict[str, Mesh]:
+        """Load exact triangle collision geometry for every collision link.
+
+        Each link's ``<collision>`` elements are concatenated into a single triangle mesh in the
+        link-local frame, with the element ``<origin>`` and mesh ``scale`` baked into the
+        vertices. Links without collision geometry fall back to their visual geometry.
+
+        Returns:
+            Mapping from link name to its link-local collision mesh. Links with no usable
+            geometry, and links listed in
+            :attr:`KinematicsLoaderCfg.mesh_collision_ignored_link_names`, are omitted.
+        """
+        ignored = set(self.mesh_collision_ignored_link_names or ())
+        unknown = ignored.difference(self.collision_link_names)
+        if unknown:
+            log_warn(
+                "mesh_collision_ignored_link_names contains links that are not in "
+                f"collision_link_names: {sorted(unknown)}"
+            )
+        link_meshes: Dict[str, Mesh] = {}
+        for link_name in self.collision_link_names:
+            if link_name in ignored:
+                continue
+            if link_name in self.extra_links:
+                # Virtual attachment frames (e.g. "attached_object") are not in the URDF and
+                # carry no static geometry. Attached objects stay sphere-based.
+                continue
+            geometry = self._kinematics_parser.get_link_geometry(
+                link_name, use_collision_mesh=True
+            )
+            if len(geometry) == 0:
+                geometry = self._kinematics_parser.get_link_geometry(link_name)
+                if len(geometry) > 0:
+                    log_warn(
+                        f"link '{link_name}' has no <collision> geometry, "
+                        "falling back to <visual> geometry for the mesh collision constraint"
+                    )
+            if len(geometry) == 0:
+                log_warn(
+                    f"link '{link_name}' has no collision or visual geometry, "
+                    "it will be ignored by the mesh collision constraint"
+                )
+                continue
+
+            trimesh_list = [g.get_trimesh_mesh(transform_with_pose=True) for g in geometry]
+            if len(trimesh_list) == 1:
+                merged = trimesh_list[0]
+            else:
+                merged = trimesh.util.concatenate(trimesh_list)
+            if len(merged.faces) == 0:
+                log_warn(f"link '{link_name}' collision geometry has no triangles, ignoring")
+                continue
+
+            link_meshes[link_name] = Mesh(
+                name=link_name,
+                vertices=merged.vertices,
+                faces=merged.faces,
+                pose=[0, 0, 0, 1, 0, 0, 0],
+            )
+        return link_meshes
 
     def add_link(self, link_params: LinkParams):
         """Add an extra link to the robot kinematics tree.

@@ -824,7 +824,6 @@ if __name__ == "__main__":
         default="curobov2_0kg",
         help="File name prefix to use to save benchmark results",
     )
-
     parser.add_argument(
         "--mesh",
         action="store_true",

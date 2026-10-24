@@ -50,6 +50,7 @@ Public API Modules:
 - :mod:`curobo.inverse_kinematics` - Inverse kinematics solver
 - :mod:`curobo.trajectory_optimizer` - Trajectory optimization
 - :mod:`curobo.motion_planner` - Motion planning
+- :mod:`curobo.multi_waypoint_planner` - Multi-waypoint motion planning
 - :mod:`curobo.model_predictive_control` - Model predictive control
 - :mod:`curobo.motion_retargeter` - Motion retargeting using inverse kinematics and model predictive control
 - :mod:`curobo.scene` - Scene representation with obstacles

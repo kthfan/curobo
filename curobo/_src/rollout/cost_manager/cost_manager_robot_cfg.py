@@ -15,9 +15,11 @@ from typing import TYPE_CHECKING, Dict, Optional
 # CuRobo
 from curobo._src.cost.cost_cspace_cfg import CSpaceCostCfg
 from curobo._src.cost.cost_cspace_dist_cfg import CSpaceDistCostCfg
+from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
 from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
+from curobo._src.cost.cost_robot_mesh_constraint_cfg import RobotMeshConstraintCfg
 from curobo._src.types.device_cfg import DeviceCfg
 
 if TYPE_CHECKING:
@@ -62,6 +64,15 @@ class RobotCostManagerCfg:
     #: disables pose-based objectives.
     tool_pose_cfg: Optional[ToolPoseCostCfg] = None
 
+    # EEF corridor bound
+    #: End-effector position/rotation corridor cost. None disables.
+    #: Activate per-axis constraints at runtime via
+    #: ``cost_manager.get_cost("ee_bound").update_margins(margins)``.
+    eef_bound_cfg: Optional[EEFBoundCostCfg] = None
+
+    # Robot mesh collision cost configuration.
+    mesh_collision_cfg: Optional[RobotMeshConstraintCfg] = None
+
     def __post_init__(self):
         from .cost_manager_robot import RobotCostManager
 
@@ -85,6 +96,8 @@ class RobotCostManagerCfg:
             "start_cspace_dist_cfg": CSpaceDistCostCfg,
             "target_cspace_dist_cfg": CSpaceDistCostCfg,
             "tool_pose_cfg": ToolPoseCostCfg,
+            "eef_bound_cfg": EEFBoundCostCfg,
+            "mesh_collision_cfg": RobotMeshConstraintCfg,
         }
         data = {}
         for k, cfg_class in cost_key_map.items():
@@ -93,6 +106,8 @@ class RobotCostManagerCfg:
 
         if "scene_collision_cfg" in data and scene_collision_checker is not None:
             data["scene_collision_cfg"].scene_collision_checker = scene_collision_checker
+        if "mesh_collision_cfg" in data and scene_collision_checker is not None:
+            data["mesh_collision_cfg"].scene_collision_checker = scene_collision_checker
 
         return RobotCostManagerCfg(**data)
 

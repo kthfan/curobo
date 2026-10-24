@@ -53,6 +53,17 @@ class TrajOptSolverCfg:
     #: Orientation error threshold (radians) for the final end-effector
     #: pose.
     orientation_tolerance: float = 0.05
+    #: Position error threshold (meters) for non-terminal trajectory steps.
+    #: When ``> 0``, the solver validates that all non-terminal steps stay
+    #: within this threshold.  Mirrors cuRoboV1's
+    #: ``position_threshold_traj``.  Set to ``0.0`` to skip trajectory-level
+    #: position checking (default, backward-compatible).
+    position_tolerance_traj: float = 0.0
+    #: Orientation error threshold (radians) for non-terminal trajectory
+    #: steps.  When ``> 0``, the solver validates that all non-terminal
+    #: steps stay within this threshold.  Mirrors cuRoboV1's
+    #: ``rotation_threshold_traj``.  Set to ``0.0`` to skip (default).
+    orientation_tolerance_traj: float = 0.0
     #: Distance threshold at which the collision cost activates during
     #: optimization.
     optimizer_collision_activation_distance: float = 0.01
@@ -127,6 +138,8 @@ class TrajOptSolverCfg:
         num_seeds: int = 4,
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
+        position_tolerance_traj: float = 0.0,
+        orientation_tolerance_traj: float = 0.0,
         use_cuda_graph: bool = True,
         random_seed: int = 123,
         optimizer_collision_activation_distance: float = 0.01,
@@ -161,6 +174,8 @@ class TrajOptSolverCfg:
             num_seeds: Number of optimization seeds.
             position_tolerance: Position tolerance for success.
             orientation_tolerance: Orientation tolerance for success.
+            position_tolerance_traj: Position tolerance for non-terminal trajectory steps.
+            orientation_tolerance_traj: Orientation tolerance for non-terminal trajectory steps.
             use_cuda_graph: Enable CUDA graph capture for solver rollouts
                 and optimizers. Defaults to True and should be left enabled
                 for normal integration/runtime code. cuRobo manages graph
@@ -247,6 +262,8 @@ class TrajOptSolverCfg:
             num_seeds=num_seeds,
             position_tolerance=position_tolerance,
             orientation_tolerance=orientation_tolerance,
+            position_tolerance_traj=position_tolerance_traj,
+            orientation_tolerance_traj=orientation_tolerance_traj,
             optimizer_collision_activation_distance=optimizer_collision_activation_distance,
             self_collision_check=self_collision_check,
             minimum_trajectory_dt=minimum_trajectory_dt,

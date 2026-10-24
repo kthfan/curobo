@@ -16,9 +16,11 @@ import torch
 # CuRobo
 from curobo._src.cost.cost_base import BaseCost
 from curobo._src.cost.cost_cspace_dist import CSpaceDistCost
+from curobo._src.cost.cost_eef_bound import EEFBoundCost
 from curobo._src.cost.cost_scene_collision import SceneCollisionCost
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_tool_pose import ToolPoseCost
+from curobo._src.cost.cost_robot_mesh_constraint import RobotMeshConstraint
 from curobo._src.geom.collision.collision_scene import SceneCollision
 from curobo._src.rollout.goal_registry import GoalRegistry
 from curobo._src.rollout.metrics import CostCollection
@@ -187,6 +189,18 @@ class RobotCostManager:
             config.target_cspace_dist_cfg.initialize_from_transition_model(transition_model)
             self.register_cost("target_cspace_dist", CSpaceDistCost(config.target_cspace_dist_cfg))
 
+        # EEF corridor bound
+        if config.eef_bound_cfg is not None:
+            self.register_cost("eef_bound", EEFBoundCost(config.eef_bound_cfg))
+
+        # Robot mesh collision
+        if config.mesh_collision_cfg is not None and scene_collision_checker is not None:
+            config.mesh_collision_cfg.initialize_from_transition_model(transition_model)
+            config.mesh_collision_cfg.scene_collision_checker = scene_collision_checker
+            self.register_cost(
+                "mesh_collision", RobotMeshConstraint(config.mesh_collision_cfg)
+            )
+
         self._initialized = True
         log_info(f"Initialized {len(self.costs)} costs for robot rollout")
 
@@ -282,6 +296,22 @@ class RobotCostManager:
                     )
                     cost_collection.add(cost_value, "scene_collision")
 
+        # Robot mesh collision
+        if self.has_cost("mesh_collision"):
+            mesh_collision_cost = self.get_cost("mesh_collision")
+            if mesh_collision_cost.enabled:
+                with self._stream_context("mesh_collision"):
+                    idxs_env = (
+                        goal.idxs_env.view(-1)
+                        if goal is not None and goal.idxs_env is not None
+                        else None
+                    )
+                    cost_value = mesh_collision_cost.forward(
+                        state.cuda_robot_model_state,
+                        idxs_env,
+                    )
+                    cost_collection.add(cost_value, "mesh_collision")
+                    
         synchronize_cuda_streams(self._costs_events, self.device_cfg.device)
         return cost_collection
 

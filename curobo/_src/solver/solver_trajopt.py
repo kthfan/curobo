@@ -56,6 +56,12 @@ class TrajOptSolver:
             use_cuda_graph=self.config.use_cuda_graph,
         )
         rollout_instance.rollout_instance_name = "interpolated_rollout"
+
+        # disable mesh collision check for interpolated_rollout
+        if rollout_instance.metrics_constraint_manager.has_cost("mesh_collision"):
+            mesh_collision_cost = rollout_instance.metrics_constraint_manager.get_cost("mesh_collision")
+            mesh_collision_cost.disable_cost()
+
         self.core.additional_metrics_rollouts["interpolated_rollout"] = rollout_instance
 
         # TrajOpt-specific: trajectory seed generator and interpolation buffers

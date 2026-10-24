@@ -34,6 +34,19 @@ class KinematicsState:
     #: Static collision geometry descriptor.
     robot_collision_geometry: Optional[RobotCollisionGeometry] = None
 
+    #: Homogeneous transform of every link ``[batch, horizon, num_links, 3, 4]`` as row-major
+    #: ``[R | t]``, indexed by internal body index
+    #: (:attr:`KinematicsParams.link_name_to_idx_map`).
+    #:
+    #: Only populated when :attr:`Kinematics.compute_link_transforms` is True. Unlike
+    #: :attr:`tool_poses`, this covers *all* links, not just ``tool_frames``.
+    #:
+    #: .. warning::
+    #:     This aliases a forward-kinematics scratch buffer that is overwritten by the next
+    #:     FK call, and it is non-differentiable. Consume it immediately or call
+    #:     :meth:`clone`.
+    link_transforms: Optional[torch.Tensor] = None
+
     @property
     def tool_frames(self) -> List[str]:
         if self.tool_poses is not None:
@@ -55,6 +68,9 @@ class KinematicsState:
                 if self.robot_collision_geometry is not None
                 else None
             ),
+            link_transforms=(
+                self.link_transforms.clone() if self.link_transforms is not None else None
+            ),
         )
 
     def detach(self):
@@ -70,6 +86,9 @@ class KinematicsState:
                 if self.robot_collision_geometry is not None
                 else None
             ),
+            link_transforms=(
+                self.link_transforms.detach() if self.link_transforms is not None else None
+            ),
         )
 
     def copy_(self, other: KinematicsState):
@@ -81,6 +100,8 @@ class KinematicsState:
             self.tool_poses.copy_(other.tool_poses)
         if self.robot_com is not None:
             self.robot_com.copy_(other.robot_com)
+        if self.link_transforms is not None and other.link_transforms is not None:
+            self.link_transforms.copy_(other.link_transforms)
         return self
 
     def __len__(self):
@@ -101,4 +122,5 @@ class KinematicsState:
             tool_poses=self.tool_poses[idx] if self.tool_poses is not None else None,
             robot_com=self.robot_com[idx] if self.robot_com is not None else None,
             robot_collision_geometry=self.robot_collision_geometry,
+            link_transforms=self.link_transforms[idx] if self.link_transforms is not None else None,
         )

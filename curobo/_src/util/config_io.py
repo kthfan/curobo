@@ -34,6 +34,19 @@ Loader.add_implicit_resolver(
     list("-+0123456789."),
 )
 
+# write pretty yaml
+class FlowDumper(yaml.SafeDumper):
+    pass
+
+def flow_seq_representer(dumper, data):
+    return dumper.represent_sequence(
+        'tag:yaml.org,2002:seq',
+        data,
+        flow_style=True
+    )
+
+FlowDumper.add_representer(list, flow_seq_representer)
+FlowDumper.add_representer(tuple, flow_seq_representer)
 
 def join_path(path1: Union[str, Path], path2: Union[str, Path]) -> str:
     """Join two paths, considering OS specific path separators.
@@ -111,6 +124,15 @@ def write_yaml(data: Dict, file_path: str) -> None:
     with open(file_path, "w") as file:
         file.write(yaml_text)
 
+def write_pretty_yaml(data: Dict, file_path: str):
+    """Write dictionary to yaml file.
+
+    Args:
+        data: Dictionary to write to yaml file.
+        file_path: Path to write the yaml file.
+    """
+    with open(file_path, "w") as file:
+        yaml.dump(data, file, Dumper=FlowDumper, sort_keys=False)
 
 def copy_file_to_path(source_file: str, destination_path: str) -> str:
     """Copy file from source to destination.

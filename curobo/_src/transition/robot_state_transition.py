@@ -42,12 +42,13 @@ class RobotStateTransition:
     def __init__(
         self,
         config: RobotStateTransitionCfg,
+        compute_link_transforms : Optional[bool] = False,
     ):
         self.config = config
         self.batch_size = self.config.batch_size
         self.interpolation_steps = self.config.interpolation_steps
         self.dt = self.config.dt_traj_params.base_dt
-        self.robot_model = Kinematics(self.config.robot_config.kinematics, compute_jacobian=False)
+        self.robot_model = Kinematics(self.config.robot_config.kinematics, compute_jacobian=False, compute_link_transforms=compute_link_transforms)
         # update cspace to store joint names in the order given by robot model:
         self.num_dof = self.robot_model.get_dof()
         self.robot_dynamics = None

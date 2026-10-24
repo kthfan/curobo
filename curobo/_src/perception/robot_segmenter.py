@@ -16,6 +16,7 @@ from torch.profiler import record_function
 
 from curobo._src.curobolib.cuda_ops.tensor_checks import (
     check_float16_tensors,
+    check_bfloat16_tensors,
     check_float32_tensors,
 )
 from curobo._src.geom.cv import get_projection_rays, project_depth_using_rays
@@ -134,6 +135,7 @@ class RobotSegmenter:
         if len(depth_image.shape) == 2:
             depth_image = depth_image.unsqueeze(0)
         points = project_depth_using_rays(depth_image, self._projection_rays)
+        points = points.to(dtype=camera_obs.depth_image.dtype)
 
         return points
 
@@ -250,6 +252,7 @@ class RobotSegmenter:
             gq_out=self._out_gq,
             gpt_out=self._out_gpt,
         )
+        points_in_robot_frame = points_in_robot_frame.to(dtype=self._ops_dtype)
 
         robot_spheres = robot_spheres.to(dtype=self._ops_dtype)
         robot_spheres = robot_spheres.view(robot_spheres.shape[0], -1, 4)
@@ -261,6 +264,8 @@ class RobotSegmenter:
                 )
         if robot_spheres.dtype == torch.float16:
             check_float16_tensors(robot_spheres.device, robot_spheres=robot_spheres)
+        elif robot_spheres.dtype == torch.bfloat16:
+            check_bfloat16_tensors(robot_spheres.device, robot_spheres=robot_spheres)
         else:
             check_float32_tensors(robot_spheres.device, robot_spheres=robot_spheres)
         if points_in_robot_frame.dim() == 2:

@@ -66,6 +66,8 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
         if self.collision_constraint is not None:
             self.collision_constraint.config.update_num_spheres(self.kinematics.total_spheres)
             self.collision_constraint.setup_batch_tensors(batch_size, horizon)
+        if self.mesh_constraint is not None:
+            self.mesh_constraint.setup_batch_tensors(batch_size, horizon)
 
     def get_kinematics(self, joint_position: torch.Tensor) -> KinematicsState:
         """Compute forward kinematics for joint positions.
@@ -169,6 +171,33 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
         )
         d = self.collision_constraint.forward(state, idxs_env_query=env_query_idx)
         return d
+
+    def get_mesh_collision_constraint(
+        self,
+        state: KinematicsState,
+        env_query_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Get the exact triangle-geometry collision constraint.
+
+        Args:
+            state: Kinematics state carrying ``link_transforms``.
+            env_query_idx: Optional environment indices for batched environments.
+
+        Returns:
+            Constraint tensor [batch, horizon]. Non-zero where the exact robot geometry
+            collides with the scene. All zeros when the mesh constraint is disabled.
+        """
+        link_transforms = state.link_transforms
+        if self.mesh_constraint is None:
+            return torch.zeros(
+                link_transforms.shape[:2],
+                device=link_transforms.device,
+                dtype=link_transforms.dtype,
+            )
+        self.mesh_constraint.setup_batch_tensors(
+            link_transforms.shape[0], link_transforms.shape[1]
+        )
+        return self.mesh_constraint.forward(state, idxs_env_query=env_query_idx)
 
     def get_self_collision_distance(self, x_sph: torch.Tensor) -> torch.Tensor:
         """Get self-collision distance for robot spheres.
@@ -368,6 +397,9 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
         if self.collision_constraint is not None:
             d_world = self.get_collision_constraint(kin_state, env_query_idx)
             sum_list.append(d_world.sum(dim=-1, keepdim=True))
+        if self.mesh_constraint is not None:
+            d_mesh = self.get_mesh_collision_constraint(kin_state, env_query_idx)
+            sum_list.append(d_mesh.unsqueeze(-1))
         d_mask = torch.sum(torch.cat(sum_list, dim=-1), dim=-1) == 0.0
         return d_mask
 

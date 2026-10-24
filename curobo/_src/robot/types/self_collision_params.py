@@ -107,7 +107,9 @@ class SelfCollisionKinematicsCfg:
         )
         num_self_collisions = collision_pairs.shape[0]
         max_threads_per_block = 512
-        log_debug("Self Collision skipped %: " + str(100 * float(skip_count) / all_val))
+        # all_val is 0 when no sphere pair is a candidate (e.g. a single collision link).
+        skipped_percent = 100 * float(skip_count) / all_val if all_val > 0 else 0.0
+        log_debug("Self Collision skipped %: " + str(skipped_percent))
         log_debug("Self Collision count: " + str(num_self_collisions))
         log_debug(
             "Self Collision per thread: "

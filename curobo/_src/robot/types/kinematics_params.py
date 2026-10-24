@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -17,6 +17,10 @@ from curobo._src.robot.types.joint_types import JointType
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise
+
+if TYPE_CHECKING:
+    from curobo._src.geom.data.data_robot_mesh import RobotMeshData
+    from curobo._src.geom.types import Mesh
 
 
 @dataclass
@@ -112,6 +116,15 @@ class KinematicsParams:
     #: Mapping of link name to link index. This is used to get link index from link name.
     link_name_to_idx_map: Optional[Dict[str, int]] = None
 
+    #: Exact triangle-mesh collision geometry per link, keyed by link name. Each mesh is in the
+    #: **link-local** frame with the URDF ``<origin>`` and ``scale`` already baked into its
+    #: vertices (so ``Mesh.pose`` is identity).
+    #:
+    #: Only populated when :attr:`KinematicsLoaderCfg.load_collision_meshes` is True. This is the
+    #: exact geometry counterpart of :attr:`link_spheres`, used by the exact-mesh collision
+    #: constraint. It is *not* used by the sphere-based collision cost.
+    link_collision_meshes: Optional[Dict[str, "Mesh"]] = None
+
     #: Total number of spheres that represent the robot's geometry.
     total_spheres: int = 0
 
@@ -140,6 +153,18 @@ class KinematicsParams:
     #: Names of links that are in contact with the gripper. This is used to disable collision for
     #: these links during grasp.
     grasp_contact_link_names: Optional[List[str]] = None
+
+    #: Per-link triangle budget for the exact-mesh collision constraint. Either one value for
+    #: every link or a per-link mapping; links not covered fall back to
+    #: :data:`~curobo._src.geom.data.data_robot_mesh.DEFAULT_MAX_TRIANGLES_PER_LINK`.
+    max_triangles_per_link: Union[None, int, Dict[str, int]] = None
+
+    #: Triangle slots to reserve per link for geometry that is only known at runtime, such as
+    #: a gripper or an attached object. Exact-mesh counterpart of ``extra_collision_spheres``.
+    extra_collision_meshes: Optional[Dict[str, int]] = None
+
+    #: Links excluded from the exact-mesh collision constraint entirely, by name.
+    mesh_collision_ignored_link_names: Optional[List[str]] = None
 
     #: Link indices sorted by tree depth level (BFS level-order). Links at the same depth
     #: have no parent-child dependencies, enabling parallel processing.
@@ -318,6 +343,11 @@ class KinematicsParams:
             ),
             link_name_to_idx_map=(
                 self.link_name_to_idx_map.copy() if self.link_name_to_idx_map is not None else None
+            ),
+            link_collision_meshes=(
+                dict(self.link_collision_meshes)
+                if self.link_collision_meshes is not None
+                else None
             ),
             total_spheres=self.total_spheres,
             debug=self.debug.copy() if self.debug is not None else None,
@@ -593,6 +623,58 @@ class KinematicsParams:
         self.link_spheres[:, link_sphere_index, :] = self.reference_link_spheres[
             :, link_sphere_index, :
         ]
+
+    # -- Exact-mesh collision geometry --
+
+    def get_robot_mesh_data(self) -> "RobotMeshData":
+        """Return the packed exact-mesh collision geometry, building it on first use.
+
+        The result is cached on this object, which every solver's kinematics instance shares.
+        That makes :meth:`update_link_mesh` behave like :meth:`update_link_spheres`: one call
+        is seen by IK, trajectory optimization and the graph planner alike.
+
+        Returns:
+            The shared :class:`~curobo._src.geom.data.data_robot_mesh.RobotMeshData`.
+        """
+        if getattr(self, "_robot_mesh_data", None) is None:
+            from curobo._src.geom.data.data_robot_mesh import RobotMeshData
+
+            if self.link_collision_meshes is None:
+                log_and_raise(
+                    "link collision meshes are not loaded, "
+                    "load the robot with load_collision_meshes=True"
+                )
+            self._robot_mesh_data = RobotMeshData.from_link_meshes(
+                link_meshes=self.link_collision_meshes,
+                link_name_to_idx_map=self.link_name_to_idx_map,
+                num_links=len(self.link_name_to_idx_map),
+                device_cfg=self.device_cfg,
+                max_triangles_per_link=self.max_triangles_per_link,
+                ignored_link_names=self.mesh_collision_ignored_link_names,
+                extra_link_triangles=self.extra_collision_meshes,
+            )
+        return self._robot_mesh_data
+
+    def update_link_mesh(self, link_name: str, triangles):
+        """Write link-local collision geometry into a link's reserved triangle slots.
+
+        Exact-mesh counterpart of :meth:`update_link_spheres`. The write is in-place, so no
+        GPU buffer is reallocated and captured CUDA graphs stay valid.
+
+        Args:
+            link_name: Name of the link. Its slots must have been reserved via
+                ``extra_collision_meshes`` in the robot config.
+            triangles: Link-local ``[n, 3, 3]`` triangle soup or a mesh.
+        """
+        self.get_robot_mesh_data().update_link_mesh(link_name, triangles)
+
+    def disable_link_mesh(self, link_name: str):
+        """Deactivate every triangle slot of a link in the exact-mesh constraint.
+
+        Args:
+            link_name: Name of the link to deactivate.
+        """
+        self.get_robot_mesh_data().disable_link_mesh(link_name)
 
 
     def get_link_masses_com(self, link_name: str) -> torch.Tensor:

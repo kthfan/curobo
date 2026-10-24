@@ -212,12 +212,18 @@ class MotionPlanner:
         use_implicit_goal: bool = True,
         max_attempts: int = 5,
         enable_graph_attempt: int = 1,
+        ik_seed_config=None,
     ) -> Optional[TrajOptSolverResult]:
         """Plan a trajectory to reach target tool poses.
 
         Goalset is auto-detected from ``goal_tool_poses.num_goalset``.  When
         ``num_goalset > 1`` the planner uses a simpler IK+TrajOpt loop without
         graph seeding.
+
+        Args:
+            ik_seed_config: Optional user-provided IK seeds forwarded to
+                ``ik_solver.solve_pose``.  Shape ``(batch, n, dof)``.  Fewer
+                than ``num_seeds`` seeds are padded with generated seeds.
         """
         if current_state.ndim > 2:
             log_and_raise(f"current_state must be a 2D tensor, got shape: {current_state.shape}")
@@ -225,10 +231,12 @@ class MotionPlanner:
         if goal_tool_poses.num_goalset > 1:
             return self._plan_pose_goalset(
                 goal_tool_poses, current_state, use_implicit_goal, max_attempts,
+                ik_seed_config=ik_seed_config,
             )
 
         return self._plan_pose_single(
             goal_tool_poses, current_state, max_attempts, enable_graph_attempt,
+            ik_seed_config=ik_seed_config,
         )
 
     def _plan_pose_single(
@@ -237,6 +245,7 @@ class MotionPlanner:
         current_state: JointState,
         max_attempts: int,
         enable_graph_attempt: int,
+        ik_seed_config=None,
     ) -> Optional[TrajOptSolverResult]:
         """Single-goal planning with retry, seed repair, and graph seeding."""
         trajopt_result = None
@@ -251,6 +260,7 @@ class MotionPlanner:
                 goal_tool_poses,
                 return_seeds=num_seeds,
                 current_state=current_state,
+                seed_config=ik_seed_config,
             )
             total_time += ik_result.total_time
             solve_time += ik_result.solve_time
@@ -302,6 +312,7 @@ class MotionPlanner:
         current_state: JointState,
         use_implicit_goal: bool = True,
         max_attempts: int = 10,
+        ik_seed_config=None,
     ) -> Optional[TrajOptSolverResult]:
         """Goalset planning: IK + TrajOpt, no graph seeding."""
         for _ in range(max_attempts):
@@ -309,6 +320,7 @@ class MotionPlanner:
                 goal_tool_poses,
                 return_seeds=self.trajopt_solver.config.num_seeds,
                 current_state=current_state,
+                seed_config=ik_seed_config,
             )
             if torch.count_nonzero(ik_result.success) == 0:
                 return None

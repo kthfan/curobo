@@ -57,6 +57,9 @@ def check_float16_tensors(device: torch.device, **tensors: torch.Tensor) -> None
     """Validate all tensors: device + contiguous + float16."""
     _check_tensors(device, torch.float16, **tensors)
 
+def check_bfloat16_tensors(device: torch.device, **tensors: torch.Tensor) -> None:
+    """Validate all tensors: device + contiguous + float16."""
+    _check_tensors(device, torch.bfloat16, **tensors)
 
 def check_int8_tensors(device: torch.device, **tensors: torch.Tensor) -> None:
     """Validate all tensors: device + contiguous + int8."""

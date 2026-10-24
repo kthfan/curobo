@@ -158,6 +158,34 @@ class KinematicsLoaderCfg:
     #: Enable loading meshes from kinematics parser.
     load_meshes: bool = False
 
+    #: Load the exact triangle-mesh collision geometry of every link in
+    #: :attr:`collision_link_names` into :attr:`KinematicsParams.link_collision_meshes`.
+    #: Required for the exact-mesh collision constraint. Implies :attr:`load_meshes`.
+    #: Links are read from the URDF ``<collision>`` tags, falling back to ``<visual>``
+    #: when a link has no collision geometry.
+    load_collision_meshes: bool = False
+
+    #: Names of links to exclude from the exact-mesh collision constraint. Their collision
+    #: geometry is never loaded, so they can never report a mesh collision against any
+    #: obstacle. Sphere-based collision checking is unaffected. Use this for links that are
+    #: in permanent contact with the scene by design, such as a base link bolted to its
+    #: mounting plate: an exact triangle test resolves a flush, coplanar contact as a
+    #: collision even though the penetration depth is zero.
+    mesh_collision_ignored_link_names: Optional[List[str]] = None
+
+    #: Triangle slots to reserve per link for collision geometry that is only known at
+    #: runtime, such as a gripper or an attached object. The exact-mesh counterpart of
+    #: :attr:`extra_collision_spheres`: the reserved slots start inactive and are filled with
+    #: :meth:`KinematicsParams.update_link_mesh`. The reserved count is also that link's
+    #: triangle budget.
+    extra_collision_meshes: Optional[Dict[str, int]] = None
+
+    #: Per-link triangle budget for the exact-mesh collision constraint. Either one value
+    #: applied to every link, or a per-link mapping. Links not covered fall back to
+    #: :data:`~curobo._src.geom.data.data_robot_mesh.DEFAULT_MAX_TRIANGLES_PER_LINK`. A link
+    #: whose mesh exceeds its budget is decimated, with a warning.
+    max_triangles_per_link: Union[None, int, Dict[str, int]] = None
+
     #: Deprecated flag to enable global cumulative transformation matrix.
     use_global_cumul: bool = True
 
@@ -182,6 +210,15 @@ class KinematicsLoaderCfg:
             self.asset_root_path = join_path(asset_path, self.asset_root_path)
         elif self.urdf_path is not None:
             self.asset_root_path = os.path.dirname(self.urdf_path)
+
+        if self.load_collision_meshes:
+            self.load_meshes = True
+
+        if self.mesh_collision_ignored_link_names is None:
+            self.mesh_collision_ignored_link_names = []
+
+        if self.extra_collision_meshes is None:
+            self.extra_collision_meshes = {}
 
         if not self.load_collision_spheres:
             self.collision_spheres = None

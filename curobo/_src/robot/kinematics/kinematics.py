@@ -11,8 +11,9 @@ of the forward kinematics function.
 from __future__ import annotations
 
 # Standard Library
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
+import numpy as np
 import torch
 import torch.autograd.profiler as profiler
 
@@ -52,17 +53,26 @@ class Kinematics:
         compute_jacobian: bool = False,
         compute_spheres: bool = True,
         compute_com: bool = False,
+        compute_link_transforms: bool = False,
     ):
         """Initialize kinematics instance with a robot model configuration.
 
         Args:
             config: Input robot model configuration.
+            compute_jacobian: Compute tool frame jacobians.
+            compute_spheres: Compute robot collision sphere positions.
+            compute_com: Compute robot center of mass.
+            compute_link_transforms: Expose the per-link homogeneous transforms computed by
+                forward kinematics as :attr:`KinematicsState.link_transforms`. This is free
+                (the buffer is always written by the FK kernels) but the buffer is reused
+                across calls, so consumers must read it before the next FK call.
         """
         self.config = config
         self.device_cfg = config.device_cfg
         self.compute_jacobian = compute_jacobian
         self.compute_spheres = compute_spheres
         self.compute_com = compute_com
+        self.compute_link_transforms = compute_link_transforms
         self._batch = 0
         self._horizon = 0
         self.update_batch_size(1, 1, reset_buffers=True)
@@ -161,12 +171,16 @@ class Kinematics:
             position=link_position,
             quaternion=link_quaternion,
         )
+        link_transforms = None
+        if self.compute_link_transforms:
+            link_transforms = self._buffers["batch_cumul_mat"]
         return KinematicsState(
             robot_spheres=robot_spheres,
             tool_poses=link_poses,
             tool_jacobians=link_jacobian,
             robot_com=robot_com,
             robot_collision_geometry=self.config.kinematics_config.get_robot_collision_geometry(),
+            link_transforms=link_transforms,
         )
 
     def compute_kinematics(
@@ -197,6 +211,53 @@ class Kinematics:
             q = q.unsqueeze(1)
         return self._forward(q, idxs_env=idxs_env)
 
+    def compute_collision_triangles(self, joint_state: JointState) -> torch.Tensor:
+        """Forward-kinematics every collision mesh into base frame and return one triangle soup.
+
+        This is the exact-mesh counterpart of reading :attr:`KinematicsState.robot_spheres`:
+        it turns a joint configuration of a sub-robot, such as a gripper, into geometry that
+        can be handed to
+        :meth:`~curobo._src.robot.types.kinematics_params.KinematicsParams.update_link_mesh`
+        on the main robot. The result is expressed in this robot's base frame, which is the
+        frame the reserved link is attached at.
+
+        Requires the robot to have been constructed with ``compute_link_transforms=True`` and
+        loaded with ``load_collision_meshes=True``.
+
+        Args:
+            joint_state: Joint state to evaluate. Must describe a single configuration.
+
+        Returns:
+            Triangle soup of shape ``[num_triangles, 3, 3]``.
+        """
+        if not self.compute_link_transforms:
+            log_and_raise(
+                "compute_collision_triangles needs link transforms, "
+                "construct Kinematics with compute_link_transforms=True"
+            )
+        link_meshes = self.get_robot_collision_link_meshes()
+        state = self.compute_kinematics(joint_state)
+        # [batch, horizon, num_links, 3, 4] row-major [R|t]; only one configuration is used.
+        num_links = self.config.kinematics_config.num_links
+        transforms = state.link_transforms.view(-1, num_links, 3, 4)[0]
+        link_name_to_idx_map = self.config.kinematics_config.link_name_to_idx_map
+
+        triangles = []
+        for link_name, mesh in link_meshes.items():
+            tri_mesh = mesh.get_trimesh_mesh(transform_with_pose=True)
+            faces = np.asarray(tri_mesh.faces, dtype=np.int64)
+            if faces.size == 0:
+                continue
+            soup = np.asarray(tri_mesh.vertices, dtype=np.float32)[faces.reshape(-1)]
+            tri = torch.as_tensor(soup, device=transforms.device, dtype=transforms.dtype)
+            tri = tri.view(-1, 3, 3)
+            tf = transforms[link_name_to_idx_map[link_name]]
+            triangles.append(tri @ tf[:, :3].transpose(0, 1) + tf[:, 3])
+
+        if not triangles:
+            return torch.empty((0, 3, 3), device=transforms.device, dtype=transforms.dtype)
+        return torch.cat(triangles, dim=0)
+
     def get_robot_link_meshes(self) -> List[Mesh]:
         """Get meshes of all links of the robot.
 
@@ -206,6 +267,24 @@ class Kinematics:
         m_list = [self.get_link_mesh(l) for l in self.config.kinematics_config.mesh_link_names]
 
         return m_list
+
+    def get_robot_collision_link_meshes(self) -> Dict[str, Mesh]:
+        """Get the exact triangle collision mesh of every collision link, in link-local frame.
+
+        These are loaded from the URDF ``<collision>`` tags and are the exact-geometry
+        counterpart of the collision spheres. Requires the robot to have been loaded with
+        :attr:`KinematicsLoaderCfg.load_collision_meshes` set to True.
+
+        Returns:
+            Mapping from link name to its link-local collision mesh.
+        """
+        meshes = self.config.kinematics_config.link_collision_meshes
+        if meshes is None:
+            log_and_raise(
+                "link collision meshes are not loaded, "
+                "load the robot with load_collision_meshes=True"
+            )
+        return meshes
 
     def get_robot_as_mesh(self, joint_position: torch.Tensor) -> List[Mesh]:
         """Transform robot links to Cartesian poses using forward kinematics and return as meshes.
@@ -318,10 +397,17 @@ class Kinematics:
         """Get self collision configuration parameters of the robot."""
         return self.config.self_collision_config
 
-    def get_link_mesh(self, link_name: str) -> Mesh:
-        """Get mesh of a link of the robot."""
+    def get_link_mesh(self, link_name: str, use_collision_mesh: bool = False) -> Mesh:
+        """Get mesh of a link of the robot.
+
+        Args:
+            link_name: Name of the link.
+            use_collision_mesh: Read the URDF ``<collision>`` geometry instead of ``<visual>``.
+        """
         #mesh = self.config.kinematics_parser.get_link_mesh(link_name)
-        mesh_list = self.config.kinematics_parser.get_link_geometry(link_name)
+        mesh_list = self.config.kinematics_parser.get_link_geometry(
+            link_name, use_collision_mesh=use_collision_mesh
+        )
         if len(mesh_list) == 0:
             return None
         if len(mesh_list) == 1:

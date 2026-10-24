@@ -34,7 +34,7 @@ from curobo._src.util.logging import log_and_raise, log_info, log_warn
 from curobo._src.util.sampling.sample_buffer import SampleBuffer
 from curobo._src.util.viser_visualizer import ViserVisualizer
 from curobo._src.util.xrdf_util import convert_curobo_to_xrdf
-from curobo._src.util_file import join_path, load_yaml, write_yaml
+from curobo._src.util_file import join_path, load_yaml, write_yaml, write_pretty_yaml
 from curobo.content import get_assets_path, get_robot_configs_path
 
 
@@ -672,7 +672,7 @@ class RobotBuilder:
 
         # Write YAML
         data_dict["kinematics"] = serialize_kinematics_config(data_dict["kinematics"])
-        write_yaml(data_dict, str(output_path))
+        write_pretty_yaml(data_dict, str(output_path))
         log_info(f"Saved robot configuration to: {output_path}")
 
     def save_xrdf(

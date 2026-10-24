@@ -663,7 +663,7 @@ class VoxelData:
         s.dims = wp.from_torch(self.dims.view(-1, 4), dtype=wp.float32)
         s.inv_pose = wp.from_torch(self.inv_pose.view(-1, 8), dtype=wp.float32)
         s.enable = wp.from_torch(self.enable.view(-1), dtype=wp.uint8)
-        s.features = wp.from_torch(self.features.view(-1), dtype=wp.float16)
+        s.features = wp.from_torch(self.features.view(-1).to(torch.float16), dtype=wp.float16)
         s.n_per_env = wp.from_torch(self.count.view(-1), dtype=wp.int32)
         s.n_voxels_per_layer = n_voxels_per_layer
         s.max_n = self.max_n
