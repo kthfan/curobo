@@ -46,6 +46,7 @@ import torch
 
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.cost.cost_base import BaseCost
+from curobo._src.util.logging import log_and_raise
 from curobo._src.util.warp import init_warp
 
 from curobo._src.cost.wp_torch_eef_bound import EEFBoundCostFunction
@@ -61,7 +62,11 @@ class EEFBoundCost(BaseCost):
         super().__init__(config)
         self.config: "EEFBoundCostCfg" = config
 
-        # tool_frames is validated by the cfg, so this is always non-empty.
+        if not config.tool_frames:
+            log_and_raise(
+                "EEFBoundCostCfg.tool_frames must be a non-empty list of link names; "
+                "call cfg.set_tool_frames([...]) before constructing the cost"
+            )
         self.tool_frames = list(config.tool_frames)
         self.num_links = len(self.tool_frames)
 
@@ -164,7 +169,6 @@ class EEFBoundCost(BaseCost):
             Cost tensor of shape ``(B, H, 1)``.
         """
         B, H, L, _ = current_tool_poses.position.shape
-        G = goal_tool_poses.num_goalset
 
         if not self._enabled or not self._cost_enabled:
             return torch.zeros(
@@ -178,6 +182,8 @@ class EEFBoundCost(BaseCost):
                 f"current_tool_poses has L={L} links but cfg declares "
                 f"{self.num_links} tool_frames: {self.tool_frames}"
             )
+
+        self.setup_batch_tensors(B, H)
 
         # ---------- pick a single goal pose across horizon (static goals) ----
         goal_pos = goal_tool_poses.position

@@ -82,11 +82,15 @@ def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
     qn = torch.where(qn[..., :1] < 0, -qn, qn)
     w = qn[..., 0]
     xyz = qn[..., 1:]
-    sin_half = torch.sqrt((xyz * xyz).sum(dim=-1, keepdim=True))
-    angle = 2.0 * torch.atan2(sin_half, w)
-    # scale = angle / sin_half for sin_half > eps, else 2.
+    sin_half_sq = (xyz * xyz).sum(dim=-1, keepdim=True)
+    # Near identity the sqrt has an infinite derivative, which turns the masked-out branch
+    # into NaN gradients; take the sqrt of a safe value there instead.
+    near_identity = sin_half_sq < 1e-12
+    sin_half = torch.sqrt(torch.where(near_identity, torch.ones_like(sin_half_sq), sin_half_sq))
+    angle = 2.0 * torch.atan2(sin_half, w.unsqueeze(-1))
+    # scale = angle / sin_half away from identity, else 2.
     scale = torch.where(
-        sin_half < 1e-6,
+        near_identity,
         torch.full_like(sin_half, 2.0),
         angle / (sin_half + eps),
     )
@@ -313,20 +317,13 @@ class EEFBoundCostPyTorch(BaseCost):
 
         # Per-link weight.
         w = self._weight
-        if w.numel() == L:
-            cost_BHL_weighted = cost_BHL * w  # broadcast over (B, H)
-        elif w.numel() == 1:
-            cost_BHL_weighted = cost_BHL  # scalar weight applied after sum
-        else:
+        if w.numel() not in (1, L):
             raise ValueError(f"weight must be scalar or shape ({L},); got {tuple(w.shape)}")
+        # A scalar or per-link weight both broadcast over the last (link) dim.
+        cost_BHL_weighted = cost_BHL * w.view(-1)
 
         cost_BH = cost_BHL_weighted.sum(dim=-1)  # (B, H)
-
-        if w.numel() == 1:
-            cost = (cost_BH * w).unsqueeze(-1)
-        else:
-            cost = cost_BH.unsqueeze(-1)
-        return cost
+        return cost_BH.unsqueeze(-1)
 
 
 def _corridor_per_axis(

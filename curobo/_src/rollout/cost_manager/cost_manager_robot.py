@@ -191,6 +191,8 @@ class RobotCostManager:
 
         # EEF corridor bound
         if config.eef_bound_cfg is not None:
+            if not config.eef_bound_cfg.tool_frames:
+                config.eef_bound_cfg.set_tool_frames(transition_model.robot_model.tool_frames)
             self.register_cost("eef_bound", EEFBoundCost(config.eef_bound_cfg))
 
         # Robot mesh collision

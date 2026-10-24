@@ -59,7 +59,7 @@ def _corridor_axis(
     Disabled axes (negative margin) are encoded as a large positive
     sentinel so both the violation and the gradient are zero.
     """
-    is_end_larger = float(end > start)
+    is_end_larger = wp.where(end > start, 1.0, 0.0)
     one_minus = 1.0 - is_end_larger
 
     # Begin-side violation.
@@ -68,8 +68,8 @@ def _corridor_axis(
     begin_viol_begin = wp.max(0.0, begin_arg_begin)
     begin_viol_end = wp.max(0.0, begin_arg_end)
     begin_viol = is_end_larger * begin_viol_begin + one_minus * begin_viol_end
-    begin_active_begin = float(begin_arg_begin > 0.0)
-    begin_active_end = float(begin_arg_end > 0.0)
+    begin_active_begin = wp.where(begin_arg_begin > 0.0, 1.0, 0.0)
+    begin_active_end = wp.where(begin_arg_end > 0.0, 1.0, 0.0)
     begin_active = is_end_larger * begin_active_begin + one_minus * begin_active_end
     begin_grad = -is_end_larger + one_minus
     grad_begin = begin_active * begin_grad
@@ -80,8 +80,8 @@ def _corridor_axis(
     end_viol_begin = wp.max(0.0, end_arg_begin)
     end_viol_end = wp.max(0.0, end_arg_end)
     end_viol = is_end_larger * end_viol_begin + one_minus * end_viol_end
-    end_active_begin = float(end_arg_begin > 0.0)
-    end_active_end = float(end_arg_end > 0.0)
+    end_active_begin = wp.where(end_arg_begin > 0.0, 1.0, 0.0)
+    end_active_end = wp.where(end_arg_end > 0.0, 1.0, 0.0)
     end_active = is_end_larger * end_active_begin + one_minus * end_active_end
     end_grad = is_end_larger - one_minus
     grad_end = end_active * end_grad
@@ -95,18 +95,18 @@ def quat_to_rotvec_warp(q: wp.quat, eps: float) -> wp.vec3:
 
     Near-identity uses ``scale = 2`` so the limit matches ``ω ≈ 2 * q_xyz``.
     """
-    norm = wp.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    norm = wp.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
     if norm < eps:
         return wp.vec3(0.0)
     qn = q / norm
-    if qn.w < 0.0:
+    if qn[3] < 0.0:
         qn = -qn
-    sin_half = wp.sqrt(qn.x * qn.x + qn.y * qn.y + qn.z * qn.z)
-    angle = 2.0 * wp.atan2(sin_half, qn.w)
+    sin_half = wp.sqrt(qn[0] * qn[0] + qn[1] * qn[1] + qn[2] * qn[2])
+    angle = 2.0 * wp.atan2(sin_half, qn[3])
     scale = angle / (sin_half + eps)
     if sin_half < 1e-6:
         scale = 2.0
-    return wp.vec3(qn.x * scale, qn.y * scale, qn.z * scale)
+    return wp.vec3(qn[0] * scale, qn[1] * scale, qn[2] * scale)
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +312,14 @@ class EEFBoundCostFunction(torch.autograd.Function):
         margins_k = _disable_negative_margins(margins).contiguous()
 
         # ---------------- reshape to Warp-friendly layout -----------------
-        # Kernel ordering: tid = b*H*L + h*L + l.  Reshape cur_pos from
-        # (B, H, L, 3) to (B, L, H, 3) and then to (N_threads, 3).
-        cur_pos_N = cur_pos.permute(0, 2, 1, 3).reshape(N_threads, 3).contiguous()
-        cur_quat_N = cur_quat.permute(0, 2, 1, 3).reshape(N_threads, 4).contiguous()
-        start_pos_N = start_pos.squeeze(1).reshape(B * L, 3).contiguous()
-        start_quat_N = start_quat.squeeze(1).reshape(B * L, 4).contiguous()
-        goal_pos_N = goal_pos.reshape(B * L * G, 3).contiguous()
-        goal_quat_N = goal_quat.reshape(B * L * G, 4).contiguous()
+        # Kernel ordering: tid = b*H*L + h*L + l, which is the row-major
+        # flattening of (B, H, L), so no permute is needed.
+        cur_pos_N = cur_pos.detach().reshape(N_threads, 3).contiguous()
+        cur_quat_N = cur_quat.detach().reshape(N_threads, 4).contiguous()
+        start_pos_N = start_pos.detach().squeeze(1).reshape(B * L, 3).contiguous()
+        start_quat_N = start_quat.detach().squeeze(1).reshape(B * L, 4).contiguous()
+        goal_pos_N = goal_pos.detach().reshape(B * L * G, 3).contiguous()
+        goal_quat_N = goal_quat.detach().reshape(B * L * G, 4).contiguous()
         margins_N = margins_k.reshape(-1).contiguous()
 
         # cuRobo (wxyz) → Warp (xyzw).

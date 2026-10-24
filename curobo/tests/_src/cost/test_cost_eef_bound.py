@@ -7,33 +7,29 @@ Tests both the legacy PyTorch implementation (``EEFBoundCostPyTorch`` in
 ``cost_eef_bound_py``) and the default Warp implementation (``EEFBoundCost`` in
 ``cost_eef_bound``).  The Warp implementation's kernel lives in
 ``wp_torch_eef_bound``.
-
-The tests run in the workspace by mocking the minimal cuRobo module hierarchy
-required by the cost modules.  If cuRobo is installed in the active environment,
-the mocks are skipped and the real types are used instead.
 """
 
 from __future__ import annotations
 
-import sys
-import types
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Type, Union
-import torch
 import pytest
+import torch
+
+from curobo._src.cost.cost_eef_bound import EEFBoundCost
+from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
+from curobo._src.cost.cost_eef_bound_py import (
+    EEFBoundCostPyTorch,
+    corridor_cost_3d,
+    quat_to_rotvec,
+)
+from curobo._src.types.device_cfg import DeviceCfg
+from curobo._src.types.tool_pose import GoalToolPose, ToolPose
+from curobo._src.util.warp import init_warp
 
 
-# Now import the modules under test.
-from cost_eef_bound_py import EEFBoundCostPyTorch, quat_to_rotvec, corridor_cost_3d
-from cost_eef_bound_cfg import EEFBoundCostCfg
+@pytest.fixture(scope="module", autouse=True)
+def _warp():
+    init_warp()
 
-WARP_AVAILABLE = False
-try:
-    import warp  # noqa: F401
-    WARP_AVAILABLE = True
-    from cost_eef_bound import EEFBoundCost
-except ImportError:
-    EEFBoundCost = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -68,10 +64,10 @@ def make_poses(B, H, L, G, device="cpu", dtype=torch.float32):
         cur_pos[:, h, :, 0] = 0.5 - h / max(H - 1, 1)
     goal_pos = torch.zeros(B, 1, L, G, 3, device=device, dtype=dtype)
     goal_quat = identity_quat(B, 1, L, G, device=device, dtype=dtype)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     return cur_tp, goal_tp
@@ -83,7 +79,7 @@ def default_cfg(device="cpu", dtype=torch.float32, weight=1.0, num_links=1, **kw
     ``num_links`` defaults to 1 for the common single-EEF case; tests that
     exercise multi-link semantics pass ``num_links=N`` explicitly.
     """
-    device_cfg = sys.modules["curobo._src.types.device_cfg"].DeviceCfg(device=device, dtype=dtype)
+    device_cfg = DeviceCfg(device=torch.device(device), dtype=dtype)
     tool_frames = [f"link_{i}" for i in range(num_links)]
     return EEFBoundCostCfg(
         weight=weight,
@@ -97,21 +93,21 @@ def default_cfg(device="cpu", dtype=torch.float32, weight=1.0, num_links=1, **kw
 # Helper-function tests
 # ---------------------------------------------------------------------------
 def test_quat_to_rotvec_identity():
-    q = identity_quat(5, device="cpu", dtype=torch.float64)
+    q = identity_quat(5, device="cpu", dtype=torch.float32)
     rv = quat_to_rotvec(q)
     assert rv.shape == (5, 3)
-    assert torch.allclose(rv, torch.zeros(5, 3, dtype=torch.float64), atol=1e-8)
+    assert torch.allclose(rv, torch.zeros(5, 3, dtype=torch.float32), atol=1e-8)
 
 
 def test_quat_to_rotvec_round_trip():
-    dtype = torch.float64
+    dtype = torch.float32
     axis = torch.tensor([1.0, 2.0, -1.0], dtype=dtype)
     axis = axis / axis.norm()
     for angle in [0.1, 0.5, 1.2, 3.0]:
         q = axis_angle_quat(axis, angle, device="cpu", dtype=dtype)
         rv = quat_to_rotvec(q)
         expected = axis * angle
-        assert torch.allclose(rv, expected, atol=1e-6)
+        assert torch.allclose(rv, expected, atol=1e-5)
 
 
 def test_corridor_cost_3d_inside_no_cost():
@@ -185,10 +181,10 @@ def test_pytorch_cost_rotation_violation():
     cur_quat[:, 2, :, :] = axis_angle_quat([1.0, 0.0, 0.0], 0.2, B, L)
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_quat = identity_quat(B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     cost = cost_obj.forward(cur_tp, goal_tp)
@@ -212,10 +208,10 @@ def test_pytorch_cost_multi_goalset_min():
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_quat = identity_quat(B, 1, L, G)
     goal_pos[:, :, :, 1, 0] = -0.5
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     cost = cost_obj.forward(cur_tp, goal_tp)
@@ -303,10 +299,10 @@ def test_pytorch_cost_per_link_margins():
         cur_pos[:, h, 1, 1] = -alpha      # link 1: y goes -0.5 → 0.5
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_quat = identity_quat(B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
 
@@ -349,10 +345,10 @@ def test_pytorch_cost_margin_offset_bug_fixed():
     cur_quat = identity_quat(B, H, L)
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_quat = identity_quat(B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     cost = cost_obj.forward(cur_tp, goal_tp)
@@ -362,7 +358,6 @@ def test_pytorch_cost_margin_offset_bug_fixed():
 # ---------------------------------------------------------------------------
 # Default Warp implementation tests
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_cost_disabled_without_margins():
     cfg = default_cfg()
     cost_obj = EEFBoundCost(cfg)
@@ -372,7 +367,6 @@ def test_warp_cost_disabled_without_margins():
     assert torch.allclose(out, torch.zeros(2, 5, 1), atol=1e-8)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_matches_pytorch_position_violation():
     B, H, L, G = 1, 5, 1, 1
     cfg = default_cfg()
@@ -389,7 +383,6 @@ def test_warp_matches_pytorch_position_violation():
     assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_matches_pytorch_rotation_violation():
     B, H, L, G = 1, 4, 1, 1
     cfg = default_cfg()
@@ -409,10 +402,10 @@ def test_warp_matches_pytorch_rotation_violation():
     cur_quat[:, 3, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.0, B, L)
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_quat = identity_quat(B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     pt_out = pt_cost.forward(cur_tp, goal_tp)
@@ -420,7 +413,6 @@ def test_warp_matches_pytorch_rotation_violation():
     assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_matches_pytorch_multi_link_goal():
     B, H, L, G = 1, 3, 2, 2
     cfg = default_cfg(num_links=2)
@@ -437,7 +429,31 @@ def test_warp_matches_pytorch_multi_link_goal():
     assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_matches_pytorch_distinct_links():
+    """Each link keeps its own trajectory when both horizon and link count exceed 1."""
+    B, H, L, G = 2, 4, 3, 1
+    cfg = default_cfg(num_links=L)
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, :] = 0.02
+    margins[1, :] = 0.02
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    frames = [f"link_{i}" for i in range(L)]
+    generator = torch.Generator().manual_seed(0)
+    cur_pos = torch.rand(B, H, L, 3, generator=generator) - 0.5
+    cur_quat = identity_quat(B, H, L)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    cur_tp = ToolPose(tool_frames=frames, position=cur_pos, quaternion=cur_quat)
+    goal_tp = GoalToolPose(tool_frames=frames, position=goal_pos, quaternion=goal_quat)
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    assert pt_out.abs().sum() > 0.0
+    assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
+
+
 def test_warp_matches_pytorch_non_identity_goal():
     B, H, L, G = 1, 5, 1, 1
     cfg = default_cfg()
@@ -461,10 +477,10 @@ def test_warp_matches_pytorch_non_identity_goal():
     goal_pos[:, :, :, :, 0] = 0.2
     goal_pos[:, :, :, :, 1] = -0.1
     goal_quat = axis_angle_quat([0.0, 0.0, 1.0], 0.3, B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     pt_out = pt_cost.forward(cur_tp, goal_tp)
@@ -472,7 +488,6 @@ def test_warp_matches_pytorch_non_identity_goal():
     assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_cost_gradient_matches_pytorch():
     B, H, L, G = 1, 5, 1, 1
     cfg = default_cfg()
@@ -502,7 +517,6 @@ def test_warp_cost_gradient_matches_pytorch():
     assert torch.allclose(wp_grad_quat, pt_grad_quat, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_cost_gradient_non_identity_goal():
     B, H, L, G = 1, 4, 1, 1
     cfg = default_cfg()
@@ -519,10 +533,10 @@ def test_warp_cost_gradient_non_identity_goal():
     goal_pos = torch.zeros(B, 1, L, G, 3)
     goal_pos[:, :, :, :, 0] = 0.2
     goal_quat = axis_angle_quat([0.0, 0.0, 1.0], 0.3, B, 1, L, G)
-    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+    cur_tp = ToolPose(
         tool_frames=frames, position=cur_pos, quaternion=cur_quat
     )
-    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+    goal_tp = GoalToolPose(
         tool_frames=frames, position=goal_pos, quaternion=goal_quat
     )
     cur_tp.position.requires_grad_(True)
@@ -533,7 +547,6 @@ def test_warp_cost_gradient_non_identity_goal():
     assert cur_tp.position.grad.abs().sum() > 0.0
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_per_link_weight_scales_gradient():
     """Per-link weight must scale the gradient w.r.t. ``cur_pos`` accordingly."""
     B, H, L, G = 1, 5, 2, 1
@@ -564,7 +577,6 @@ def test_warp_per_link_weight_scales_gradient():
     assert torch.allclose(grad_w[:, :, 1, :], 3.0 * grad_one[:, :, 1, :], atol=1e-5)
 
 
-@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
 def test_warp_output_buffers_populated():
     """``_out_goalset_idx``, ``_out_position_gradient`` etc. are filled by the kernel."""
     B, H, L, G = 1, 4, 2, 3

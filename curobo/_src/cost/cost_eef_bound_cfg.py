@@ -28,10 +28,9 @@ class EEFBoundCostCfg(BaseCostCfg):
     Inherits :attr:`weight`, :attr:`device_cfg`, :attr:`convert_to_binary`, and
     :attr:`use_grad_input` from :class:`BaseCostCfg`.
 
-    ``tool_frames`` is **required**: it must be a non-empty list of link names.
-    The cost raises ``ValueError`` at construction time otherwise, because the
-    Warp kernel needs to know the number of links to size its output buffers
-    and per-link margin tensor.
+    ``tool_frames`` must be a non-empty list of link names by the time the cost is
+    constructed. The robot cost manager fills it from the robot's tool frames when it is
+    left unset, mirroring :class:`ToolPoseCostCfg`.
     """
 
     class_type: Type = EEFBoundCost  # type: ignore[assignment]
@@ -47,25 +46,14 @@ class EEFBoundCostCfg(BaseCostCfg):
     #: Offset added to enabled rotation margins (rad).
     rot_margin_offset: float = 0.0
 
-    #: List of link names for which to compute pose costs.  Must be non-empty;
-    #: ``__post_init__`` enforces this.
+    #: List of link names for which to compute pose costs. Left empty, it is filled from the
+    #: robot's tool frames by the cost manager.
     tool_frames: Optional[List[str]] = field(default_factory=list)
 
     def __post_init__(self):
         super().__post_init__()
-        if self.tool_frames is None or len(self.tool_frames) == 0:
-            raise ValueError(
-                "EEFBoundCostCfg.tool_frames must be a non-empty list of link names; "
-                "call `cfg.set_tool_frames([...])` before constructing the cost."
-            )
-        # De-dup while preserving order to make sure indexing is well-defined.
-        seen = set()
-        deduped: List[str] = []
-        for name in self.tool_frames:
-            if name not in seen:
-                seen.add(name)
-                deduped.append(name)
-        self.tool_frames = deduped
+        if self.tool_frames:
+            self.set_tool_frames(self.tool_frames)
 
     def set_tool_frames(self, tool_frames: List[str]) -> "EEFBoundCostCfg":
         """Update the list of tool frames.  Returns ``self`` for chaining.
