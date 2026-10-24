@@ -296,6 +296,18 @@ class RobotCostManager:
                     )
                     cost_collection.add(cost_value, "scene_collision")
 
+        # if self.has_cost("eef_bound"):
+        #     eef_bound_cost = self.get_cost("eef_bound")
+        #     if eef_bound_cost.enabled:
+        #         with self._stream_context("eef_bound"):
+        #             cost_value = eef_bound_cost.forward(
+        #                 state.tool_poses.position,
+        #                 state.tool_poses.quaternion,
+        #                 goal.link_goal_poses.position,
+        #                 goal.link_goal_poses.quaternion,
+        #             )
+        #             cost_collection.add(cost_value, "eef_bound")
+
         # Robot mesh collision
         if self.has_cost("mesh_collision"):
             mesh_collision_cost = self.get_cost("mesh_collision")

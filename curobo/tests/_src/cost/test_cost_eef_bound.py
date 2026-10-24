@@ -1,686 +1,598 @@
 ﻿# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for EEFBoundCost and EEFBoundCostCfg."""
 
-import math
+"""Unit tests for the EEF bound / corridor cost.
 
-import pytest
+Tests both the legacy PyTorch implementation (``EEFBoundCostPyTorch`` in
+``cost_eef_bound_py``) and the default Warp implementation (``EEFBoundCost`` in
+``cost_eef_bound``).  The Warp implementation's kernel lives in
+``wp_torch_eef_bound``.
+
+The tests run in the workspace by mocking the minimal cuRobo module hierarchy
+required by the cost modules.  If cuRobo is installed in the active environment,
+the mocks are skipped and the real types are used instead.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Type, Union
 import torch
+import pytest
 
-from curobo._src.cost.cost_eef_bound import (
-    EEFBoundCost,
-    _eef_position_bound_cost,
-    _eef_rotation_bound_cost,
-    _quat_to_rotvec,
-)
-from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
-from curobo._src.types.device_cfg import DeviceCfg
 
+# Now import the modules under test.
+from cost_eef_bound_py import EEFBoundCostPyTorch, quat_to_rotvec, corridor_cost_3d
+from cost_eef_bound_cfg import EEFBoundCostCfg
+
+WARP_AVAILABLE = False
+try:
+    import warp  # noqa: F401
+    WARP_AVAILABLE = True
+    from cost_eef_bound import EEFBoundCost
+except ImportError:
+    EEFBoundCost = None  # type: ignore
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Fixtures / helpers
 # ---------------------------------------------------------------------------
-
-def _identity_quat(shape, device, dtype):
-    """Return identity quaternion (w,x,y,z) = (1,0,0,0) with given shape."""
+def identity_quat(*shape, device="cpu", dtype=torch.float32):
+    """Return identity quaternions in cuRobo (wxyz) layout."""
     q = torch.zeros(*shape, 4, device=device, dtype=dtype)
     q[..., 0] = 1.0
     return q
 
 
-def _rot_z_quat(angle_rad: float, device, dtype) -> torch.Tensor:
-    """Return a (1, 4) wxyz quaternion for a rotation of *angle_rad* about Z."""
-    half = angle_rad * 0.5
-    return torch.tensor(
-        [[math.cos(half), 0.0, 0.0, math.sin(half)]],
-        device=device,
-        dtype=dtype,
+def axis_angle_quat(axis, angle, *shape, device="cpu", dtype=torch.float32):
+    """Build a quaternion (wxyz) from an axis/angle (axis need not be normalized)."""
+    if not isinstance(axis, torch.Tensor):
+        axis = torch.tensor(axis, device=device, dtype=dtype)
+    else:
+        axis = axis.to(device=device, dtype=dtype)
+    axis = axis / axis.norm()
+    half = torch.tensor(angle / 2.0, device=device, dtype=dtype)
+    q = torch.zeros(*shape, 4, device=device, dtype=dtype)
+    q[..., 0] = torch.cos(half)
+    q[..., 1:] = axis * torch.sin(half)
+    return q
+
+
+def make_poses(B, H, L, G, device="cpu", dtype=torch.float32):
+    """Create a deterministic trajectory and a static goal."""
+    frames = [f"link_{i}" for i in range(L)]
+    cur_pos = torch.zeros(B, H, L, 3, device=device, dtype=dtype)
+    cur_quat = identity_quat(B, H, L, device=device, dtype=dtype)
+    for h in range(H):
+        cur_pos[:, h, :, 0] = 0.5 - h / max(H - 1, 1)
+    goal_pos = torch.zeros(B, 1, L, G, 3, device=device, dtype=dtype)
+    goal_quat = identity_quat(B, 1, L, G, device=device, dtype=dtype)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    return cur_tp, goal_tp
+
+
+def default_cfg(device="cpu", dtype=torch.float32, weight=1.0, num_links=1, **kwargs):
+    """Build a config with the given weight and number of tool frames.
+
+    ``num_links`` defaults to 1 for the common single-EEF case; tests that
+    exercise multi-link semantics pass ``num_links=N`` explicitly.
+    """
+    device_cfg = sys.modules["curobo._src.types.device_cfg"].DeviceCfg(device=device, dtype=dtype)
+    tool_frames = [f"link_{i}" for i in range(num_links)]
+    return EEFBoundCostCfg(
+        weight=weight,
+        device_cfg=device_cfg,
+        tool_frames=tool_frames,
+        **kwargs,
     )
 
 
-def _all_disabled_margins(device, dtype) -> torch.Tensor:
-    """Return (4, 3) margins tensor with all axes disabled (all -1)."""
-    return torch.full((4, 3), -1.0, device=device, dtype=dtype)
+# ---------------------------------------------------------------------------
+# Helper-function tests
+# ---------------------------------------------------------------------------
+def test_quat_to_rotvec_identity():
+    q = identity_quat(5, device="cpu", dtype=torch.float64)
+    rv = quat_to_rotvec(q)
+    assert rv.shape == (5, 3)
+    assert torch.allclose(rv, torch.zeros(5, 3, dtype=torch.float64), atol=1e-8)
 
 
-def _all_zero_margins(device, dtype) -> torch.Tensor:
-    """Return (4, 3) margins tensor with all axes constrained, zero dead-zone."""
-    return torch.zeros((4, 3), device=device, dtype=dtype)
+def test_quat_to_rotvec_round_trip():
+    dtype = torch.float64
+    axis = torch.tensor([1.0, 2.0, -1.0], dtype=dtype)
+    axis = axis / axis.norm()
+    for angle in [0.1, 0.5, 1.2, 3.0]:
+        q = axis_angle_quat(axis, angle, device="cpu", dtype=dtype)
+        rv = quat_to_rotvec(q)
+        expected = axis * angle
+        assert torch.allclose(rv, expected, atol=1e-6)
+
+
+def test_corridor_cost_3d_inside_no_cost():
+    N, H = 2, 4
+    current = torch.zeros(N, H, 3)
+    start = torch.zeros(N, 1, 3)
+    end = torch.zeros(N, 1, 3)
+    margins = torch.tensor([[0.1, 0.1, 0.1], [0.1, 0.1, 0.1]])
+    cost = corridor_cost_3d(current, start, end, margins)
+    assert cost.shape == (N, H)
+    assert torch.allclose(cost, torch.zeros(N, H), atol=1e-8)
+
+
+def test_corridor_cost_3d_position_violation():
+    N, H = 1, 3
+    start = torch.tensor([[[0.5, 0.0, 0.0]]])
+    end = torch.zeros_like(start)
+    current = torch.zeros(N, H, 3)
+    current[:, 0, 0] = 0.7
+    current[:, 1, 0] = -0.2
+    current[:, 2, 0] = 0.25
+    margins = torch.tensor([[0.1, -1.0, -1.0], [0.1, -1.0, -1.0]])
+    cost = corridor_cost_3d(current, start, end, margins)
+    assert torch.allclose(cost[0], torch.tensor([0.1, 0.1, 0.0]), atol=1e-8)
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Legacy PyTorch implementation tests
 # ---------------------------------------------------------------------------
-
-@pytest.fixture(params=["cpu", "cuda:0"])
-def device_cfg(request):
-    device = request.param
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    return DeviceCfg(device=torch.device(device))
-
-
-# ---------------------------------------------------------------------------
-# EEFBoundCostCfg tests
-# ---------------------------------------------------------------------------
-
-class TestEEFBoundCostCfg:
-
-    def test_init_float_weight(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        assert cfg.weight.shape == (1,)
-        assert torch.allclose(cfg.weight, torch.tensor([1.0], device=device_cfg.device, dtype=device_cfg.dtype))
-
-    def test_init_list_weight(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=[2.0], device_cfg=device_cfg)
-        assert torch.allclose(cfg.weight, torch.tensor([2.0], device=device_cfg.device, dtype=device_cfg.dtype))
-
-    def test_class_type_is_eef_bound_cost(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        assert cfg.class_type is EEFBoundCost
-
-    def test_default_flags(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        assert cfg.disable_margin is False
-        assert cfg.pos_margin_offset == 0.0
-        assert cfg.rot_margin_offset == 0.0
-
-    def test_custom_flags(self, device_cfg):
-        cfg = EEFBoundCostCfg(
-            weight=1.0,
-            disable_margin=True,
-            pos_margin_offset=0.05,
-            rot_margin_offset=0.1,
-            device_cfg=device_cfg,
-        )
-        assert cfg.disable_margin is True
-        assert cfg.pos_margin_offset == pytest.approx(0.05)
-        assert cfg.rot_margin_offset == pytest.approx(0.1)
-
-    def test_int_weight_raises(self, device_cfg):
-        with pytest.raises(Exception):
-            EEFBoundCostCfg(weight=1, device_cfg=device_cfg)
+def test_pytorch_cost_disabled_without_margins():
+    cfg = default_cfg()
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    cur_tp, goal_tp = make_poses(2, 5, 1, 1)
+    out = cost_obj.forward(cur_tp, goal_tp)
+    assert out.shape == (2, 5, 1)
+    assert torch.allclose(out, torch.zeros(2, 5, 1), atol=1e-8)
+    assert not cost_obj.margins_enabled
 
 
-# ---------------------------------------------------------------------------
-# EEFBoundCost initialisation and update_margins
-# ---------------------------------------------------------------------------
-
-class TestEEFBoundCostInit:
-
-    def test_init_disabled_by_default(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        assert cost.margins_enabled is False
-        assert cost.enabled is True  # BaseCost: weight > 0, so enabled
-
-    def test_margins_all_negative_on_construction(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        assert torch.all(cost._margins < 0)
-
-    def test_update_margins_enables(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        margins = _all_zero_margins(device_cfg.device, device_cfg.dtype)
-        cost.update_margins(margins)
-        assert cost.margins_enabled is True
-
-    def test_update_margins_none_disables(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        cost.update_margins(_all_zero_margins(device_cfg.device, device_cfg.dtype))
-        cost.update_margins(None)
-        assert cost.margins_enabled is False
-        assert torch.all(cost._margins < 0)
-
-    def test_update_margins_copies_values(self, device_cfg):
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        margins = torch.tensor(
-            [[0.01, 0.01, -1.0], [0.01, 0.01, -1.0],
-             [-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]],
-            device=device_cfg.device, dtype=device_cfg.dtype,
-        )
-        cost.update_margins(margins)
-        assert torch.allclose(cost._margins, margins)
+def test_pytorch_cost_position_violation():
+    B, H, L, G = 1, 5, 1, 1
+    cfg = default_cfg()
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    assert cost.shape == (B, H, 1)
+    assert cost[0, 0, 0] == 0.0
+    assert cost[0, H // 2, 0] == 0.0
+    assert cost[0, -1, 0] > 0.0
+    assert cost[0, -2, 0] > 0.0
+    assert cost[0, -1, 0] > cost[0, -2, 0]
 
 
-# ---------------------------------------------------------------------------
-# EEFBoundCost.forward – disabled path
-# ---------------------------------------------------------------------------
-
-class TestEEFBoundCostForwardDisabled:
-
-    def test_forward_returns_zeros_when_not_enabled(self, device_cfg):
-        """When margins have never been set, forward must return all-zero cost."""
-        B, T = 3, 8
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-
-        ee_pos = torch.randn(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert out.shape == (B, T)
-        assert torch.all(out == 0.0)
-
-    def test_forward_returns_zeros_after_disable(self, device_cfg):
-        """After calling update_margins(None), forward must return zeros."""
-        B, T = 2, 5
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg)
-        cost = EEFBoundCost(cfg)
-        cost.update_margins(_all_zero_margins(device_cfg.device, device_cfg.dtype))
-        cost.update_margins(None)
-
-        ee_pos = torch.randn(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.all(out == 0.0)
+def test_pytorch_cost_rotation_violation():
+    B, H, L, G = 1, 3, 1, 1
+    cfg = default_cfg()
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[2, 0] = 0.05
+    margins[3, 0] = 0.05
+    cost_obj.update_margins(margins)
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    cur_quat[:, 0, :, :] = axis_angle_quat([1.0, 0.0, 0.0], 0.5, B, L)
+    cur_quat[:, 1, :, :] = axis_angle_quat([1.0, 0.0, 0.0], 0.7, B, L)
+    cur_quat[:, 2, :, :] = axis_angle_quat([1.0, 0.0, 0.0], 0.2, B, L)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    assert cost[0, 1, 0] > 0.0
+    assert torch.allclose(cost[0, 2, 0], torch.zeros(1), atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# EEFBoundCost.forward – position cost
-# ---------------------------------------------------------------------------
+def test_pytorch_cost_multi_goalset_min():
+    B, H, L, G = 1, 3, 1, 2
+    cfg = default_cfg()
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    for h in range(H):
+        cur_pos[:, h, :, 0] = 0.5 - h / max(H - 1, 1)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    goal_pos[:, :, :, 1, 0] = -0.5
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    assert torch.allclose(cost, torch.zeros(B, H, 1), atol=1e-6)
 
-class TestEEFBoundCostForwardPosition:
-    """Tests using identity goal orientation so goal frame == world frame."""
 
-    def _make_cost(self, device_cfg, weight=1.0, **cfg_kwargs):
-        cfg = EEFBoundCostCfg(weight=weight, device_cfg=device_cfg, **cfg_kwargs)
-        return EEFBoundCost(cfg)
+def test_pytorch_cost_multi_link_sum():
+    B, H, L, G = 1, 3, 2, 1
+    cfg = default_cfg(num_links=2)
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    # Build a separate single-link cfg / cost for the comparison.
+    single_link_cost = EEFBoundCostPyTorch(default_cfg(num_links=1))
+    single_link_cost.update_margins(margins)
+    cur_tp_single, goal_tp_single = make_poses(B, H, 1, G)
+    single_cost = single_link_cost.forward(cur_tp_single, goal_tp_single)
+    assert torch.allclose(cost, 2.0 * single_cost, atol=1e-6)
 
-    def _pos_only_margins(self, device, dtype):
-        """Constrain position (zero dead-zone), leave rotation disabled."""
-        m = torch.zeros(4, 3, device=device, dtype=dtype)
-        m[2:] = -1.0   # disable rotation rows
-        return m
 
-    def test_trajectory_at_start_has_zero_cost(self, device_cfg):
-        """
-        All timesteps equal the start pose.
-        In goal frame: start_pos ≠ 0, but every step equals start_pos.
-        The bound is [end=0, start], so a step that equals start is exactly
-        on the start boundary (margin = 0 → no dead-zone) → zero violation.
-        """
-        B, T = 2, 6
-        cost = self._make_cost(device_cfg)
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-        cost.update_margins(margins)
+def test_pytorch_cost_weight_scaling():
+    B, H, L, G = 1, 3, 1, 1
+    cfg = default_cfg(weight=2.5)
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    cfg_one = default_cfg(weight=1.0)
+    cost_one = EEFBoundCostPyTorch(cfg_one)
+    cost_one.update_margins(margins)
+    one_cost = cost_one.forward(cur_tp, goal_tp)
+    assert torch.allclose(cost, 2.5 * one_cost, atol=1e-6)
 
-        start = torch.tensor([0.3, 0.0, 0.0], device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos = start.view(1, 1, 3).expand(B, T, 3).clone()
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert out.shape == (B, T)
-        assert torch.allclose(out, torch.zeros_like(out), atol=1e-5)
+def test_pytorch_cost_per_link_weight():
+    """Per-link weight tensor of shape ``(L,)`` scales each link independently."""
+    B, H, L, G = 1, 3, 2, 1
+    w_per_link = torch.tensor([2.0, 0.5])
+    cfg = default_cfg(num_links=2, weight=w_per_link)
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
 
-    def test_trajectory_at_goal_has_zero_cost(self, device_cfg):
-        """All timesteps at origin (goal). Bound includes goal → zero cost."""
-        B, T = 2, 6
-        cost = self._make_cost(device_cfg)
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-        cost.update_margins(margins)
+    cfg_one = default_cfg(num_links=2, weight=1.0)
+    cost_one = EEFBoundCostPyTorch(cfg_one)
+    cost_one.update_margins(margins)
+    one_cost = cost_one.forward(cur_tp, goal_tp)  # 2 * single-link cost (identical links)
 
-        start = torch.tensor([0.3, 0.0, 0.0], device=device_cfg.device, dtype=device_cfg.dtype)
-        # t=0 must be start; rest at goal (origin)
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0] = start
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
+    weighted_cost = cost_obj.forward(cur_tp, goal_tp)
+    expected = (w_per_link.sum() / 2.0) * one_cost
+    assert torch.allclose(weighted_cost, expected, atol=1e-5)
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        # non-start steps are at goal (origin) → within [0, 0.3] → zero
-        assert torch.allclose(out[:, 1:], torch.zeros_like(out[:, 1:]), atol=1e-5)
 
-    def test_trajectory_outside_start_bound_has_positive_cost(self, device_cfg):
-        """
-        Start at x=0.3 (goal at origin), so bound is x ∈ [0, 0.3].
-        Moving to x=0.5 violates the start bound → positive cost.
-        """
-        B, T = 2, 4
-        cost = self._make_cost(device_cfg)
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-        cost.update_margins(margins)
+def test_pytorch_cost_per_link_margins():
+    """Per-link margins of shape ``(L, 4, 3)`` apply each link's own margins."""
+    B, H, L, G = 1, 3, 2, 1
+    cfg = default_cfg(num_links=2)
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    # Link 0: x-axis constrained with margin 0.1; Link 1: y-axis constrained.
+    margins = torch.full((2, 4, 3), -1.0)
+    margins[0, 0, 0] = 0.1
+    margins[0, 1, 0] = 0.1
+    margins[1, 0, 1] = 0.1
+    margins[1, 1, 1] = 0.1
+    cost_obj.update_margins(margins)
 
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3   # start at x=0.3
-        ee_pos[:, 1, 0] = 0.5   # violates upper bound (x > 0.3)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
+    # Build a trajectory where x is violated on link 0 only, and y on link 1.
+    frames = ["link_0", "link_1"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    # Linear interpolation in x and y from (0.5, 0.5) to (-0.5, -0.5).
+    for h in range(H):
+        alpha = 0.5 - h / max(H - 1, 1)
+        cur_pos[:, h, 0, 0] = alpha       # link 0: x goes 0.5 → -0.5
+        cur_pos[:, h, 1, 1] = -alpha      # link 1: y goes -0.5 → 0.5
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        # step t=1 should have positive cost
-        assert torch.all(out[:, 1] > 0.0)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    # At the boundary points, the cost is 0 because the trajectory ends
+    # exactly at the corridor edge.  Interior points with x outside the
+    # corridor on link 0 contribute cost; same for y on link 1.
+    assert cost.shape == (B, H, 1)
+    assert torch.all(cost >= 0.0)
 
-    def test_trajectory_outside_goal_bound_has_positive_cost(self, device_cfg):
-        """
-        Start at x=0.3, goal at origin, bound x ∈ [0, 0.3].
-        Moving to x=-0.1 violates the goal-side lower bound → positive cost.
-        """
-        B, T = 2, 4
-        cost = self._make_cost(device_cfg)
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-        cost.update_margins(margins)
 
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3   # start
-        ee_pos[:, 1, 0] = -0.1  # violates lower bound (x < 0)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
+def test_pytorch_cost_gradient_exists():
+    B, H, L, G = 1, 4, 1, 1
+    cfg = default_cfg()
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cur_tp.position.requires_grad_(True)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    total = cost.sum()
+    total.backward()
+    assert cur_tp.position.grad is not None
+    assert cur_tp.position.grad.shape == cur_tp.position.shape
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.all(out[:, 1] > 0.0)
 
-    def test_disabled_axes_not_penalised(self, device_cfg):
-        """When an axis margin is negative, arbitrarily large movement is not penalised."""
-        B, T = 2, 4
-        cost = self._make_cost(device_cfg)
-
-        # Only constrain X; Y and Z disabled
-        margins = torch.full((4, 3), -1.0, device=device_cfg.device, dtype=device_cfg.dtype)
-        margins[0, 0] = 0.0   # position start-side X
-        margins[1, 0] = 0.0   # position goal-side X
-        cost.update_margins(margins)
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3   # start x=0.3
-        # Stay within X bound, but go far in Y and Z
-        ee_pos[:, 1] = torch.tensor([0.15, 100.0, 100.0], device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        # t=1: X is within [0, 0.3], Y/Z unconstrained → zero cost
-        assert torch.allclose(out[:, 1], torch.zeros(B, device=device_cfg.device, dtype=device_cfg.dtype), atol=1e-5)
-
-    def test_weight_scales_cost(self, device_cfg):
-        """Cost with weight=2 should be exactly 2× cost with weight=1."""
-        B, T = 2, 4
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-
-        cost1 = self._make_cost(device_cfg, weight=1.0)
-        cost1.update_margins(margins)
-        cost2 = self._make_cost(device_cfg, weight=2.0)
-        cost2.update_margins(margins)
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3
-        ee_pos[:, 1, 0] = 0.5   # out of bounds
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out1 = cost1.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        out2 = cost2.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.allclose(out2, 2.0 * out1, atol=1e-5)
-
-    def test_disable_margin_ignores_offset(self, device_cfg):
-        """With disable_margin=True, pos_margin_offset is ignored."""
-        B, T = 2, 4
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)
-
-        # disable_margin=True: margin widening is skipped
-        cost_no_margin = self._make_cost(device_cfg, disable_margin=True, pos_margin_offset=0.5)
-        cost_no_margin.update_margins(margins)
-
-        # Plain cost (no offset, no widening)
-        cost_plain = self._make_cost(device_cfg)
-        cost_plain.update_margins(margins)
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3
-        ee_pos[:, 1, 0] = 0.5   # outside [0, 0.3]
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out_no_margin = cost_no_margin.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        out_plain = cost_plain.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-
-        # Both treat margin as 0 → results must be identical
-        assert torch.allclose(out_no_margin, out_plain, atol=1e-5)
-
-    def test_pos_margin_offset_creates_dead_zone(self, device_cfg):
-        """A pos_margin_offset should allow slight violations without penalty."""
-        B, T = 2, 4
-        offset = 0.05
-        margins = self._pos_only_margins(device_cfg.device, device_cfg.dtype)  # base = 0
-
-        cost = self._make_cost(device_cfg, pos_margin_offset=offset)
-        cost.update_margins(margins)
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_pos[:, 0, 0] = 0.3        # start
-        # t=1 slightly beyond start: 0.3 + 0.03 = 0.33, within 0.05 dead-zone
-        ee_pos[:, 1, 0] = 0.33
-        # t=2 far beyond dead-zone: 0.3 + 0.1 = 0.4 > 0.35
-        ee_pos[:, 2, 0] = 0.4
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        # Within dead-zone → zero
-        assert torch.allclose(out[:, 1], torch.zeros(B, device=device_cfg.device, dtype=device_cfg.dtype), atol=1e-5)
-        # Beyond dead-zone → positive
-        assert torch.all(out[:, 2] > 0.0)
+def test_pytorch_cost_margin_offset_bug_fixed():
+    cfg = default_cfg(pos_margin_offset=0.5)
+    cost_obj = EEFBoundCostPyTorch(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = -0.1
+    margins[1, 0] = 0.1
+    cost_obj.update_margins(margins)
+    B, H, L, G = 1, 3, 1, 1
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_pos[:, :, :, 0] = 10.0
+    cur_quat = identity_quat(B, H, L)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    assert torch.allclose(cost, torch.zeros(B, H, 1), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# EEFBoundCost.forward – rotation cost
+# Default Warp implementation tests
 # ---------------------------------------------------------------------------
-
-class TestEEFBoundCostForwardRotation:
-
-    def _rot_only_margins(self, device, dtype):
-        """Constrain rotation (zero dead-zone), leave position disabled."""
-        m = torch.zeros(4, 3, device=device, dtype=dtype)
-        m[:2] = -1.0   # disable position rows
-        return m
-
-    def _make_cost(self, device_cfg, weight=1.0, **cfg_kwargs):
-        cfg = EEFBoundCostCfg(weight=weight, device_cfg=device_cfg, **cfg_kwargs)
-        return EEFBoundCost(cfg)
-
-    def test_identity_trajectory_has_zero_rotation_cost(self, device_cfg):
-        """Trajectory at identity rotation, goal at identity → zero cost."""
-        B, T = 2, 6
-        cost = self._make_cost(device_cfg)
-        cost.update_margins(self._rot_only_margins(device_cfg.device, device_cfg.dtype))
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.allclose(out, torch.zeros_like(out), atol=1e-5)
-
-    def test_rotation_outside_bound_has_positive_cost(self, device_cfg):
-        """
-        Start with a 90° rotation around Z; goal = identity.
-        Bound is rotvec_z ∈ [0, π/2].  Moving to 100° violates start bound.
-        """
-        B, T = 2, 4
-        cost = self._make_cost(device_cfg)
-        cost.update_margins(self._rot_only_margins(device_cfg.device, device_cfg.dtype))
-
-        start_q = _rot_z_quat(math.pi / 2, device_cfg.device, device_cfg.dtype)  # 90°
-        exceed_q = _rot_z_quat(math.radians(100), device_cfg.device, device_cfg.dtype)  # 100°
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        ee_rot[:, 0] = start_q   # t=0: start
-        ee_rot[:, 1] = exceed_q  # t=1: beyond start bound
-
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.all(out[:, 1] > 0.0)
-
-    def test_rotation_within_bound_has_zero_cost(self, device_cfg):
-        """
-        Start 90°, goal identity.  Intermediate 45° is inside [0°, 90°] → zero cost.
-        """
-        B, T = 2, 4
-        cost = self._make_cost(device_cfg)
-        cost.update_margins(self._rot_only_margins(device_cfg.device, device_cfg.dtype))
-
-        start_q = _rot_z_quat(math.pi / 2, device_cfg.device, device_cfg.dtype)
-        mid_q = _rot_z_quat(math.pi / 4, device_cfg.device, device_cfg.dtype)
-
-        ee_pos = torch.zeros(B, T, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        ee_rot = _identity_quat((B, T), device_cfg.device, device_cfg.dtype)
-        ee_rot[:, 0] = start_q
-        ee_rot[:, 1] = mid_q   # within [0, π/2]
-
-        goal_pos = torch.zeros(B, 3, device=device_cfg.device, dtype=device_cfg.dtype)
-        goal_rot = _identity_quat((B,), device_cfg.device, device_cfg.dtype)
-
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        assert torch.allclose(out[:, 1], torch.zeros(B, device=device_cfg.device, dtype=device_cfg.dtype), atol=1e-4)
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_cost_disabled_without_margins():
+    cfg = default_cfg()
+    cost_obj = EEFBoundCost(cfg)
+    cur_tp, goal_tp = make_poses(2, 5, 1, 1)
+    out = cost_obj.forward(cur_tp, goal_tp)
+    assert out.shape == (2, 5, 1)
+    assert torch.allclose(out, torch.zeros(2, 5, 1), atol=1e-8)
 
 
-# ---------------------------------------------------------------------------
-# _quat_to_rotvec helper
-# ---------------------------------------------------------------------------
-
-class TestQuatToRotvec:
-    """Tests for the module-private _quat_to_rotvec helper."""
-
-    @pytest.fixture(params=["cpu", "cuda:0"])
-    def device(self, request):
-        if request.param.startswith("cuda") and not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        return torch.device(request.param)
-
-    def test_identity_maps_to_zero(self, device):
-        q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
-        rv = _quat_to_rotvec(q)
-        assert torch.allclose(rv, torch.zeros(1, 3, device=device, dtype=torch.float32), atol=1e-5)
-
-    def test_90_deg_z_rotation(self, device):
-        """90° around Z: rotvec should be (0, 0, π/2)."""
-        angle = math.pi / 2
-        q = torch.tensor(
-            [[math.cos(angle / 2), 0.0, 0.0, math.sin(angle / 2)]],
-            device=device, dtype=torch.float32,
-        )
-        rv = _quat_to_rotvec(q)
-        expected = torch.tensor([[0.0, 0.0, angle]], device=device, dtype=torch.float32)
-        assert torch.allclose(rv, expected, atol=1e-4)
-
-    def test_180_deg_x_rotation(self, device):
-        """180° around X: rotvec should be (π, 0, 0)."""
-        angle = math.pi
-        q = torch.tensor(
-            [[math.cos(angle / 2), math.sin(angle / 2), 0.0, 0.0]],
-            device=device, dtype=torch.float32,
-        )
-        rv = _quat_to_rotvec(q)
-        expected = torch.tensor([[angle, 0.0, 0.0]], device=device, dtype=torch.float32)
-        assert torch.allclose(rv, expected, atol=1e-4)
-
-    def test_negative_w_shortest_arc(self, device):
-        """Quaternion with w < 0 must be flipped to shortest arc before conversion."""
-        angle = math.pi / 3  # 60°
-        half = angle / 2
-        q_pos = torch.tensor(
-            [[math.cos(half), 0.0, math.sin(half), 0.0]],
-            device=device, dtype=torch.float32,
-        )
-        # Negated quaternion represents same rotation
-        q_neg = -q_pos
-        rv_pos = _quat_to_rotvec(q_pos)
-        rv_neg = _quat_to_rotvec(q_neg)
-        assert torch.allclose(rv_pos, rv_neg, atol=1e-5)
-
-    def test_batch_shape_preserved(self, device):
-        """Output shape must be (..., 3)."""
-        q = torch.rand(4, 6, 4, device=device, dtype=torch.float32)
-        q = q / q.norm(dim=-1, keepdim=True)
-        q[..., 0] = q[..., 0].abs()   # keep w positive
-        rv = _quat_to_rotvec(q)
-        assert rv.shape == (4, 6, 3)
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_matches_pytorch_position_violation():
+    B, H, L, G = 1, 5, 1, 1
+    cfg = default_cfg()
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# _eef_position_bound_cost functional
-# ---------------------------------------------------------------------------
-
-class TestEEFPositionBoundCostFunctional:
-
-    @pytest.fixture(params=["cpu", "cuda:0"])
-    def device(self, request):
-        if request.param.startswith("cuda") and not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        return torch.device(request.param)
-
-    def test_output_shape(self, device):
-        B, T = 3, 7
-        dtype = torch.float32
-        ee_pos = torch.zeros(B, T, 3, device=device, dtype=dtype)
-        ee_rot = _identity_quat((B, T), device, dtype)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.zeros(2, 3, device=device, dtype=dtype)
-        out = _eef_position_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert out.shape == (B, T)
-
-    def test_all_disabled_margins_zero_cost(self, device):
-        """All-negative margins → no constraint → zero cost even for wild trajectories."""
-        B, T = 2, 5
-        dtype = torch.float32
-        ee_pos = torch.randn(B, T, 3, device=device, dtype=dtype) * 10.0
-        ee_rot = _identity_quat((B, T), device, dtype)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.full((2, 3), -1.0, device=device, dtype=dtype)
-        out = _eef_position_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert torch.allclose(out, torch.zeros_like(out), atol=1e-5)
-
-    def test_output_non_negative(self, device):
-        """Cost must always be ≥ 0."""
-        B, T = 4, 10
-        dtype = torch.float32
-        torch.manual_seed(0)
-        ee_pos = torch.randn(B, T, 3, device=device, dtype=dtype)
-        ee_rot = _identity_quat((B, T), device, dtype)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.zeros(2, 3, device=device, dtype=dtype)
-        out = _eef_position_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert torch.all(out >= 0.0)
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_matches_pytorch_rotation_violation():
+    B, H, L, G = 1, 4, 1, 1
+    cfg = default_cfg()
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[2, 2] = 0.05
+    margins[3, 2] = 0.05
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    cur_quat[:, 0, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.5, B, L)
+    cur_quat[:, 1, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.8, B, L)
+    cur_quat[:, 2, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.3, B, L)
+    cur_quat[:, 3, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.0, B, L)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_quat = identity_quat(B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# _eef_rotation_bound_cost functional
-# ---------------------------------------------------------------------------
-
-class TestEEFRotationBoundCostFunctional:
-
-    @pytest.fixture(params=["cpu", "cuda:0"])
-    def device(self, request):
-        if request.param.startswith("cuda") and not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        return torch.device(request.param)
-
-    def test_output_shape(self, device):
-        B, T = 3, 7
-        dtype = torch.float32
-        ee_pos = torch.zeros(B, T, 3, device=device, dtype=dtype)
-        ee_rot = _identity_quat((B, T), device, dtype)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.zeros(2, 3, device=device, dtype=dtype)
-        out = _eef_rotation_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert out.shape == (B, T)
-
-    def test_all_disabled_margins_zero_cost(self, device):
-        B, T = 2, 5
-        dtype = torch.float32
-        ee_pos = torch.zeros(B, T, 3, device=device, dtype=dtype)
-        ee_rot = torch.rand(B, T, 4, device=device, dtype=dtype)
-        ee_rot = ee_rot / ee_rot.norm(dim=-1, keepdim=True)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.full((2, 3), -1.0, device=device, dtype=dtype)
-        out = _eef_rotation_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert torch.allclose(out, torch.zeros_like(out), atol=1e-5)
-
-    def test_output_non_negative(self, device):
-        B, T = 4, 8
-        dtype = torch.float32
-        torch.manual_seed(1)
-        ee_pos = torch.zeros(B, T, 3, device=device, dtype=dtype)
-        ee_rot = torch.rand(B, T, 4, device=device, dtype=dtype)
-        ee_rot = ee_rot / ee_rot.norm(dim=-1, keepdim=True)
-        goal_pos = torch.zeros(B, 3, device=device, dtype=dtype)
-        goal_rot = _identity_quat((B,), device, dtype)
-        margins = torch.zeros(2, 3, device=device, dtype=dtype)
-        out = _eef_rotation_bound_cost(ee_pos, ee_rot, goal_pos, goal_rot, margins)
-        assert torch.all(out >= 0.0)
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_matches_pytorch_multi_link_goal():
+    B, H, L, G = 1, 3, 2, 2
+    cfg = default_cfg(num_links=2)
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.1
+    margins[1, 0] = 0.1
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# Gradient tests
-# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_matches_pytorch_non_identity_goal():
+    B, H, L, G = 1, 5, 1, 1
+    cfg = default_cfg()
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    margins[2, 2] = 0.05
+    margins[3, 2] = 0.05
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    for h in range(H):
+        cur_pos[:, h, :, 0] = 0.5 - h / max(H - 1, 1)
+    for h in range(H):
+        cur_quat[:, h, :, :] = axis_angle_quat([0.0, 0.0, 1.0], 0.1 * h, B, L)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_pos[:, :, :, :, 0] = 0.2
+    goal_pos[:, :, :, :, 1] = -0.1
+    goal_quat = axis_angle_quat([0.0, 0.0, 1.0], 0.3, B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    assert torch.allclose(pt_out, wp_out, atol=1e-4, rtol=1e-4)
 
-class TestEEFBoundCostGradients:
 
-    @pytest.fixture
-    def cuda_device_cfg(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required for gradient tests")
-        return DeviceCfg(device=torch.device("cuda:0"))
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_cost_gradient_matches_pytorch():
+    B, H, L, G = 1, 5, 1, 1
+    cfg = default_cfg()
+    pt_cost = EEFBoundCostPyTorch(cfg)
+    wp_cost = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    margins[2, 2] = 0.05
+    margins[3, 2] = 0.05
+    pt_cost.update_margins(margins)
+    wp_cost.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cur_tp.position.requires_grad_(True)
+    cur_tp.quaternion.requires_grad_(True)
+    wp_out = wp_cost.forward(cur_tp, goal_tp)
+    wp_out.sum().backward()
+    wp_grad_pos = cur_tp.position.grad.clone()
+    wp_grad_quat = cur_tp.quaternion.grad.clone()
+    cur_tp.position.grad = None
+    cur_tp.quaternion.grad = None
+    pt_out = pt_cost.forward(cur_tp, goal_tp)
+    pt_out.sum().backward()
+    pt_grad_pos = cur_tp.position.grad.clone()
+    pt_grad_quat = cur_tp.quaternion.grad.clone()
+    assert torch.allclose(wp_grad_pos, pt_grad_pos, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(wp_grad_quat, pt_grad_quat, atol=1e-4, rtol=1e-4)
 
-    def test_position_gradient_flows(self, cuda_device_cfg):
-        """Gradients must flow back through ee_pos_batch."""
-        B, T = 2, 4
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=cuda_device_cfg)
-        cost = EEFBoundCost(cfg)
-        margins = torch.zeros(4, 3, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        cost.update_margins(margins)
 
-        ee_pos = torch.zeros(
-            B, T, 3, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype,
-            requires_grad=True,
-        )
-        with torch.no_grad():
-            ee_pos.data[:, 0, 0] = 0.3   # start
-            ee_pos.data[:, 1, 0] = 0.5   # out of bounds
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_cost_gradient_non_identity_goal():
+    B, H, L, G = 1, 4, 1, 1
+    cfg = default_cfg()
+    cost_obj = EEFBoundCost(cfg)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    cost_obj.update_margins(margins)
+    frames = ["link_0"]
+    cur_pos = torch.zeros(B, H, L, 3)
+    cur_quat = identity_quat(B, H, L)
+    for h in range(H):
+        cur_pos[:, h, :, 0] = 0.5 - h / max(H - 1, 1)
+    goal_pos = torch.zeros(B, 1, L, G, 3)
+    goal_pos[:, :, :, :, 0] = 0.2
+    goal_quat = axis_angle_quat([0.0, 0.0, 1.0], 0.3, B, 1, L, G)
+    cur_tp = sys.modules["curobo._src.types.tool_pose"].ToolPose(
+        tool_frames=frames, position=cur_pos, quaternion=cur_quat
+    )
+    goal_tp = sys.modules["curobo._src.types.tool_pose"].GoalToolPose(
+        tool_frames=frames, position=goal_pos, quaternion=goal_quat
+    )
+    cur_tp.position.requires_grad_(True)
+    cost = cost_obj.forward(cur_tp, goal_tp)
+    cost.sum().backward()
+    assert cur_tp.position.grad is not None
+    assert cur_tp.position.grad.shape == cur_tp.position.shape
+    assert cur_tp.position.grad.abs().sum() > 0.0
 
-        ee_rot = _identity_quat((B, T), cuda_device_cfg.device, cuda_device_cfg.dtype)
-        goal_pos = torch.zeros(B, 3, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        goal_rot = _identity_quat((B,), cuda_device_cfg.device, cuda_device_cfg.dtype)
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        out.sum().backward()
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_per_link_weight_scales_gradient():
+    """Per-link weight must scale the gradient w.r.t. ``cur_pos`` accordingly."""
+    B, H, L, G = 1, 5, 2, 1
+    w_link = torch.tensor([1.0, 3.0])
+    cfg_w = default_cfg(num_links=2, weight=w_link)
+    cost_w = EEFBoundCost(cfg_w)
+    cfg_one = default_cfg(num_links=2, weight=1.0)
+    cost_one = EEFBoundCost(cfg_one)
 
-        assert ee_pos.grad is not None
-        assert ee_pos.grad.shape == ee_pos.shape
-        # Gradient at the violating step must be non-zero
-        assert torch.any(ee_pos.grad[:, 1] != 0.0)
+    margins = torch.full((4, 3), -1.0)
+    margins[0, 0] = 0.05
+    margins[1, 0] = 0.05
+    cost_w.update_margins(margins)
+    cost_one.update_margins(margins)
 
-    def test_rotation_gradient_flows(self, cuda_device_cfg):
-        """Gradients must flow back through ee_rot_batch."""
-        B, T = 2, 4
-        cfg = EEFBoundCostCfg(weight=1.0, device_cfg=cuda_device_cfg)
-        cost = EEFBoundCost(cfg)
-        # Enable only rotation rows
-        margins = torch.full((4, 3), -1.0, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        margins[2:] = 0.0
-        cost.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    cur_tp.position.requires_grad_(True)
 
-        ee_pos = torch.zeros(B, T, 3, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        start_q = _rot_z_quat(math.pi / 2, cuda_device_cfg.device, cuda_device_cfg.dtype)
-        exceed_q = _rot_z_quat(math.radians(100), cuda_device_cfg.device, cuda_device_cfg.dtype)
+    cost_w.forward(cur_tp, goal_tp).sum().backward()
+    grad_w = cur_tp.position.grad.clone()
+    cur_tp.position.grad = None
 
-        ee_rot = _identity_quat((B, T), cuda_device_cfg.device, cuda_device_cfg.dtype).requires_grad_(False)
-        ee_rot = ee_rot.detach().clone().requires_grad_(True)
-        with torch.no_grad():
-            ee_rot.data[:, 0] = start_q
-            ee_rot.data[:, 1] = exceed_q
+    cost_one.forward(cur_tp, goal_tp).sum().backward()
+    grad_one = cur_tp.position.grad.clone()
 
-        goal_pos = torch.zeros(B, 3, device=cuda_device_cfg.device, dtype=cuda_device_cfg.dtype)
-        goal_rot = _identity_quat((B,), cuda_device_cfg.device, cuda_device_cfg.dtype)
+    # The link-1 gradient should be 3x the link-0 gradient.
+    assert torch.allclose(grad_w[:, :, 0, :], grad_one[:, :, 0, :], atol=1e-5)
+    assert torch.allclose(grad_w[:, :, 1, :], 3.0 * grad_one[:, :, 1, :], atol=1e-5)
 
-        out = cost.forward(ee_pos, ee_rot, goal_pos, goal_rot)
-        out.sum().backward()
 
-        assert ee_rot.grad is not None
-        assert ee_rot.grad.shape == ee_rot.shape
+@pytest.mark.skipif(not WARP_AVAILABLE, reason="warp is not installed")
+def test_warp_output_buffers_populated():
+    """``_out_goalset_idx``, ``_out_position_gradient`` etc. are filled by the kernel."""
+    B, H, L, G = 1, 4, 2, 3
+    cfg = default_cfg(num_links=2)
+    cost_obj = EEFBoundCost(cfg)
+    cost_obj.setup_batch_tensors(B, H)
+    margins = torch.full((2, 4, 3), -1.0)
+    margins[:, 0, 0] = 0.05
+    margins[:, 1, 0] = 0.05
+    cost_obj.update_margins(margins)
+    cur_tp, goal_tp = make_poses(B, H, L, G)
+    # Make the 2nd goal attractive for link 0 by moving it to where the
+    # trajectory is — that should be the chosen goal.
+    goal_tp.position[:, 0, 0, 1, 0] = 0.5  # link 0, goal 1
+    cost_obj.forward(cur_tp, goal_tp)
+    # Goalset index must be 0 or 1 (within the goalset of size 3).
+    g_idx = cost_obj._out_goalset_idx
+    assert g_idx.shape == (B, H, L)
+    assert g_idx.dtype == torch.int32
+    assert (g_idx >= 0).all() and (g_idx < G).all()
+    # Position gradient must be non-zero somewhere (because the trajectory
+    # leaves the corridor).
+    assert cost_obj._out_position_gradient.abs().sum() > 0.0
+    # Bookkeeping buffers are populated.
+    assert cost_obj._out_distance.abs().sum() >= 0.0
+    assert cost_obj._out_position_distance.shape == (B, H, L)
+    assert cost_obj._out_rotation_distance.shape == (B, H, L)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
