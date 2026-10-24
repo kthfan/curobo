@@ -1,0 +1,31 @@
+# CPU-only verification of the EEF bound cost (no GPU runner needed).
+# NOT for main: see cpu_verify/README.md; blocked by cpu-verify-guard.yml.
+name: cpu-verify
+
+on:
+  push:
+    branches: ["claude/brave-bardeen-di9ty0"]
+  workflow_dispatch:
+
+jobs:
+  eef-bound-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU-only dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install warp-lang numpy scipy pyyaml setuptools_scm matplotlib pytest pytest-xdist
+      - name: Existing EEF bound unit tests on CPU
+        run: PYTHONPATH=$PWD python -m pytest -n0 -p no:cacheprovider curobo/tests/_src/cost/test_cost_eef_bound.py
+      - name: CPU verification harness
+        run: python -m pytest cpu_verify
+      - name: Render figures
+        run: python cpu_verify/eef_bound/visualize_eef_bound.py --out cpu_verify_figures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eef-bound-figures
+          path: cpu_verify_figures/
