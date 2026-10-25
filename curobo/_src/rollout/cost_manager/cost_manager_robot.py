@@ -298,17 +298,19 @@ class RobotCostManager:
                     )
                     cost_collection.add(cost_value, "scene_collision")
 
-        # if self.has_cost("eef_bound"):
-        #     eef_bound_cost = self.get_cost("eef_bound")
-        #     if eef_bound_cost.enabled:
-        #         with self._stream_context("eef_bound"):
-        #             cost_value = eef_bound_cost.forward(
-        #                 state.tool_poses.position,
-        #                 state.tool_poses.quaternion,
-        #                 goal.link_goal_poses.position,
-        #                 goal.link_goal_poses.quaternion,
-        #             )
-        #             cost_collection.add(cost_value, "eef_bound")
+        # Tool pose bounds
+        if self.has_cost("eef_bound"):
+            eef_bound_cost = self.get_cost("eef_bound")
+            if eef_bound_cost.enabled:
+                with self._stream_context("eef_bound"):
+                    cost_value = eef_bound_cost.forward(
+                        state.tool_poses,
+                        goal.link_goal_poses if goal is not None else None,
+                        goal.idxs_link_pose if goal is not None else None,
+                        goal.link_start_poses if goal is not None else None,
+                        goal.idxs_current_js if goal is not None else None,
+                    )
+                    cost_collection.add(cost_value, "eef_bound")
 
         # Robot mesh collision
         if self.has_cost("mesh_collision"):
@@ -417,6 +419,9 @@ class RobotCostManager:
                 return
             if tool_pose_cost is not None:
                 tool_pose_cost.update_tool_pose_criteria(tool_pose_criteria)
+            eef_bound_cost = self.get_cost("eef_bound")
+            if eef_bound_cost is not None:
+                eef_bound_cost.update_tool_pose_criteria(tool_pose_criteria)
         if "dt" in kwargs:
             self.update_dt(kwargs["dt"])
 

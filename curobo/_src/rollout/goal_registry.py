@@ -15,7 +15,7 @@ from curobo._src.types.device_cfg import DeviceCfg
 
 # CuRobo
 from curobo._src.types.pose import Pose
-from curobo._src.types.tool_pose import GoalToolPose
+from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.logging import log_and_raise
 from curobo._src.util.tensor_util import (
     copy_or_clone,
@@ -40,6 +40,10 @@ class GoalRegistry:
     seed_goal_js: Optional[JointState] = None
     link_goal_poses: Optional[GoalToolPose] = None
     current_js: Optional[JointState] = None
+
+    #: Tool poses at ``current_js``, shape ``(n_problems, 1, num_links, 3/4)``, indexed with
+    #: ``idxs_current_js``. Filled by the solver when a cost needs the start pose.
+    link_start_poses: Optional[ToolPose] = None
 
     #: Time elapsed since the current robot state was observed. Shape: ``(n_problems,)``.
     #: Used by :class:`~curobo._src.cost.cost_cspace_position.PositionCSpaceCost` to tighten
@@ -130,6 +134,7 @@ class GoalRegistry:
         # across seeds, the data is the same, so could we just expand batch_idx
         goal_js = current_js = links_goal_pose = None
         seed_goal_js = None
+        link_start_poses = self.link_start_poses
 
         idxs_enable = idxs_link_pose = idxs_env = idxs_current_js = None
         idxs_goal_js = None
@@ -201,6 +206,7 @@ class GoalRegistry:
             idxs_goal_js=idxs_goal_js,
             idxs_seed_goal_js=idxs_seed_goal_js,
             link_goal_poses=links_goal_pose,
+            link_start_poses=link_start_poses,
             seed_enable_implicit_goal_js=seed_enable_implicit_goal_js,
             num_seeds=num_seeds,
             batch_size=batch_size,
@@ -220,6 +226,9 @@ class GoalRegistry:
             idxs_goal_js=self.idxs_goal_js if self.idxs_goal_js is not None else None,
             link_goal_poses=(
                 self.link_goal_poses.clone() if self.link_goal_poses is not None else None
+            ),
+            link_start_poses=(
+                self.link_start_poses.clone() if self.link_start_poses is not None else None
             ),
             num_goalset=self.num_goalset,
             idxs_seed_goal_js=(
@@ -272,6 +281,7 @@ class GoalRegistry:
         return GoalRegistry(
             goal_js=goal_state,
             link_goal_poses=links_goal_pose,
+            link_start_poses=self.link_start_poses,
             current_js=current_state,
             current_state_dt=self.current_state_dt,
             idxs_link_pose=batch_pose_idx,
@@ -323,6 +333,12 @@ class GoalRegistry:
                 self.link_goal_poses = goal.link_goal_poses
             else:
                 self.link_goal_poses.copy_(goal.link_goal_poses)
+
+        if goal.link_start_poses is not None:
+            if self.link_start_poses is None:
+                self.link_start_poses = goal.link_start_poses
+            else:
+                self.link_start_poses.copy_(goal.link_start_poses)
 
         self._update_batch_size()
 

@@ -947,3 +947,58 @@ class TestGoalManagerUpdateGoalBufferNewFields:
 
         assert buffer is not None
 
+
+
+class TestGoalManagerStartPoses:
+    """Start tool poses are computed from current_js when a start pose function is set."""
+
+    @staticmethod
+    def _start_pose_fn(joint_state):
+        # Stand-in for forward kinematics: position = first three joints.
+        from curobo._src.types.tool_pose import ToolPose
+
+        n = joint_state.position.shape[0]
+        quaternion = torch.zeros(n, 1, 1, 4, dtype=joint_state.position.dtype)
+        quaternion[..., 0] = 1.0
+        return ToolPose(
+            tool_frames=["ee_link"],
+            position=joint_state.position[:, :3].reshape(n, 1, 1, 3).clone(),
+            quaternion=quaternion,
+        )
+
+    def _current_js(self, value, cpu_device_cfg):
+        return JointState.from_position(
+            torch.full((4, 7), value, **cpu_device_cfg.as_torch_dict())
+        )
+
+    def test_without_fn_start_poses_stay_none(
+        self, goal_manager, sample_solve_state, sample_goal_poses, cpu_device_cfg
+    ):
+        buffer, _ = goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=sample_goal_poses,
+            current_js=self._current_js(0.1, cpu_device_cfg),
+        )
+        assert buffer.link_start_poses is None
+
+    def test_create_and_update_fill_start_poses(
+        self, goal_manager, sample_solve_state, sample_goal_poses, cpu_device_cfg
+    ):
+        goal_manager.set_start_pose_fn(self._start_pose_fn)
+        buffer, update_reference = goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=sample_goal_poses,
+            current_js=self._current_js(0.1, cpu_device_cfg),
+        )
+        assert update_reference
+        start_poses = buffer.link_start_poses
+        assert start_poses.position.shape == (4, 1, 1, 3)
+        assert torch.allclose(start_poses.position, torch.full_like(start_poses.position, 0.1))
+
+        buffer, update_reference = goal_manager.update_goal_buffer(
+            sample_solve_state, current_js=self._current_js(0.3, cpu_device_cfg)
+        )
+        assert not update_reference
+        # Updated in place so captured buffers stay valid.
+        assert buffer.link_start_poses is start_poses
+        assert torch.allclose(start_poses.position, torch.full_like(start_poses.position, 0.3))

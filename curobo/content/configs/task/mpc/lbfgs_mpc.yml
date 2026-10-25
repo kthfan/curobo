@@ -38,6 +38,8 @@ rollout:
       _terminal_pose_convergence_tolerance:
       - 0.0
       - 0.0
+    eef_bound_cfg:
+      weight: 10000.0
 
 
 

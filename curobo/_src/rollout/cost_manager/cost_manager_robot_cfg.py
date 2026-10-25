@@ -64,10 +64,9 @@ class RobotCostManagerCfg:
     #: disables pose-based objectives.
     tool_pose_cfg: Optional[ToolPoseCostCfg] = None
 
-    # EEF corridor bound
-    #: End-effector position/rotation corridor cost. None disables.
-    #: Activate per-axis constraints at runtime via
-    #: ``cost_manager.get_cost("ee_bound").update_margins(margins)``.
+    # Tool pose bounds
+    #: Cost keeping tool frames inside their :class:`ToolPoseBound` limits, set at runtime
+    #: through ``ToolPoseCriteria.bound``. None disables.
     eef_bound_cfg: Optional[EEFBoundCostCfg] = None
 
     # Robot mesh collision cost configuration.

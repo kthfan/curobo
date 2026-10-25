@@ -1,83 +1,45 @@
-﻿# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
-"""Configuration dataclass for :class:`EEFBoundCost`."""
+"""Configuration for :class:`~curobo._src.cost.cost_eef_bound.EEFBoundCost`."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Type
 
-import torch
-
 from curobo._src.cost.cost_base_cfg import BaseCostCfg
-from curobo._src.types.device_cfg import DeviceCfg
-
-# Import the cost class for the default class_type.  This is done at module
-# level to match the pattern used by other cuRobo cost configs.
-try:
-    from curobo._src.cost.cost_eef_bound import EEFBoundCost
-except ImportError:  # pragma: no cover - can happen during partial installs
-    EEFBoundCost = None  # type: ignore[misc, assignment]
+from curobo._src.cost.cost_eef_bound import EEFBoundCost
+from curobo._src.util.logging import log_and_raise
 
 
 @dataclass
 class EEFBoundCostCfg(BaseCostCfg):
-    """Configuration for the EEF bound / corridor cost.
+    """Configuration for the tool-frame bound cost.
 
-    Inherits :attr:`weight`, :attr:`device_cfg`, :attr:`convert_to_binary`, and
-    :attr:`use_grad_input` from :class:`BaseCostCfg`.
-
-    ``tool_frames`` must be a non-empty list of link names by the time the cost is
-    constructed. The robot cost manager fills it from the robot's tool frames when it is
-    left unset, mirroring :class:`ToolPoseCostCfg`.
+    The bounds themselves are runtime data: set them per link through
+    :attr:`ToolPoseCriteria.bound <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bound>`.
+    ``weight`` is a scalar or one value per tool frame.
     """
 
-    class_type: Type = EEFBoundCost  # type: ignore[assignment]
+    class_type: Type[EEFBoundCost] = EEFBoundCost
 
-    #: If ``True``, the configured margins are ignored and tight zero margins
-    #: are used for every enabled axis (i.e. the trajectory must stay strictly
-    #: inside the corridor).  This is useful for debugging / hard constraints.
-    disable_margin: bool = False
+    #: Tool frames the cost applies to. Left unset, the cost manager fills it with the robot's
+    #: tool frames.
+    tool_frames: Optional[List[str]] = None
 
-    #: Offset added to enabled position margins (m).
-    pos_margin_offset: float = 0.0
+    #: Widen every interval by the bound tolerances. Leave ``False`` for optimization costs
+    #: (zero margin gives smoother, better-converged paths) and set ``True`` for the metrics
+    #: constraint that decides feasibility.
+    use_tolerance: bool = False
 
-    #: Offset added to enabled rotation margins (rad).
-    rot_margin_offset: float = 0.0
-
-    #: List of link names for which to compute pose costs. Left empty, it is filled from the
-    #: robot's tool frames by the cost manager.
-    tool_frames: Optional[List[str]] = field(default_factory=list)
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.tool_frames:
-            self.set_tool_frames(self.tool_frames)
-
-    def set_tool_frames(self, tool_frames: List[str]) -> "EEFBoundCostCfg":
-        """Update the list of tool frames.  Returns ``self`` for chaining.
+    def set_tool_frames(self, tool_frames: List[str]) -> None:
+        """Set the tool frames the cost applies to.
 
         Args:
-            tool_frames: List of tool frames to set.
-
-        Raises:
-            ValueError: If ``tool_frames`` is empty or ``None``.
+            tool_frames: Non-empty list of unique link names.
         """
-        if tool_frames is None or len(tool_frames) == 0:
-            raise ValueError("tool_frames must be a non-empty list of link names")
+        if not tool_frames:
+            log_and_raise("EEFBoundCostCfg: tool_frames must be a non-empty list")
+        if len(set(tool_frames)) != len(tool_frames):
+            log_and_raise(f"EEFBoundCostCfg: tool_frames must be unique, got {tool_frames}")
         self.tool_frames = list(tool_frames)
-        # Re-run validation (re-dedupes etc.).
-        seen = set()
-        deduped: List[str] = []
-        for name in self.tool_frames:
-            if name not in seen:
-                seen.add(name)
-                deduped.append(name)
-        self.tool_frames = deduped
-        return self
-
-    @property
-    def num_links(self) -> int:
-        """Number of links controlled by this cost."""
-        return len(self.tool_frames) if self.tool_frames else 0

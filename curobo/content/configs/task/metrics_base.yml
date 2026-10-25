@@ -17,6 +17,10 @@ rollout:
       weight: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0] # position, velocity, acceleration, jerk, torque
       activation_distance: [0.0,0.0,0.0,0.0, 0.0] # for position, velocity, acceleration and jerk
       cost_type: STATE
+    eef_bound_cfg:
+      weight: 5000.0
+      use_tolerance: True
+      convert_to_binary: True
 
 
 
