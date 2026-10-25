@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from curobo._src.collision.attachment_manager import AttachmentManager
+from curobo._src.cost.tool_pose_bound import ToolPoseBound, find_tool_pose_bound_violations
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.collision.collision_scene import create_scene_collision
 from curobo._src.geom.types import SceneCfg
@@ -53,6 +54,7 @@ class MotionPlanner:
         self.device_cfg = config.device_cfg
         self.scene_collision_checker = None
         self._destroyed = False
+        self._tool_pose_bounds: Dict[str, ToolPoseBound] = {}
         self._initialize_components()
 
     def _initialize_components(self):
@@ -227,6 +229,7 @@ class MotionPlanner:
         """
         if current_state.ndim > 2:
             log_and_raise(f"current_state must be a 2D tensor, got shape: {current_state.shape}")
+        self._check_tool_pose_bounds(goal_tool_poses, current_state)
 
         if goal_tool_poses.num_goalset > 1:
             return self._plan_pose_goalset(
@@ -650,3 +653,24 @@ class MotionPlanner:
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.ik_solver.update_tool_pose_criteria(tool_pose_criteria)
         self.trajopt_solver.update_tool_pose_criteria(tool_pose_criteria)
+        for name, criteria in tool_pose_criteria.items():
+            if criteria.bound is None:
+                self._tool_pose_bounds.pop(name, None)
+            else:
+                self._tool_pose_bounds[name] = criteria.bound
+
+    def _check_tool_pose_bounds(self, goal_tool_poses: GoalToolPose, current_state: JointState):
+        """Raise if the start state or every goal violates a tool pose bound."""
+        if not self._tool_pose_bounds:
+            return
+        # Positions only, matching how the solvers read current_state.
+        start_tool_poses = self.compute_kinematics(
+            JointState.from_position(current_state.position)
+        ).tool_poses
+        start_tool_poses = start_tool_poses.reorder_links(goal_tool_poses.tool_frames)
+        bounds = {
+            k: v for k, v in self._tool_pose_bounds.items() if k in goal_tool_poses.tool_frames
+        }
+        violations = find_tool_pose_bound_violations(bounds, start_tool_poses, goal_tool_poses)
+        if violations:
+            log_and_raise("Tool pose bounds are violated:\n  " + "\n  ".join(violations))

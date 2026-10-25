@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 # CuRobo
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise
 
@@ -40,6 +41,10 @@ class ToolPoseCriteria:
 
     #: If true, the distance is computed after projecting the current pose to the goal frame.
     project_distance_to_goal: Union[torch.Tensor, bool] = False
+
+    #: Bounds on this tool frame over the whole trajectory, enforced by the ``eef_bound`` cost
+    #: and checked for feasibility. ``None`` leaves the tool frame unbounded.
+    bound: Optional[ToolPoseBound] = None
 
     device_cfg: DeviceCfg = DeviceCfg()
 
@@ -108,6 +113,7 @@ class ToolPoseCriteria:
             terminal_pose_convergence_tolerance=self.terminal_pose_convergence_tolerance.clone(),
             non_terminal_pose_convergence_tolerance=self.non_terminal_pose_convergence_tolerance.clone(),
             project_distance_to_goal=self.project_distance_to_goal.clone(),
+            bound=self.bound,
             device_cfg=self.device_cfg,
         )
 
@@ -129,6 +135,8 @@ class ToolPoseCriteria:
             )
         if other.project_distance_to_goal is not None:
             self.project_distance_to_goal[:] = other.project_distance_to_goal
+        # ``None`` clears the bound, so it is always copied.
+        self.bound = other.bound
 
     @staticmethod
     def track_position(xyz: List[float] = [1.0, 1.0, 1.0]):

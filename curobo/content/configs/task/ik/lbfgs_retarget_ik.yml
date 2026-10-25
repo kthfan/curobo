@@ -27,6 +27,8 @@ rollout:
         - 1.0e-8 #1.0e-6
       use_grad_input: false
       use_lie_group: false
+    eef_bound_cfg:
+      weight: 10000.0
 
 
   constraint_cfg:

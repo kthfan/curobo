@@ -95,6 +95,16 @@ class SolverCore:
             action_horizon=self.auxiliary_rollout.action_horizon,
         )
 
+        # Start-anchored tool pose bounds read the start pose from the goal buffer.
+        rollouts = [self.metrics_rollout, self.auxiliary_rollout] + self.optimizer_rollouts
+        if any("eef_bound" in r.get_cost_component_names() for r in rollouts):
+            # Positions only: like the c-space costs, current_js is in solver joint order.
+            self.goal_registry_manager.set_start_pose_fn(
+                lambda joint_state: self.compute_kinematics(
+                    JointState.from_position(joint_state.position)
+                ).tool_poses
+            )
+
         # Default initial state
         self.init_state = JointState.from_position(
             self.default_joint_position.unsqueeze(0),

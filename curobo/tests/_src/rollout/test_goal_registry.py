@@ -872,3 +872,41 @@ class TestGoalRegistryEdgeCases:
         assert registry.current_js is not None
         # Batch size should come from link_goal_poses
         assert registry.batch_size == sample_multi_link_goalset_pose.batch_size
+
+
+class TestLinkStartPoses:
+    """link_start_poses follows the goal registry through repeat, clone and copy."""
+
+    @staticmethod
+    def _start_poses(value, device_cfg):
+        from curobo._src.types.tool_pose import ToolPose
+
+        quaternion = torch.zeros(2, 1, 1, 4, **device_cfg.as_torch_dict())
+        quaternion[..., 0] = 1.0
+        return ToolPose(
+            tool_frames=["ee"],
+            position=torch.full((2, 1, 1, 3), value, **device_cfg.as_torch_dict()),
+            quaternion=quaternion,
+        )
+
+    def test_repeat_clone_copy(self, cpu_device_cfg):
+        current_js = JointState.from_position(torch.zeros(2, 7, **cpu_device_cfg.as_torch_dict()))
+        goal = GoalRegistry(
+            current_js=current_js, link_start_poses=self._start_poses(0.1, cpu_device_cfg)
+        )
+        repeated = goal.repeat_seeds(3)
+        assert repeated.link_start_poses is goal.link_start_poses
+        assert repeated.idxs_current_js.shape[0] == 6
+
+        cloned = goal.clone()
+        cloned_ptr = cloned.link_start_poses.position.data_ptr()
+        assert cloned_ptr != goal.link_start_poses.position.data_ptr()
+
+        target = GoalRegistry(current_js=current_js.clone())
+        target.copy_(goal)
+        assert target.link_start_poses is goal.link_start_poses
+        update = GoalRegistry(
+            current_js=current_js, link_start_poses=self._start_poses(0.4, cpu_device_cfg)
+        )
+        target.copy_(update)
+        assert torch.allclose(goal.link_start_poses.position, torch.full((2, 1, 1, 3), 0.4))

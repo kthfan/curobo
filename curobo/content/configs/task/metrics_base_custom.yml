@@ -20,6 +20,10 @@ rollout:
     mesh_collision_cfg:
       weight: 5000.0
       margin: 0
+    eef_bound_cfg:
+      weight: 5000.0
+      use_tolerance: True
+      convert_to_binary: True
 
 
 

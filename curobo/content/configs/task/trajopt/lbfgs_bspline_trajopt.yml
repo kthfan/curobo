@@ -85,3 +85,5 @@ rollout:
       weight:
       - 1000000.0
       - 100000.0
+    eef_bound_cfg:
+      weight: 10000.0

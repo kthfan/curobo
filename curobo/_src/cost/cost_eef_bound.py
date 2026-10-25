@@ -1,260 +1,230 @@
-﻿# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""Tool-frame bound cost: keeps tool frames inside per-link :class:`ToolPoseBound` limits.
 
-"""End-effector corridor / bound cost (Warp-based).
-
-This is the default cuRoboV2 implementation.  It uses the Warp kernel in
-``wp_torch_eef_bound`` for the forward pass; the Warp kernel itself computes
-the per-(B, H, L) cost **and** the per-link position / rotation gradient in
-the same launch.  A ``torch.autograd.Function`` caches those gradients and
-reuses them in ``backward`` so no ``wp.Tape`` or PyTorch re-evaluation is
-required.
-
-A legacy pure-PyTorch version is available in ``cost_eef_bound_py`` for
-reference and as the gradient ground-truth in unit tests.
-
-Per-link margins
-----------------
-``update_margins`` accepts a ``(4, 3)`` tensor (broadcast to all tool frames)
-or a ``(num_links, 4, 3)`` tensor so each link can have its own corridor
-widths.  Margins are ``(l, s, ax)`` shaped:
-
-    margins[l, 0, :]  – position start-side  (m),  negative → axis disabled
-    margins[l, 1, :]  – position goal-side   (m),  negative → axis disabled
-    margins[l, 2, :]  – rotation start-side  (rad), negative → axis disabled
-    margins[l, 3, :]  – rotation goal-side   (rad), negative → axis disabled
-
-Per-link / scalar weight
-------------------------
-``BaseCostCfg.weight`` may be:
-
-* a scalar tensor of shape ``()`` or ``(1,)`` — applies the same scalar to
-  every per-link cost before the sum over links;
-* a tensor of shape ``(num_links,)`` — applies per-link scaling so the
-  contribution of each tool frame can be tuned independently.
-
-The weight is applied inside :class:`EEFBoundCostFunction` so the cached
-position / rotation gradients can be re-used in ``backward`` without a
-second pass through the cost computation.
+Bounds are set per tool frame through
+:attr:`ToolPoseCriteria.bound <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bound>` and
+stored in fixed-size tensors, so updating them never changes the launched kernel (CUDA graph
+safe). Links without a bound contribute zero cost.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.cost.cost_base import BaseCost
+from curobo._src.cost.tool_pose_bound import UNBOUNDED, ToolPoseBound, ToolPoseBoundAnchor
+from curobo._src.cost.wp_eef_bound import EEFBoundCostFunction
+from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.logging import log_and_raise
 from curobo._src.util.warp import init_warp
 
-from curobo._src.cost.wp_torch_eef_bound import EEFBoundCostFunction
-
 if TYPE_CHECKING:
     from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
+    from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 
 
 class EEFBoundCost(BaseCost):
-    """Axis-aligned EEF position + orientation bound cost (per-link margins)."""
+    """Squared-hinge cost on tool-frame components expressed in a reference frame."""
 
-    def __init__(self, config: "EEFBoundCostCfg"):
+    def __init__(self, config: EEFBoundCostCfg):
+        """Allocate per-link bound tensors; all tool frames start unbounded."""
         super().__init__(config)
-        self.config: "EEFBoundCostCfg" = config
-
         if not config.tool_frames:
-            log_and_raise(
-                "EEFBoundCostCfg.tool_frames must be a non-empty list of link names; "
-                "call cfg.set_tool_frames([...]) before constructing the cost"
-            )
+            log_and_raise("EEFBoundCostCfg.tool_frames must be set before creating the cost")
         self.tool_frames = list(config.tool_frames)
-        self.num_links = len(self.tool_frames)
-
+        num_links = len(self.tool_frames)
+        if self._weight.numel() not in (1, num_links):
+            log_and_raise(
+                f"EEFBoundCost weight must have 1 or {num_links} values, "
+                + f"got {self._weight.numel()}"
+            )
         init_warp()
 
         device = self.device_cfg.device
         dtype = self.device_cfg.dtype
+        self._bounds: Dict[str, Optional[ToolPoseBound]] = {
+            name: None for name in self.tool_frames
+        }
+        self._anchor = torch.full((num_links,), -1, device=device, dtype=torch.int32)
+        self._offset_position = torch.zeros((num_links, 3), device=device, dtype=dtype)
+        self._offset_quaternion = torch.zeros((num_links, 4), device=device, dtype=dtype)
+        self._offset_quaternion[:, 0] = 1.0
+        self._position_lower = torch.full((num_links, 3), -UNBOUNDED, device=device, dtype=dtype)
+        self._position_upper = torch.full((num_links, 3), UNBOUNDED, device=device, dtype=dtype)
+        self._rotation_lower = torch.full((num_links, 3), -UNBOUNDED, device=device, dtype=dtype)
+        self._rotation_upper = torch.full((num_links, 3), UNBOUNDED, device=device, dtype=dtype)
+        self._max_swing = torch.full((num_links,), UNBOUNDED, device=device, dtype=dtype)
+        self._use_rotation = torch.zeros((num_links,), device=device, dtype=torch.int32)
+        # Placeholders for anchors that are not in use.
+        self._unused_position = torch.zeros((1, 3), device=device, dtype=dtype)
+        self._unused_quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
 
-        # Per-link margins, shape (L, 4, 3).
-        self._margins = torch.full((self.num_links, 4, 3), -1.0, device=device, dtype=dtype)
-        self._enabled = False
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     @property
-    def margins_enabled(self) -> bool:
-        """True when at least one axis on at least one link is constrained."""
-        return self._enabled
+    def tool_pose_bounds(self) -> Dict[str, Optional[ToolPoseBound]]:
+        """Current bound per tool frame (``None`` when unbounded)."""
+        return dict(self._bounds)
 
-    def update_margins(self, margins: Optional[torch.Tensor] = None) -> None:
-        """Set per-link corridor margins.
+    def uses_anchor(self, anchor: ToolPoseBoundAnchor) -> bool:
+        """True if any tool frame's bound is attached to ``anchor``."""
+        return any(b is not None and b.anchor == anchor for b in self._bounds.values())
+
+    def update_tool_pose_bounds(self, bounds: Dict[str, Optional[ToolPoseBound]]) -> None:
+        """Set or clear (``None``) the bound of the given tool frames.
 
         Args:
-            margins: Float tensor of shape ``(num_links, 4, 3)`` for per-link
-                margins or ``(4, 3)`` to broadcast the same margins to every
-                link.  Pass ``None`` to disable all constraints.
-
-        Raises:
-            ValueError: If ``margins`` shape is incompatible with ``num_links``.
+            bounds: Map from tool frame name to its bound.
         """
-        if margins is None:
-            self._margins.fill_(-1.0)
-            self._enabled = False
-            return
-
-        margins_t = margins.to(self._margins.device, dtype=self._margins.dtype)
-        if margins_t.dim() == 2 and tuple(margins_t.shape) == (4, 3):
-            margins_t = margins_t.unsqueeze(0).expand(self.num_links, -1, -1).contiguous()
-        elif tuple(margins_t.shape) != (self.num_links, 4, 3):
-            raise ValueError(
-                f"margins must have shape (4, 3) or ({self.num_links}, 4, 3); "
-                f"got {tuple(margins_t.shape)}"
+        for name, bound in bounds.items():
+            if name not in self._bounds:
+                log_and_raise(f"EEFBoundCost: unknown tool frame {name}, have {self.tool_frames}")
+            i = self.tool_frames.index(name)
+            self._bounds[name] = bound
+            if bound is None:
+                self._anchor[i] = -1
+                continue
+            offset_p, offset_q, pos_lo, pos_hi, rot_lo, rot_hi, max_swing = bound.stacked_values(
+                self.config.use_tolerance
             )
+            self._offset_position[i] = self._offset_position.new_tensor(offset_p)
+            self._offset_quaternion[i] = self._offset_quaternion.new_tensor(offset_q)
+            self._position_lower[i] = self._position_lower.new_tensor(pos_lo)
+            self._position_upper[i] = self._position_upper.new_tensor(pos_hi)
+            self._rotation_lower[i] = self._rotation_lower.new_tensor(rot_lo)
+            self._rotation_upper[i] = self._rotation_upper.new_tensor(rot_hi)
+            self._max_swing[i] = max_swing[0]
+            self._use_rotation[i] = int(bound.uses_rotation)
+            self._anchor[i] = bound.anchor.value
 
-        self._margins.copy_(margins_t)
-        self._enabled = True
+    def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]) -> None:
+        """Take the bounds from ``ToolPoseCriteria.bound`` of the given tool frames."""
+        self.update_tool_pose_bounds({k: v.bound for k, v in tool_pose_criteria.items()})
 
-    # ------------------------------------------------------------------
-    # BaseCost interface
-    # ------------------------------------------------------------------
-    def setup_batch_tensors(self, batch_size: int, horizon: int, **kwargs):
+    def setup_batch_tensors(self, batch_size: int, horizon: int):
+        """Allocate output buffers for a ``(batch_size, horizon)`` trajectory batch."""
         if batch_size != self._batch_size or horizon != self._horizon:
-            num_links = self.num_links
-            self._out_distance = torch.zeros(
-                (batch_size, horizon, 2 * num_links),
-                dtype=torch.float32,
-                device=self.device_cfg.device,
-            )
-            self._out_position_distance = torch.zeros(
-                (batch_size, horizon, num_links),
-                dtype=torch.float32,
-                device=self.device_cfg.device,
-            )
-            self._out_rotation_distance = torch.zeros(
-                (batch_size, horizon, num_links),
-                dtype=torch.float32,
-                device=self.device_cfg.device,
-            )
-            self._out_goalset_idx = torch.zeros(
-                (batch_size, horizon, num_links),
-                dtype=torch.int32,
-                device=self.device_cfg.device,
-            )
+            num_links = len(self.tool_frames)
+            kwargs = {"device": self.device_cfg.device, "dtype": self.device_cfg.dtype}
+            self._out_cost = torch.zeros((batch_size, horizon, num_links), **kwargs)
             self._out_position_gradient = torch.zeros(
-                (batch_size, horizon, num_links, 3),
-                dtype=torch.float32,
-                device=self.device_cfg.device,
+                (batch_size, horizon, num_links, 3), **kwargs
             )
-            self._out_rotation_gradient = torch.zeros(
-                (batch_size, horizon, num_links, 4),
-                dtype=torch.float32,
-                device=self.device_cfg.device,
+            self._out_quaternion_gradient = torch.zeros(
+                (batch_size, horizon, num_links, 4), **kwargs
+            )
+            self._unused_idxs = torch.zeros(
+                (batch_size,), device=self.device_cfg.device, dtype=torch.int32
             )
         super().setup_batch_tensors(batch_size, horizon)
 
     def forward(
         self,
         current_tool_poses: ToolPose,
-        goal_tool_poses: GoalToolPose,
+        goal_tool_poses: Optional[GoalToolPose] = None,
+        idxs_goal: Optional[torch.Tensor] = None,
+        start_tool_poses: Optional[ToolPose] = None,
+        idxs_start: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Compute the EEF bound cost.
+        """Compute the bound cost.
 
         Args:
-            current_tool_poses: Current EEF poses, shape ``(B, H, L, 3/4)``.
-            goal_tool_poses: Goal EEF poses, shape ``(B, H_goal, L, G, 3/4)``.
+            current_tool_poses: Tool poses ``(B, H, L, 3/4)``.
+            goal_tool_poses: Goals ``(B_goal, 1, L, G, 3/4)``; required by goal-anchored bounds.
+            idxs_goal: ``(B,)`` or ``(B, 1)`` index into the goal batch.
+            start_tool_poses: Start poses ``(B_start, 1, L, 3/4)``; required by start-anchored
+                bounds.
+            idxs_start: ``(B,)`` or ``(B, 1)`` index into the start batch.
+            **kwargs: Ignored; accepted for the common cost interface.
 
         Returns:
-            Cost tensor of shape ``(B, H, 1)``.
+            Cost ``(B, H, 1)``.
         """
-        B, H, L, _ = current_tool_poses.position.shape
-
-        if not self._enabled or not self._cost_enabled:
-            return torch.zeros(
-                (B, H, 1),
-                device=current_tool_poses.position.device,
-                dtype=current_tool_poses.position.dtype,
+        if current_tool_poses.tool_frames != self.tool_frames:
+            log_and_raise(
+                f"EEFBoundCost: tool frames {current_tool_poses.tool_frames} do not match "
+                + f"{self.tool_frames}"
             )
+        b, h, _, _ = current_tool_poses.position.shape
+        self.setup_batch_tensors(b, h)
 
-        if L != self.num_links:
-            raise ValueError(
-                f"current_tool_poses has L={L} links but cfg declares "
-                f"{self.num_links} tool_frames: {self.tool_frames}"
+        # Real goal / start arrays are passed whenever they are usable, so a CUDA graph
+        # captured before a bound switches anchor still reads valid memory.
+        goal_position, goal_quaternion = self._unused_position, self._unused_quaternion
+        idxs_goal_flat = self._unused_idxs
+        num_goalset = 1
+        goal_usable = (
+            goal_tool_poses is not None
+            and idxs_goal is not None
+            and goal_tool_poses.tool_frames == self.tool_frames
+            and goal_tool_poses.horizon == 1
+        )
+        if self.uses_anchor(ToolPoseBoundAnchor.GOAL) and not goal_usable:
+            log_and_raise(
+                "EEFBoundCost: a goal-anchored bound needs goal poses with horizon 1 for tool "
+                + f"frames {self.tool_frames} and idxs_goal"
             )
+        if goal_usable:
+            num_goalset = goal_tool_poses.num_goalset
+            goal_position = goal_tool_poses.position.reshape(-1, 3)
+            goal_quaternion = goal_tool_poses.quaternion.reshape(-1, 4)
+            idxs_goal_flat = self._flat_idxs(idxs_goal, b, "idxs_goal")
 
-        self.setup_batch_tensors(B, H)
-
-        # ---------- pick a single goal pose across horizon (static goals) ----
-        goal_pos = goal_tool_poses.position
-        goal_quat = goal_tool_poses.quaternion
-        if goal_pos.shape[1] == 1:
-            goal_pos0 = goal_pos[:, 0]   # (B, L, G, 3)
-            goal_quat0 = goal_quat[:, 0]  # (B, L, G, 4)
-        elif goal_pos.shape[1] > 1:
-            raise ValueError(
-                f"goal_tool_poses.horizon > 1 not supported, got {goal_pos.shape[1]}"
+        start_position, start_quaternion = self._unused_position, self._unused_quaternion
+        idxs_start_flat = self._unused_idxs
+        start_usable = (
+            start_tool_poses is not None
+            and idxs_start is not None
+            and start_tool_poses.tool_frames == self.tool_frames
+        )
+        if self.uses_anchor(ToolPoseBoundAnchor.START) and not start_usable:
+            log_and_raise(
+                "EEFBoundCost: a start-anchored bound needs the start state of the problem "
+                + f"(start poses for tool frames {self.tool_frames} and idxs_start)"
             )
-        else:
-            raise ValueError(
-                f"goal_tool_poses.horizon must be >= 1, got {goal_pos.shape[1]}"
-            )
+        if start_usable:
+            start_position = start_tool_poses.position.reshape(-1, 3)
+            start_quaternion = start_tool_poses.quaternion.reshape(-1, 4)
+            idxs_start_flat = self._flat_idxs(idxs_start, b, "idxs_start")
 
-        # ---------- start pose = current pose at t=0 ----------------------
-        start_pos = current_tool_poses.position[:, 0:1]    # (B, 1, L, 3)
-        start_quat = current_tool_poses.quaternion[:, 0:1]  # (B, 1, L, 4)
-
-        # ---------- per-axis margin offsets (applied to enabled axes) -------
-        margins = self._margins
-        if self.config.disable_margin:
-            margins = torch.zeros_like(margins)
-        else:
-            offset = torch.tensor(
-                [
-                    self.config.pos_margin_offset,
-                    self.config.pos_margin_offset,
-                    self.config.rot_margin_offset,
-                    self.config.rot_margin_offset,
-                ],
-                dtype=margins.dtype,
-                device=margins.device,
-            )  # shape (4,)
-            margins = torch.where(
-                margins >= 0,
-                torch.relu(margins + offset.view(1, 4, 1)),
-                margins,
-            )
-
-        # ---------- validate weight shape ----------------------------------
-        w = self._weight
-        if w.numel() not in (1, L):
-            raise ValueError(
-                f"weight must be a scalar tensor or have shape ({L},); "
-                f"got {tuple(w.shape)}"
-            )
-
-        # ---------- Warp kernel + autograd Function -------------------------
-        # The autograd function applies the weight (scalar or per-link) to
-        # the per-link cost internally, so backward can re-use the cached
-        # gradients from the kernel without any extra pass.
-        cost_BHL_w = EEFBoundCostFunction.apply(
+        cost = EEFBoundCostFunction.apply(
             current_tool_poses.position,
             current_tool_poses.quaternion,
-            start_pos,
-            start_quat,
-            goal_pos0,
-            goal_quat0,
-            margins,
-            w,
-            self._out_distance,
-            self._out_position_distance,
-            self._out_rotation_distance,
-            self._out_goalset_idx,
+            goal_position.detach().contiguous(),
+            goal_quaternion.detach().contiguous(),
+            idxs_goal_flat,
+            start_position.detach().contiguous(),
+            start_quaternion.detach().contiguous(),
+            idxs_start_flat,
+            self._anchor,
+            self._offset_position,
+            self._offset_quaternion,
+            self._position_lower,
+            self._position_upper,
+            self._rotation_lower,
+            self._rotation_upper,
+            self._max_swing,
+            self._use_rotation,
+            self._weight,
+            num_goalset,
+            self.config.use_grad_input,
+            self._out_cost,
             self._out_position_gradient,
-            self._out_rotation_gradient,
-        )  # shape (B, H, L) — per-link weighted cost
-
-        # ---------- sum across links ---------------------------------------
-        cost_BH = cost_BHL_w.sum(dim=-1)  # (B, H)
-        cost = cost_BH.unsqueeze(-1)       # (B, H, 1)
+            self._out_quaternion_gradient,
+        )
+        cost = cost.sum(dim=-1, keepdim=True)
+        if self.config.convert_to_binary:
+            cost = torch.clamp(cost, max=1.0)
+            cost = torch.where(cost > 0, cost + 1.0, cost)
         return cost
+
+    @staticmethod
+    def _flat_idxs(idxs: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
+        flat = idxs.reshape(-1)
+        if flat.shape[0] != batch_size:
+            log_and_raise(f"EEFBoundCost: {name} must have {batch_size} entries, got {flat.shape}")
+        if flat.dtype != torch.int32:
+            log_and_raise(f"EEFBoundCost: {name} must be int32, got {flat.dtype}")
+        return flat.contiguous()

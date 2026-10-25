@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 # Standard Library
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -16,7 +16,7 @@ from curobo._src.rollout.goal_registry import GoalRegistry
 from curobo._src.solver.solve_state import SolveState
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
-from curobo._src.types.tool_pose import GoalToolPose
+from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.logging import log_and_raise
 
 
@@ -37,6 +37,25 @@ class GoalManager:
         self._solve_state = None
         self._goal_buffer = None
         self._col = None
+        self._start_pose_fn: Optional[Callable[[JointState], ToolPose]] = None
+
+    def set_start_pose_fn(self, start_pose_fn: Optional[Callable[[JointState], ToolPose]]):
+        """Compute ``link_start_poses`` from ``current_js`` with ``start_pose_fn`` (FK).
+
+        Args:
+            start_pose_fn: Maps a ``(n_problems, dof)`` joint state to tool poses
+                ``(n_problems, 1, num_links, 3/4)``. ``None`` stops filling start poses.
+        """
+        self._start_pose_fn = start_pose_fn
+
+    def _update_start_poses(self, goal_buffer: GoalRegistry, current_js: JointState):
+        if self._start_pose_fn is None:
+            return
+        start_poses = self._start_pose_fn(current_js)
+        if goal_buffer.link_start_poses is None:
+            goal_buffer.link_start_poses = start_poses
+        else:
+            goal_buffer.link_start_poses.copy_(start_poses)
 
     def create_goal_buffer(
         self,
@@ -80,6 +99,7 @@ class GoalManager:
 
         if current_js is not None:
             goal_buffer.current_js = current_js
+            self._update_start_poses(goal_buffer, current_js)
 
         # Extract current_state_dt: prefer explicit argument, fall back to current_js.dt
         if current_state_dt is not None:
@@ -149,6 +169,7 @@ class GoalManager:
         else:
             if current_js is not None:
                 self._goal_buffer.current_js.copy_(current_js)
+                self._update_start_poses(self._goal_buffer, current_js)
             if goal_js is not None:
                 self._goal_buffer.goal_js.copy_(goal_js)
             if goal_tool_poses is not None:
@@ -224,6 +245,8 @@ class GoalManager:
                 self._goal_buffer.seed_enable_implicit_goal_js = goal.seed_enable_implicit_goal_js
         else:
             self._goal_buffer.copy_(goal, update_idx_buffers=False)
+        if goal.link_start_poses is None and goal.current_js is not None:
+            self._update_start_poses(self._goal_buffer, goal.current_js)
 
         return self._goal_buffer, update_reference
 
