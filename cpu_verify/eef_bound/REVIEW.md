@@ -2,6 +2,28 @@
 
 > NOT for main: see `cpu_verify/README.md`.
 
+## 現況：已重新設計
+
+原本的 margin 式 corridor cost 已在本分支的函式庫 commit 中改為 reference frame 式的 tool pose
+bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x, y, z, swing_x, swing_y, twist）
+都可以選填上下限，另有選填的 `max_swing`。下表各項目的處理方式：
+
+| ID | 狀態 |
+|---|---|
+| D1 | 已修：梯度精確、在 base frame，由 `test_cost_eef_bound.py` 的有限差分測試與本目錄的回歸檢查涵蓋 |
+| D2 | 已移除：`disable_margin` 隨舊 API 刪除 |
+| D3 | 已移除：PyTorch 參考類別刪除，改用 `tool_pose_bound_cost` 只做 forward 比對 |
+| D4 | 已修：kernel 透過 `idxs_link_pose` 取 goal |
+| D5 | 已修：cost manager 已接上，並加進 IK、trajopt、MPC 與 metrics 的設定檔 |
+| R1 | 已修：buffer 預先配置；有 goal/start 資料時一律傳入；kernel 檢查索引範圍 |
+| R2 | 已改：start 錨點改由 solver 對起始狀態做 FK |
+| R3 | 已改：平方 hinge |
+| R4、R6 | 已改：swing-twist 分解，梯度精確 |
+| R5 | 保留「取違反最小的 goal」的語意（使用者決定） |
+| R7 | 已清理（重寫的檔案沒有 BOM） |
+
+以下為原始的檢視紀錄。
+
 檢視對象：`origin/dev/eef_cost` @ `dac5bd7`
 （`cost_eef_bound.py`、`cost_eef_bound_cfg.py`、`cost_eef_bound_py.py`、`wp_torch_eef_bound.py`、
 `cost_manager_robot.py`）。

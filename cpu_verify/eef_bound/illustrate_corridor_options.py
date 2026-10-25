@@ -72,8 +72,13 @@ def _goal_box(ax, start: np.ndarray, title: str) -> None:
     k = int(np.argmax(np.linalg.norm(lateral, axis=1)))
     foot = corners[k] - lateral[k]
     ax.plot(*corners[k], "o", color=ORANGE, markersize=7)
-    ax.plot([corners[k][0], foot[0]], [corners[k][1], foot[1]], color=ORANGE, linewidth=1.5,
-            label=f"max deviation {np.linalg.norm(lateral[k]) * 100:.0f} cm")
+    ax.plot(
+        [corners[k][0], foot[0]],
+        [corners[k][1], foot[1]],
+        color=ORANGE,
+        linewidth=1.5,
+        label=f"max deviation {np.linalg.norm(lateral[k]) * 100:.0f} cm",
+    )
     ax.set_title(title, fontsize=10)
 
 
@@ -108,8 +113,15 @@ def _angle_cap(ax) -> None:
     ax.plot(t, np.degrees(slerp), color=BLUE, label="slerp path")
     ax.plot(t, np.degrees(wobble), color=ORANGE, label="path that swings away")
     over = wobble > cap
-    ax.fill_between(t, math.degrees(cap), np.degrees(wobble), where=over, color=ORANGE, alpha=0.25,
-                    label="hinge(θ − θ_max)")
+    ax.fill_between(
+        t,
+        math.degrees(cap),
+        np.degrees(wobble),
+        where=over,
+        color=ORANGE,
+        alpha=0.25,
+        label="hinge(θ − θ_max)",
+    )
     ax.set_xlabel("normalized time")
     ax.set_ylabel("θ = angle(goal⁻¹ · current) [deg]")
     ax.set_ylim(0, 95)
@@ -119,7 +131,9 @@ def _angle_cap(ax) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"))
+    parser.add_argument(
+        "--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+    )
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
     _style()
@@ -138,8 +152,10 @@ def main() -> None:
         ax.legend(fontsize=7.5, loc="lower right")
     axes[0].set_ylabel("goal-frame y [m]")
     _angle_cap(axes[3])
-    fig.suptitle(f"Position corridors (margin {MARGIN * 100:.0f} cm on every side) and rotation cap",
-                 fontsize=11)
+    fig.suptitle(
+        f"Position corridors (margin {MARGIN * 100:.0f} cm on every side) and rotation cap",
+        fontsize=11,
+    )
     fig.tight_layout()
     path = os.path.join(args.out, "corridor_options.png")
     fig.savefig(path, dpi=130)

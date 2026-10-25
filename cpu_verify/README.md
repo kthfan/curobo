@@ -24,8 +24,9 @@ matplotlib pytest`. No GPU, CUDA driver, or curobolib build is needed.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install warp-lang numpy scipy pyyaml setuptools_scm matplotlib pytest pytest-xdist
 
-# Existing unit tests, on CPU
-PYTHONPATH=$PWD python -m pytest -n0 -p no:cacheprovider curobo/tests/_src/cost/test_cost_eef_bound.py
+# Library unit tests for the bound cost, on CPU
+PYTHONPATH=$PWD python -m pytest -n0 -p no:cacheprovider \
+  curobo/tests/_src/cost/test_tool_pose_bound.py curobo/tests/_src/cost/test_cost_eef_bound.py
 
 # Verification harness (its own pytest.ini, single process)
 python -m pytest cpu_verify
@@ -42,11 +43,8 @@ and uploads the figures as an artifact.
 | File | Purpose |
 |---|---|
 | `conftest.py`, `pytest.ini` | Hide GPUs, put the repo root on `sys.path`, override the repo pytest options. |
-| `eef_bound/cpu_adapter.py` | Builders on CPU; a Python mirror of the CUDA quaternion-gradient → angular-gradient map; world-frame finite differences; the goal gather by `idxs_link_pose`. |
-| `eef_bound/test_eef_bound_cpu.py` | Sanity checks, plus `xfail(strict=True)` checks for each defect in `eef_bound/REVIEW.md`. |
-| `eef_bound/visualize_eef_bound.py` | Headless matplotlib diagnostics. |
-| `eef_bound/REVIEW.md` | Review findings and the verification plan. |
-
-When a defect is fixed on `dev/eef_cost` and merged in here, its strict-xfail check XPASSes
-and fails the run. Remove that `xfail` marker in the same merge, so the check becomes a
-regression test.
+| `eef_bound/cpu_adapter.py` | Builders on CPU; a Python mirror of the CUDA quaternion-gradient → angular-gradient map; base-frame finite differences. |
+| `eef_bound/test_eef_bound_cpu.py` | Regression checks for the review defects (D1, D4) on the redesigned cost. |
+| `eef_bound/visualize_eef_bound.py` | Headless matplotlib diagnostics of the bound cost. |
+| `eef_bound/illustrate_corridor_options.py` | Geometry sketch used during the design discussion. |
+| `eef_bound/REVIEW.md` | Review findings, the verification plan, and the redesign status. |

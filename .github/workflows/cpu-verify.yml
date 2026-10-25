@@ -19,8 +19,12 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install warp-lang numpy scipy pyyaml setuptools_scm matplotlib pytest pytest-xdist
-      - name: Existing EEF bound unit tests on CPU
-        run: PYTHONPATH=$PWD python -m pytest -n0 -p no:cacheprovider curobo/tests/_src/cost/test_cost_eef_bound.py
+      - name: Bound cost unit tests on CPU
+        run: >-
+          PYTHONPATH=$PWD python -m pytest -n0 -p no:cacheprovider
+          curobo/tests/_src/cost/test_tool_pose_bound.py
+          curobo/tests/_src/cost/test_cost_eef_bound.py
+          curobo/tests/_src/solver/test_manager_goal.py
       - name: CPU verification harness
         run: python -m pytest cpu_verify
       - name: Render figures
