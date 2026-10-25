@@ -47,4 +47,5 @@ and uploads the figures as an artifact.
 | `eef_bound/test_eef_bound_cpu.py` | Regression checks for the review defects (D1, D4) on the redesigned cost. |
 | `eef_bound/visualize_eef_bound.py` | Headless matplotlib diagnostics of the bound cost. |
 | `eef_bound/illustrate_corridor_options.py` | Geometry sketch used during the design discussion. |
+| `eef_bound/gpu_check.py` | End-to-end planner checks on a CUDA GPU (the only file here that needs one). |
 | `eef_bound/REVIEW.md` | Review findings, the verification plan, and the redesign status. |
