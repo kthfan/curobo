@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end GPU checks for tool pose bounds with the motion planner.
+"""End-to-end GPU checks for tool pose bounds with the motion planner and MPC.
 
 NOT for main: see ``cpu_verify/README.md``. Needs a CUDA GPU and a curobo build.
 
@@ -8,6 +8,9 @@ Run from the repository root::
 
     python cpu_verify/eef_bound/gpu_check.py                 # CUDA graphs on (default)
     python cpu_verify/eef_bound/gpu_check.py --no-cuda-graph # eager, for comparison
+    python cpu_verify/eef_bound/gpu_check.py --only M2 M3    # selected checks
+
+G1-G10 use the motion planner; M1-M4 run MPC in closed loop (the plan is executed perfectly).
 
 Each check prints PASS/FAIL with numbers; the exit code is the number of failed checks.
 """
@@ -267,23 +270,175 @@ CHECKS = [
 ]
 
 
+class MPCSetup:
+    """MPC solver, start state, and a closed-loop runner (the plan is executed perfectly)."""
+
+    def __init__(self, robot: str, scene: Optional[str], use_cuda_graph: bool, steps: int):
+        from curobo.model_predictive_control import (
+            ModelPredictiveControl,
+            ModelPredictiveControlCfg,
+        )
+
+        cfg = ModelPredictiveControlCfg.create(
+            robot=robot,
+            scene_model=scene,
+            use_cuda_graph=use_cuda_graph,
+            optimization_dt=0.025,
+            interpolation_steps=4,
+        )
+        self.mpc = ModelPredictiveControl(cfg)
+        self.steps = steps
+        self.ee = self.mpc.tool_frames[0]
+        self.start = JointState.from_position(
+            self.mpc.default_joint_position.clone().unsqueeze(0), joint_names=self.mpc.joint_names
+        )
+        self.start.velocity = torch.zeros_like(self.start.position)
+        self.start.acceleration = torch.zeros_like(self.start.position)
+        self.mpc.setup(self.start.clone())  # CUDA graphs are captured here, without bounds
+        self.device = self.start.position.device
+        self.start_p, self.start_q = self.fk(self.start.position)
+        self.start_p, self.start_q = self.start_p[0], self.start_q[0]
+
+    def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        tool = self.mpc.compute_kinematics(JointState.from_position(positions)).tool_poses
+        return tool.position[:, 0, 0], tool.quaternion[:, 0, 0]
+
+    def set_bound(self, bound: Optional[ToolPoseBound]):
+        criteria = ToolPoseCriteria(bound=bound, device_cfg=self.mpc.device_cfg)
+        self.mpc.update_tool_pose_criteria({self.ee: criteria})
+
+    def run(self, goal_p: torch.Tensor, goal_q: torch.Tensor) -> Dict[str, object]:
+        """Track the goal in closed loop; return executed positions, success flags and timing."""
+        state = self.start.clone()
+        self.mpc.reset_robot(state.clone())
+        goal = GoalToolPose(
+            tool_frames=[self.ee],
+            position=goal_p.view(1, 1, 1, 1, 3).clone(),
+            quaternion=goal_q.view(1, 1, 1, 1, 4).clone(),
+        )
+        if not self.mpc.update_goal_tool_poses(goal, run_ik=True):
+            raise RuntimeError("MPC goal IK failed")
+        executed, success, times = [state.position.clone()], [], []
+        for _ in range(self.steps):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            result = self.mpc.optimize_action_sequence(state)
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+            success.append(bool(result.success.view(-1)[0]))
+            actions = result.action_sequence
+            state = JointState.from_position(
+                actions.position[:, -1, :].clone(), joint_names=self.mpc.joint_names
+            )
+            state.velocity = actions.velocity[:, -1, :].clone()
+            state.acceleration = actions.acceleration[:, -1, :].clone()
+            executed.append(state.position.clone())
+        positions = torch.cat(executed, dim=0)
+        final_p = self.fk(positions[-1:])[0][0]
+        return {
+            "positions": positions,
+            "success_rate": sum(success) / len(success),
+            "step_ms": 1e3 * sorted(times)[len(times) // 2],
+            "final_error": (final_p - goal_p).norm().item(),
+        }
+
+
+@check("M1 MPC baseline without bounds")
+def m1_baseline(s: MPCSetup):
+    goal_p = s.start_p + torch.tensor([0.0, 0.2, 0.0], device=s.device)
+    r = s.run(goal_p, s.start_q)
+    dz = (s.fk(r["positions"])[0][:, 2] - s.start_p[2]).abs().max().item()
+    return r["final_error"] < 0.02, (
+        f"final error {r['final_error'] * 1e3:.1f} mm, max |dz| {dz * 1e3:.1f} mm, "
+        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms"
+    )
+
+
+@check("M2 MPC plane bound set after graph capture")
+def m2_plane(s: MPCSetup):
+    z0 = s.start_p[2].item()
+    bound = ToolPoseBound.plane(
+        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
+    )
+    s.set_bound(bound)
+    goal_p = s.start_p + torch.tensor([0.0, 0.2, 0.0], device=s.device)
+    r = s.run(goal_p, s.start_q)
+    dz = (s.fk(r["positions"])[0][:, 2] - z0).abs().max().item()
+    ok = dz <= 0.0025 and r["final_error"] < 0.02 and r["success_rate"] >= 0.9
+    return ok, (
+        f"max |dz| {dz * 1e3:.2f} mm (tol 2 mm), final error {r['final_error'] * 1e3:.1f} mm, "
+        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms"
+    )
+
+
+@check("M3 MPC orientation cone (goal anchor)")
+def m3_orientation(s: MPCSetup):
+    lim = math.radians(5)
+    bound = ToolPoseBound(max_swing=lim, rotation_tolerance=math.radians(1))
+    s.set_bound(bound)
+    goal_p = s.start_p + torch.tensor([0.1, 0.1, -0.05], device=s.device)
+    r = s.run(goal_p, s.start_q)
+    p, q = s.fk(r["positions"])
+    v = tool_pose_bound_violation(bound, p, q, goal_p.expand_as(p), s.start_q.expand_as(q))
+    ok = v.max().item() == 0.0 and r["final_error"] < 0.02
+    return ok, (
+        f"max swing violation {math.degrees(v[:, 6].max().item()):.2f} deg, "
+        f"final error {r['final_error'] * 1e3:.1f} mm, success {r['success_rate']:.0%}"
+    )
+
+
+@check("M4 MPC start anchor follows the robot (informational)")
+def m4_start_anchor(s: MPCSetup):
+    # The start pose is refreshed from the current state every step, so the plane moves
+    # with the robot; this reports how far the height drifts over the run.
+    s.set_bound(ToolPoseBound.plane("z", anchor="start", tolerance=0.002))
+    in_plane = _quat_rotate(s.start_q, torch.tensor([0.0, 0.2, 0.0], device=s.device))
+    r = s.run(s.start_p + in_plane, s.start_q)
+    p = s.fk(r["positions"])[0]
+    drift = (p - s.start_p) @ _quat_rotate(
+        s.start_q, torch.tensor([0.0, 0.0, 1.0], device=s.device)
+    )
+    return True, (
+        f"max drift along the start normal {drift.abs().max().item() * 1e3:.2f} mm, "
+        f"success {r['success_rate']:.0%}"
+    )
+
+
+MPC_CHECKS = [m1_baseline, m2_plane, m3_orientation, m4_start_anchor]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--robot", default="franka.yml")
     parser.add_argument("--scene", default="collision_test.yml", help="'none' for no scene")
     parser.add_argument("--no-cuda-graph", action="store_true")
-    parser.add_argument("--only", nargs="*", help="check ids to run, e.g. G2 G7")
+    parser.add_argument("--only", nargs="*", help="check ids to run, e.g. G2 G7 M2")
+    parser.add_argument("--mpc-steps", type=int, default=120)
+    parser.add_argument("--skip-mpc", action="store_true")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     scene = None if args.scene == "none" else args.scene
-    setup = Setup(args.robot, scene, use_cuda_graph=not args.no_cuda_graph)
-    print(f"robot={args.robot} scene={scene} cuda_graph={not args.no_cuda_graph} ee={setup.ee}")
-    print(f"start ee position {setup.start_p.tolist()}")
-    for run in CHECKS:
-        if args.only and run.check_name.split()[0] not in args.only:
-            continue
-        run(setup)
+
+    def selected(run) -> bool:
+        return not args.only or run.check_name.split()[0] in args.only
+
+    if any(selected(run) for run in CHECKS):
+        setup = Setup(args.robot, scene, use_cuda_graph=not args.no_cuda_graph)
+        print(
+            f"robot={args.robot} scene={scene} cuda_graph={not args.no_cuda_graph} ee={setup.ee}"
+        )
+        print(f"start ee position {setup.start_p.tolist()}")
+        for run in CHECKS:
+            if selected(run):
+                run(setup)
+        del setup
+        torch.cuda.empty_cache()
+    if not args.skip_mpc and any(selected(run) for run in MPC_CHECKS):
+        mpc_setup = MPCSetup(args.robot, scene, not args.no_cuda_graph, args.mpc_steps)
+        for run in MPC_CHECKS:
+            if selected(run):
+                run(mpc_setup)
     failed = [name for name, ok, _ in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
     for name in failed:
