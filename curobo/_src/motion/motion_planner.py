@@ -448,6 +448,12 @@ class MotionPlanner:
     ) -> GraspPlanResult:
         """Plan a grasp motion: goalset -> approach -> grasp -> lift.
 
+        Note:
+            Tool pose criteria set before this call, including ``ToolPoseCriteria.bound``, apply
+            to the goalset and approach phases only. The grasp and lift phases use fixed
+            linear-motion criteria without bounds, and all tool frames are reset to default
+            criteria when the call returns.
+
         Args:
             grasp_poses: Candidate grasp poses with ``num_goalset`` entries per link.
                 Construct via ``GoalToolPose`` with the desired goalset size.
