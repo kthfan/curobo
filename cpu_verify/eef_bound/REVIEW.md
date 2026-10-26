@@ -84,3 +84,22 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 - `curobo/` 內沒有任何 CPU 專用的 hook。Warp 本來就支援 `cpu` device，函式庫不需要改。
 - `cpu-verify-guard.yml` 會擋下任何帶有 harness 的、進入 `main` 的 PR。
 - 修正只以「只改 `curobo/`」的 commit port 到 `dev/eef_cost`，不合併這個分支。
+
+## 待辦與已知事項（不在本次修改範圍）
+
+| 項目 | 說明 | 狀態 |
+|---|---|---|
+| `plan_grasp` 與約束 | 呼叫前設定的 `bound` 只作用在 goalset 與 approach；grasp、lift 用固定的 linear-motion criteria（沒有約束），結束後所有 criteria 重設為預設值。已寫進 `plan_grasp` docstring（commit `0419744`） | 暫不修改 |
+| `ToolPoseCost` 旋轉梯度 0.5 倍 | `use_lie_group=False`（預設）時，kinematics 收到的旋轉梯度是 cost 真實梯度的一半，方向正確；`use_lie_group=True` 精確。成因見下 | 待決定是否另開 PR |
+| Graph planner（PRM） | 也使用 `metrics_base.yml`，但 `update_tool_pose_criteria` 不會傳給它，初始路徑不受約束 | 待處理 |
+| MPC | start 錨點每步跟隨目前狀態；違反約束只讓 `success` 為 False，機器人不會停（安全減速 fallback 在程式中被停用） | 已記錄 |
+
+### ToolPoseCost 0.5 倍的來源（依 git 紀錄）
+
+- 量測（CPU，`ToolPoseCost`）：誤差 1 rad 時 cost 為 1.0、真實梯度 2.0，kinematics 收到 1.0。
+- `wp_tool_pose.py::compute_rotation_error_axis_angle`：cost = w·θ²，梯度寫成 2·w·θ·axis（正確）。
+- `convert_angular_velocity_to_quaternion_rate`：輸出 `q ⊗ (ω, 0)`；docstring 說「scaled by 0.5」，但 `# quat_rate = 0.5 * quat_rate` 被註解掉。
+- kinematics backward `quaternion_gradient_to_angular_velocity`：ω = 0.5·vec(q⁻¹ ⊗ dq)，這是歐氏四元數梯度的正確轉換，因此把 `q ⊗ (ω, 0)` 還原成 ω/2。正確的編碼應為 `q ⊗ (0, 2ω)`。
+- cuRobo v1（`d64c4b0`）：pose distance 直接把角梯度寫進四元數梯度的 xyz 欄位，kinematics 也直接讀取，沒有 0.5，倍率為 1。
+- 兩組程式都來自 `457b658`「curobov2 initial release」（NVIDIA 作者，一次性大 commit），沒有逐行的歷史或說明。
+- 公開討論：NVlabs/curobo 的 issue 中沒有找到相關討論。
