@@ -40,7 +40,9 @@ class ToolPoseBoundAnchor(Enum):
     #: Goal pose of the tool frame. With a goalset, a pose is feasible if it satisfies the
     #: bound of any goal in the set.
     GOAL = 0
-    #: Tool frame pose at the start state of the problem.
+    #: Tool frame pose at the start state of the problem. In MPC the start state is the
+    #: current robot state, so the reference moves with the robot at every step; use GOAL or
+    #: BASE for a fixed reference.
     START = 1
     #: Robot base frame.
     BASE = 2
