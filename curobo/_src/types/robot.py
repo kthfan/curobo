@@ -61,6 +61,7 @@ class RobotCfg:
         device_cfg: DeviceCfg = DeviceCfg(),
         load_collision_spheres: bool = True,
         num_envs: int = 1,
+        load_collision_meshes: bool = False,
     ) -> "RobotCfg":
         """Create RobotCfg from a dictionary or return existing RobotCfg.
 
@@ -73,6 +74,9 @@ class RobotCfg:
                 from the robot config. Saves memory and compute when collision
                 checking is not needed.
             num_envs: Number of environment configurations for link_spheres.
+            load_collision_meshes: When True, also load the URDF ``<collision>`` meshes needed
+                by the exact mesh collision check, even if the robot config does not request
+                them. Ignored when ``data`` is already a RobotCfg.
 
         Returns:
             Configured RobotCfg instance.
@@ -89,6 +93,8 @@ class RobotCfg:
             kinematics_dict["device_cfg"] = device_cfg
             kinematics_dict["load_collision_spheres"] = load_collision_spheres
             kinematics_dict["num_envs"] = num_envs
+            if load_collision_meshes:
+                kinematics_dict["load_collision_meshes"] = True
             data_dict["kinematics"] = KinematicsCfg.from_config(
                 KinematicsLoaderCfg(**kinematics_dict)
             )

@@ -550,6 +550,8 @@ class TrajOptSolver:
             rotation_error=None,
             position_tolerance=self.config.position_tolerance,
             orientation_tolerance=self.config.orientation_tolerance,
+            position_tolerance_traj=self.config.position_tolerance_traj,
+            orientation_tolerance_traj=self.config.orientation_tolerance_traj,
             goalset_index=None,
             solve_time=0.0,
             debug_info={"solver": self.optimizer.get_recorded_trace()},
