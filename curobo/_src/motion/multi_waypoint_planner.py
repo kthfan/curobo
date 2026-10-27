@@ -65,7 +65,8 @@ class MultiWaypointMotionPlanner:
 
     def destroy(self):
         """Release CUDA graph resources held by the underlying solvers."""
-        if self._destroyed:
+        # Instances built without __init__ (test stubs) hold nothing to release.
+        if getattr(self, "_destroyed", True):
             return
         self._destroyed = True
         self.motion_planner.destroy()
@@ -307,7 +308,10 @@ class MultiWaypointMotionPlanner:
         elif result.interpolated_last_tstep is not None:
             last = int(result.interpolated_last_tstep.view(-1)[0].item())
             trajectory = trim_joint_state_trajectory(trajectory, 0, last + 1)
-        return trajectory[0]
+        # Results are [batch, (seeds,) horizon, dof]; keep the first trajectory.
+        while trajectory.position.ndim > 2:
+            trajectory = trajectory[0]
+        return trajectory
 
     # -- Public API --
 

@@ -144,6 +144,20 @@ class TestStitch:
         with pytest.raises(Exception):
             stitch_jointstate_trajectories([])
 
+    @pytest.mark.parametrize(
+        "shape, last_tstep, expected",
+        [((1, 1, 42, 9), 30, (31, 9)), ((1, 42, 9), None, (42, 9)), ((42, 9), None, (42, 9))],
+    )
+    def test_extract_segment_trajectory_is_2d(self, shape, last_tstep, expected):
+        """Segments handed to stitching are [horizon, dof] for any result layout."""
+        result = SimpleNamespace(
+            interpolated_trajectory=JointState.from_position(torch.zeros(*shape)),
+            js_solution=None,
+            interpolated_last_tstep=None if last_tstep is None else torch.tensor([last_tstep]),
+        )
+        segment = MultiWaypointMotionPlanner._extract_segment_trajectory(None, result)
+        assert segment.position.shape == expected
+
 
 # --------------------------------------------------------------------------- #
 # Shared-waypoint criteria merging
