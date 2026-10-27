@@ -20,12 +20,17 @@ from __future__ import annotations
 
 # Standard Library
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Third Party
 import torch
 
 # CuRobo
+from curobo._src.cost.tool_pose_bound import (
+    ToolPoseBound,
+    ToolPoseBoundAnchor,
+    tool_pose_bound_violation,
+)
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
 from curobo._src.motion.motion_planner import MotionPlanner
@@ -60,6 +65,8 @@ class MultiWaypointMotionPlanner:
         # planner is never left in a modified constraint state (mirrors how
         # ``plan_grasp`` restores ``standard_criteria``).
         self._baseline_criteria = {k: ToolPoseCriteria() for k in self.tool_frames}
+        # Bounds applied to every segment whose criteria leave the tool frame unbounded.
+        self._default_tool_pose_bounds: Dict[str, ToolPoseBound] = {}
 
     # -- Lifecycle --
 
@@ -113,6 +120,26 @@ class MultiWaypointMotionPlanner:
 
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.motion_planner.update_tool_pose_criteria(tool_pose_criteria)
+
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        """Set or clear (``None``) default tool pose bounds for all segments.
+
+        A default bound applies to every segment whose criteria leave that tool frame
+        unbounded; a bound in the segment's :class:`ToolPoseCriteria` takes precedence. Defaults
+        are kept across :meth:`plan_waypoints` calls.
+
+        Args:
+            tool_pose_bounds: Map from tool frame name to its bound.
+        """
+        for name, bound in tool_pose_bounds.items():
+            if name not in self._baseline_criteria:
+                log_and_raise(f"Unknown tool frame {name}, have {self.tool_frames}")
+            if bound is None:
+                self._default_tool_pose_bounds.pop(name, None)
+            else:
+                self._default_tool_pose_bounds[name] = bound
+            self._baseline_criteria[name].bound = bound
+        self.motion_planner.update_tool_pose_bounds(tool_pose_bounds)
 
     def update_world(self, scene_cfg):
         self.motion_planner.update_world(scene_cfg)
@@ -180,7 +207,9 @@ class MultiWaypointMotionPlanner:
 
         Waypoint 0 uses segment 0's criteria, the last waypoint uses the last
         segment's criteria, and every interior waypoint merges its two adjacent
-        segments' criteria.
+        segments' criteria. Tool pose bounds are dropped: their goal and start anchors refer
+        to the segment's endpoints, not to the waypoint IK problem, so IK solutions are
+        filtered against the bounds afterwards (:meth:`_filter_by_segment_bounds`).
         """
         if self.config.waypoint_constraint_merge_mode != "max_weights_min_tols":
             log_and_raise(
@@ -200,7 +229,41 @@ class MultiWaypointMotionPlanner:
                         segment_criteria[i - 1], segment_criteria[i]
                     )
                 )
-        return waypoint_criteria
+        return [self._without_bounds(criteria) for criteria in waypoint_criteria]
+
+    @staticmethod
+    def _without_bounds(
+        criteria: Dict[str, ToolPoseCriteria],
+    ) -> Dict[str, ToolPoseCriteria]:
+        """Return ``criteria`` with all tool pose bounds removed (unchanged if it has none)."""
+        if all(c.bound is None for c in criteria.values()):
+            return criteria
+        out = {}
+        for frame, c in criteria.items():
+            if c.bound is not None:
+                c = c.clone()
+                c.bound = None
+            out[frame] = c
+        return out
+
+    def _with_default_bounds(
+        self, criteria: Dict[str, ToolPoseCriteria]
+    ) -> Dict[str, ToolPoseCriteria]:
+        """Fill tool frames that ``criteria`` leaves unbounded with the default bounds.
+
+        Tool frames missing from ``criteria`` get the baseline criteria with the default bound.
+        """
+        if not self._default_tool_pose_bounds:
+            return criteria
+        out = dict(criteria)
+        for frame, bound in self._default_tool_pose_bounds.items():
+            if frame not in out:
+                out[frame] = self._baseline_criteria[frame]
+            elif out[frame].bound is None:
+                c = out[frame].clone()
+                c.bound = bound
+                out[frame] = c
+        return out
 
     # -- Edge construction --
 
@@ -371,7 +434,7 @@ class MultiWaypointMotionPlanner:
                     self.reset_seed()
 
                 ik_sets, status = self._generate_ik_layers(
-                    waypoints, waypoint_criteria, start_state
+                    waypoints, waypoint_criteria, start_state, segment_criteria
                 )
                 if ik_sets is None:
                     result.status = status
@@ -435,15 +498,19 @@ class MultiWaypointMotionPlanner:
             )
         # Empty criteria dicts fall back to baseline (track-everything) so a
         # segment never silently reuses the previous segment's constraints.
-        return [crit if crit else self._baseline_criteria for crit in segment_criteria]
+        return [
+            self._with_default_bounds(crit if crit else self._baseline_criteria)
+            for crit in segment_criteria
+        ]
 
     def _generate_ik_layers(
         self,
         waypoints: List[GoalToolPose],
         waypoint_criteria: List[Dict[str, ToolPoseCriteria]],
         start_state: JointState,
+        segment_criteria: List[Dict[str, ToolPoseCriteria]],
     ):
-        """Solve and de-duplicate IK per waypoint. Returns (ik_sets, status)."""
+        """Solve, bound-filter, and de-duplicate IK per waypoint. Returns (ik_sets, status)."""
         dof = self.action_dim
         ik_sets: List[torch.Tensor] = []
         for i, waypoint in enumerate(waypoints):
@@ -458,10 +525,76 @@ class MultiWaypointMotionPlanner:
             good = solutions[success]
             if good.shape[0] == 0:
                 return None, f"No IK solution at waypoint {i}."
+            good = self._filter_by_segment_bounds(good, i, waypoints, segment_criteria)
+            if good.shape[0] == 0:
+                return None, (
+                    f"No IK solution at waypoint {i} satisfies the tool pose bounds of its "
+                    + "segments."
+                )
             ik_sets.append(
                 dedup_joint_solutions(good, self.config.ik_dedup_joint_tol)
             )
         return ik_sets, None
+
+    def _filter_by_segment_bounds(
+        self,
+        solutions: torch.Tensor,
+        waypoint_index: int,
+        waypoints: List[GoalToolPose],
+        segment_criteria: List[Dict[str, ToolPoseCriteria]],
+    ) -> torch.Tensor:
+        """Keep IK solutions whose tool poses satisfy the bounds of the adjacent segments.
+
+        Waypoint ``i`` ends segment ``i - 1`` and starts segment ``i``. Goal anchors resolve to
+        the segment's goal waypoint and start anchors of segment ``i`` to the solution itself.
+        Start anchors of segment ``i - 1`` depend on the node chosen at waypoint ``i - 1`` and
+        are left to the segment's trajectory optimization.
+
+        Args:
+            solutions: Joint configurations ``(N, dof)`` at waypoint ``waypoint_index``.
+            waypoint_index: Index of the waypoint.
+            waypoints: All waypoints.
+            segment_criteria: Per-segment criteria.
+
+        Returns:
+            The feasible solutions ``(M, dof)``, ``M <= N``.
+        """
+        checks: List[Tuple[str, ToolPoseBound, GoalToolPose]] = []
+        if waypoint_index > 0:
+            for frame, c in segment_criteria[waypoint_index - 1].items():
+                if c.bound is not None and c.bound.anchor != ToolPoseBoundAnchor.START:
+                    checks.append((frame, c.bound, waypoints[waypoint_index]))
+        if waypoint_index < len(segment_criteria):
+            for frame, c in segment_criteria[waypoint_index].items():
+                if c.bound is not None:
+                    checks.append((frame, c.bound, waypoints[waypoint_index + 1]))
+        if not checks:
+            return solutions
+
+        tool_poses = self.compute_kinematics(
+            JointState.from_position(solutions, self.joint_names)
+        ).tool_poses
+        keep = torch.ones(solutions.shape[0], dtype=torch.bool, device=solutions.device)
+        for frame, bound, goal in checks:
+            li = tool_poses.tool_frames.index(frame)
+            position = tool_poses.position[:, 0, li].unsqueeze(1)  # (N, 1, 3)
+            quaternion = tool_poses.quaternion[:, 0, li].unsqueeze(1)
+            if bound.anchor == ToolPoseBoundAnchor.GOAL:
+                if frame not in goal.tool_frames:
+                    continue
+                gi = goal.tool_frames.index(frame)
+                anchor_p = goal.position[0, 0, gi].unsqueeze(0)  # (1, G, 3)
+                anchor_q = goal.quaternion[0, 0, gi].unsqueeze(0)
+            elif bound.anchor == ToolPoseBoundAnchor.START:
+                anchor_p, anchor_q = position, quaternion
+            else:
+                anchor_p = torch.zeros_like(position)
+                anchor_q = torch.zeros_like(quaternion)
+                anchor_q[..., 0] = 1.0
+            # (N, A, 7); feasible if the bound of any anchor (goalset entry) is satisfied.
+            violation = tool_pose_bound_violation(bound, position, quaternion, anchor_p, anchor_q)
+            keep &= (violation.amax(dim=-1) == 0.0).any(dim=-1)
+        return solutions[keep]
 
     def _plan_all_segments(
         self,
