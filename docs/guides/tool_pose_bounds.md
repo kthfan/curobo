@@ -115,6 +115,36 @@ Adjust them as follows:
   trajectory optimization, and MPC task configs (default `1e5`). A higher weight competes more
   strongly with the other costs, such as collision avoidance.
 
+## Bound multi-waypoint plans
+
+{py:class}`~curobo.multi_waypoint_planner.MultiWaypointMotionPlanner` plans each segment
+between two waypoints separately. A `"goal"` bound refers to the waypoint that ends the segment
+and a `"start"` bound to the waypoint that starts it.
+
+- To bound one segment, set `bound` on that segment's criteria.
+- To bound every segment, call `update_tool_pose_bounds` on the multi-waypoint planner. The
+  bound applies to each segment whose criteria leave the tool frame unbounded, and stays set
+  until you clear it with `None`.
+
+```python
+from curobo.types import ToolPoseBound, ToolPoseCriteria
+
+frame = planner.tool_frames[0]
+insert = ToolPoseCriteria.track_position_and_orientation()
+insert.bound = ToolPoseBound.line("z", lower=-0.12, upper=0.0)  # along the goal z axis onto at_part
+result = planner.plan_waypoints(
+    [above_part, at_part],
+    start_state,
+    segment_tool_pose_criteria=[{frame: insert}],
+)
+```
+
+IK solutions at a waypoint that violate the bounds of its adjacent segments are discarded. If
+none remain, planning fails with the status
+`No IK solution at waypoint i satisfies the tool pose bounds of its segments.` A `"start"` bound
+of the segment that ends at the waypoint depends on the previous waypoint's solution, so the
+segment's trajectory optimization checks it instead.
+
 ## Handle errors
 
 | Error | Cause | Fix |
@@ -131,7 +161,3 @@ Adjust them as follows:
 - {py:meth}`~curobo.motion_planner.MotionPlanner.plan_grasp` applies bounds to the goalset and
   approach phases only. The grasp and lift phases use their own linear-motion criteria, and the
   criteria of all tool frames are reset when the call returns.
-- {py:class}`~curobo.multi_waypoint_planner.MultiWaypointMotionPlanner` sets the tool pose
-  criteria of each segment itself, which replaces bounds set with `update_tool_pose_bounds`. Pass
-  bounds through the `bound` field of each segment's criteria instead. Interior waypoints are
-  solved without bounds, and the start and goal check of `plan_pose` is not run.
