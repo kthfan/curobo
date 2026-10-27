@@ -103,3 +103,11 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 - cuRobo v1（`d64c4b0`）：pose distance 直接把角梯度寫進四元數梯度的 xyz 欄位，kinematics 也直接讀取，沒有 0.5，倍率為 1。
 - 兩組程式都來自 `457b658`「curobov2 initial release」（NVIDIA 作者，一次性大 commit），沒有逐行的歷史或說明。
 - 公開討論：NVlabs/curobo 的 issue 中沒有找到相關討論。
+
+## GPU 驗證結果（franka, collision_test.yml）
+
+- 單元測試全數通過；`gpu_check.py` 17/17 通過（含 CUDA graph 錄製後才設定約束、MPC）。
+- margin（cost 往內縮）：`band`（±3 mm 不等式）在 margin 0 時成功率 75–88%，margin ≥ 1 mm 時三種權重皆 100%。預設 1 mm / 0.01 rad 維持。
+- 等式軸（`plane`、`line` 的側向）不受 margin 影響（cost 區間固定為 0），只受權重影響；1e4 時 `line` 成功率 75%，1e5 與 1e6 為 100%。
+- 規劃結果中等式軸的最大偏移接近 tolerance（1e5 時 plane 約 1.9 mm / tol 2 mm、line 約 2.5–2.9 mm / tol 3 mm），RMS 則小得多（0.8 mm、1.0 mm）；1e6 時 RMS 降到 0.25 mm、0.38 mm。MPC（每步都評估）在 1e5 時偏移僅 0.3 mm，推測規劃的最大偏移出現在優化取樣點之間（插值後的軌跡），待確認。
+- 每組只有 8 個 goal，相同設定（例如 plane 不同 margin）之間 75% 與 100% 的差異屬雜訊，不宜據此挑選設定。
