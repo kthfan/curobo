@@ -15,3 +15,10 @@ Writing Optimization Problems
    custom_cost
    custom_optimization
 
+Motion Planning
+---------------
+
+.. toctree::
+   :maxdepth: 1
+
+   tool_pose_bounds
