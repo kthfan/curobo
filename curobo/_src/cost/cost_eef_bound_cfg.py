@@ -27,10 +27,10 @@ class EEFBoundCostCfg(BaseCostCfg):
     #: tool frames.
     tool_frames: Optional[List[str]] = None
 
-    #: Widen every interval by the bound tolerances. Leave ``False`` for optimization costs
-    #: (zero margin gives smoother, better-converged paths) and set ``True`` for the metrics
-    #: constraint that decides feasibility.
-    use_tolerance: bool = False
+    #: ``False`` (optimization cost): each interval side is shrunk inward by the bound margin so
+    #: paths stay inside the user's bounds. ``True`` (metrics constraint deciding feasibility):
+    #: the user's bounds, with the tolerance only on sides the cost could not shrink.
+    metric: bool = False
 
     def set_tool_frames(self, tool_frames: List[str]) -> None:
         """Set the tool frames the cost applies to.

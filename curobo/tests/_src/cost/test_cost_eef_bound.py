@@ -105,6 +105,10 @@ class Problem:
         return cost.forward(tool_poses, self.goal, self.idxs, self.start, self.idxs)
 
     def reference(self, bound):
+        return self.reference_per_anchor(bound).min(dim=-1).values
+
+    def reference_per_anchor(self, bound):
+        """PyTorch cost against every anchor candidate, ``(B, H, A)``."""
         idx = self.idxs.long()
         if bound.anchor.name == "GOAL":
             anchor_p = self.goal.position[idx, 0, 0]
@@ -123,7 +127,7 @@ class Problem:
             anchor_p.unsqueeze(1),
             anchor_q.unsqueeze(1),
         )
-        return cost.min(dim=-1).values
+        return cost
 
 
 def world_omega(quaternion, quaternion_grad):
@@ -179,8 +183,17 @@ def test_gradient_matches_finite_difference(device_cfg, name):
         minus = problem.evaluate(cost, quaternion=q_minus).clone()
         fd_rotation[..., k] = (plus - minus)[..., 0] / (2 * eps)
 
-    assert torch.allclose(position_grad, fd_position, atol=2e-3, rtol=1e-2)
-    assert torch.allclose(omega, fd_rotation, atol=5e-3, rtol=1e-2)
+    # Skip samples where two goalset candidates have nearly equal cost: the minimum switches
+    # goals there, so the cost is not differentiable and finite differences straddle the switch.
+    per_anchor = problem.reference_per_anchor(bound)
+    if per_anchor.shape[-1] > 1:
+        best_two = per_anchor.topk(2, dim=-1, largest=False).values
+        clear = (best_two[..., 1] - best_two[..., 0]) > 1e-2
+    else:
+        clear = torch.ones(per_anchor.shape[:2], dtype=torch.bool, device=per_anchor.device)
+    assert clear.sum() >= clear.numel() // 2
+    assert torch.allclose(position_grad[clear], fd_position[clear], atol=2e-3, rtol=1e-2)
+    assert torch.allclose(omega[clear], fd_rotation[clear], atol=5e-3, rtol=1e-2)
 
 
 def test_no_bound_is_zero(device_cfg):
@@ -229,7 +242,7 @@ def test_tolerance_and_binary(device_cfg):
     assert torch.allclose(optim.forward(tool_poses)[0, :, 0], expected, atol=1e-8)
 
     metrics = make_cost(
-        device_cfg, {"ee": bound}, weight=5000.0, use_tolerance=True, convert_to_binary=True
+        device_cfg, {"ee": bound}, weight=5000.0, metric=True, convert_to_binary=True
     )
     feasible = metrics.forward(tool_poses)[0, :, 0]
     assert feasible[0].item() == 0.0 and feasible[1].item() == 0.0

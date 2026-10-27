@@ -12,8 +12,15 @@ of the start state), or the robot base frame. The tool pose is expressed in the 
   rotation vector (radians) says where the tool z axis points; the twist is the rotation about
   the tool z axis.
 
-Each component has an optional ``[lower, upper]`` interval. The optimization cost uses the
-interval as is; feasibility checks widen it by ``position_tolerance`` / ``rotation_tolerance``.
+Each component has an optional ``[lower, upper]`` interval, used in two ways:
+
+* the optimization cost shrinks each finite side inward by the margin
+  (``position_margin`` / ``rotation_margin``) but never past the reference, so optimized paths
+  stay inside the user's interval instead of settling just outside it;
+* the feasibility check (metrics, planner start/goal check) uses the user's interval. A side
+  the cost could not shrink by the full margin (an equality, or a side within the margin of the
+  reference) is widened by the tolerance (``position_tolerance`` / ``rotation_tolerance``),
+  since the cost cannot keep paths strictly inside there.
 """
 
 from __future__ import annotations
@@ -30,6 +37,10 @@ from curobo._src.util.logging import log_and_raise
 
 #: Magnitude used for unbounded interval ends inside kernels.
 UNBOUNDED = 1.0e9
+
+#: Slack (m or rad) added to every finite side in feasibility checks to absorb float32 noise of
+#: forward kinematics, e.g. a start pose lying exactly on a bound.
+METRIC_EPSILON = 1.0e-5
 
 _AXES = ("x", "y", "z")
 
@@ -90,12 +101,21 @@ class ToolPoseBound:
     #: axis. ``None`` is unbounded.
     max_swing: Optional[float] = None
 
-    #: Slack (m) added to every position interval when checking feasibility.
-    position_tolerance: float = 0.0
+    #: Distance (m) the optimization cost moves each finite position side inward, never past the
+    #: reference. Must exceed how far the optimizer overshoots an active bound.
+    position_margin: float = 0.001
 
-    #: Slack (rad) added to every rotation interval and to ``max_swing`` when checking
-    #: feasibility.
-    rotation_tolerance: float = 0.0
+    #: Angle (rad) the optimization cost moves each finite rotation side and ``max_swing``
+    #: inward, never past the reference.
+    rotation_margin: float = 0.01
+
+    #: Slack (m) the feasibility check adds to position sides the cost could not shrink by the
+    #: full margin, e.g. both sides of an equality.
+    position_tolerance: float = 0.002
+
+    #: Slack (rad) the feasibility check adds to rotation sides (and ``max_swing``) the cost could
+    #: not shrink by the full margin.
+    rotation_tolerance: float = 0.02
 
     def __post_init__(self):
         """Normalize inputs and validate intervals against the reference pose."""
@@ -119,8 +139,14 @@ class ToolPoseBound:
         self.position_upper = _optional_vec3(self.position_upper, "position_upper")
         self.rotation_lower = _optional_vec3(self.rotation_lower, "rotation_lower")
         self.rotation_upper = _optional_vec3(self.rotation_upper, "rotation_upper")
-        if self.position_tolerance < 0.0 or self.rotation_tolerance < 0.0:
-            log_and_raise("position_tolerance and rotation_tolerance must be >= 0")
+        for name in (
+            "position_margin",
+            "rotation_margin",
+            "position_tolerance",
+            "rotation_tolerance",
+        ):
+            if getattr(self, name) < 0.0:
+                log_and_raise(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.max_swing is not None and not 0.0 <= self.max_swing <= math.pi:
             log_and_raise(f"max_swing must be in [0, pi], got {self.max_swing}")
 
@@ -148,34 +174,49 @@ class ToolPoseBound:
             v is not None for v in self.rotation_lower + self.rotation_upper
         )
 
-    def stacked_values(self, use_tolerance: bool) -> Tuple[List[float], ...]:
+    def stacked_values(self, metric: bool) -> Tuple[List[float], ...]:
         """Return kernel-ready values with ``±UNBOUNDED`` for missing bounds.
 
         Args:
-            use_tolerance: Widen intervals by the tolerances (feasibility checks).
+            metric: ``True`` for the feasibility interval (user bounds, tolerance on sides the cost
+                cannot shrink, plus :data:`METRIC_EPSILON`); ``False`` for the optimization cost
+                interval (sides shrunk inward by the margin, never past the reference).
 
         Returns:
             ``(offset_position[3], offset_quaternion[4], position_lower[3], position_upper[3],
             rotation_lower[3], rotation_upper[3], [max_swing])``.
         """
-        pos_tol = self.position_tolerance if use_tolerance else 0.0
-        rot_tol = self.rotation_tolerance if use_tolerance else 0.0
-
-        def lower(values, tol):
-            return [-UNBOUNDED if v is None else v - tol for v in values]
-
-        def upper(values, tol):
-            return [UNBOUNDED if v is None else v + tol for v in values]
-
+        pos_lo, pos_hi = _intervals(
+            self.position_lower,
+            self.position_upper,
+            self.position_margin,
+            self.position_tolerance,
+            metric,
+        )
+        rot_lo, rot_hi = _intervals(
+            self.rotation_lower,
+            self.rotation_upper,
+            self.rotation_margin,
+            self.rotation_tolerance,
+            metric,
+        )
+        if self.max_swing is None:
+            max_swing = UNBOUNDED
+        elif metric:
+            soft = self.max_swing <= self.rotation_margin
+            max_swing = (
+                self.max_swing + (self.rotation_tolerance if soft else 0.0) + METRIC_EPSILON
+            )
+        else:
+            max_swing = max(self.max_swing - self.rotation_margin, 0.0)
         offset_q = self.offset_quaternion or [1.0, 0.0, 0.0, 0.0]
-        max_swing = UNBOUNDED if self.max_swing is None else self.max_swing + rot_tol
         return (
             [0.0 if v is None else v for v in self.offset_position],
             list(offset_q),
-            lower(self.position_lower, pos_tol),
-            upper(self.position_upper, pos_tol),
-            lower(self.rotation_lower, rot_tol),
-            upper(self.rotation_upper, rot_tol),
+            pos_lo,
+            pos_hi,
+            rot_lo,
+            rot_hi,
             [max_swing],
         )
 
@@ -183,11 +224,15 @@ class ToolPoseBound:
     def plane(
         normal_axis: str = "z",
         anchor: Union[ToolPoseBoundAnchor, str] = ToolPoseBoundAnchor.GOAL,
-        tolerance: float = 0.0,
+        tolerance: Optional[float] = None,
         offset_position: Optional[Sequence[Optional[float]]] = None,
         offset_quaternion: Optional[Sequence[float]] = None,
     ) -> ToolPoseBound:
-        """Keep the tool frame on the reference plane normal to ``normal_axis``."""
+        """Keep the tool frame on the reference plane normal to ``normal_axis``.
+
+        The plane is an equality: the cost pulls onto it and feasibility allows ``±tolerance`` (m);
+        ``None`` keeps the default :attr:`position_tolerance`.
+        """
         k = _axis_index(normal_axis)
         bound = [None, None, None]
         bound[k] = 0.0
@@ -197,7 +242,7 @@ class ToolPoseBound:
             offset_quaternion=offset_quaternion,
             position_lower=bound,
             position_upper=list(bound),
-            position_tolerance=tolerance,
+            **_tolerance_kwargs(tolerance),
         )
 
     @staticmethod
@@ -206,9 +251,13 @@ class ToolPoseBound:
         lower: Optional[float] = None,
         upper: Optional[float] = None,
         anchor: Union[ToolPoseBoundAnchor, str] = ToolPoseBoundAnchor.GOAL,
-        tolerance: float = 0.0,
+        tolerance: Optional[float] = None,
     ) -> ToolPoseBound:
-        """Keep the tool frame on the reference ``axis``, within ``[lower, upper]`` along it."""
+        """Keep the tool frame on the reference ``axis``, within ``[lower, upper]`` along it.
+
+        The two lateral axes are equalities with ``±tolerance`` (m) feasibility slack; ``None``
+        keeps the default :attr:`position_tolerance`.
+        """
         k = _axis_index(axis)
         lo = [0.0, 0.0, 0.0]
         hi = [0.0, 0.0, 0.0]
@@ -218,8 +267,38 @@ class ToolPoseBound:
             anchor=anchor,
             position_lower=lo,
             position_upper=hi,
-            position_tolerance=tolerance,
+            **_tolerance_kwargs(tolerance),
         )
+
+
+def _tolerance_kwargs(tolerance: Optional[float]) -> Dict[str, float]:
+    return {} if tolerance is None else {"position_tolerance": tolerance}
+
+
+def _intervals(
+    lowers: List[Optional[float]],
+    uppers: List[Optional[float]],
+    margin: float,
+    tolerance: float,
+    metric: bool,
+) -> Tuple[List[float], List[float]]:
+    """Per-component cost or feasibility interval; see :meth:`ToolPoseBound.stacked_values`."""
+    out_lo, out_hi = [], []
+    for lo, hi in zip(lowers, uppers):
+        if lo is None:
+            out_lo.append(-UNBOUNDED)
+        elif metric:
+            # A side within the margin of the reference could not be shrunk: it is soft.
+            out_lo.append(lo - (tolerance if -lo <= margin else 0.0) - METRIC_EPSILON)
+        else:
+            out_lo.append(min(lo + margin, 0.0))
+        if hi is None:
+            out_hi.append(UNBOUNDED)
+        elif metric:
+            out_hi.append(hi + (tolerance if hi <= margin else 0.0) + METRIC_EPSILON)
+        else:
+            out_hi.append(max(hi - margin, 0.0))
+    return out_lo, out_hi
 
 
 def _axis_index(axis: str) -> int:
@@ -309,7 +388,7 @@ def tool_pose_bound_reference(
     anchor_quaternion: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return the reference pose ``T_anchor * T_offset`` for ``(..., 3/4)`` anchors."""
-    offset_p, offset_q, *_ = bound.stacked_values(use_tolerance=False)
+    offset_p, offset_q, *_ = bound.stacked_values(metric=False)
     offset_p = anchor_position.new_tensor(offset_p)
     offset_q = anchor_quaternion.new_tensor(offset_q)
     position = anchor_position + _quat_rotate(
@@ -325,7 +404,7 @@ def tool_pose_bound_violation(
     quaternion: torch.Tensor,
     anchor_position: torch.Tensor,
     anchor_quaternion: torch.Tensor,
-    use_tolerance: bool = True,
+    metric: bool = True,
 ) -> torch.Tensor:
     """Per-component violation of ``bound`` (0 where satisfied).
 
@@ -335,7 +414,8 @@ def tool_pose_bound_violation(
         quaternion: ``(..., 4)`` tool orientations (wxyz).
         anchor_position: ``(..., 3)`` anchor positions (broadcastable).
         anchor_quaternion: ``(..., 4)`` anchor orientations (broadcastable).
-        use_tolerance: Widen intervals by the bound tolerances.
+        metric: Use the feasibility interval (``True``) or the optimization cost interval
+            (``False``); see :meth:`ToolPoseBound.stacked_values`.
 
     Returns:
         ``(..., 7)`` non-negative violations of ``(x, y, z, swing_x, swing_y, twist,
@@ -343,7 +423,7 @@ def tool_pose_bound_violation(
     """
     ref_p, ref_q = tool_pose_bound_reference(bound, anchor_position, anchor_quaternion)
     components, swing_angle = tool_pose_bound_components(position, quaternion, ref_p, ref_q)
-    _, _, pos_lo, pos_hi, rot_lo, rot_hi, max_swing = bound.stacked_values(use_tolerance)
+    _, _, pos_lo, pos_hi, rot_lo, rot_hi, max_swing = bound.stacked_values(metric)
     lower = components.new_tensor(pos_lo + rot_lo)
     upper = components.new_tensor(pos_hi + rot_hi)
     violation = torch.relu(lower - components) + torch.relu(components - upper)
@@ -357,11 +437,11 @@ def tool_pose_bound_cost(
     quaternion: torch.Tensor,
     anchor_position: torch.Tensor,
     anchor_quaternion: torch.Tensor,
-    use_tolerance: bool = False,
+    metric: bool = False,
 ) -> torch.Tensor:
     """Squared-hinge cost ``0.5 * sum(violation²)`` matching the Warp kernel (unweighted)."""
     violation = tool_pose_bound_violation(
-        bound, position, quaternion, anchor_position, anchor_quaternion, use_tolerance
+        bound, position, quaternion, anchor_position, anchor_quaternion, metric
     )
     return 0.5 * (violation * violation).sum(dim=-1)
 
