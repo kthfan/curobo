@@ -20,6 +20,8 @@ Optimization & Planning
 
    optimization_solver
    graph_planner
+   multi_waypoint_planner
+   mesh_collision
 
 
 

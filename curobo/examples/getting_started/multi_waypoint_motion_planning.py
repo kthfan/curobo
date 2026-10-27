@@ -1,40 +1,88 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Plan a single trajectory through several Cartesian waypoints.
+"""Plan one trajectory through several Cartesian waypoints.
 
-Multi-waypoint planning extends pose-to-pose motion planning to an *ordered
-list* of Cartesian waypoints.  For each waypoint the planner generates a set of
-inverse-kinematics (IK) solutions and de-duplicates them; for each consecutive
-pair of waypoints it runs configuration-space trajectory optimization on the
-edges between IK nodes; failed edges are pruned; the cheapest surviving path
-through the layers is found; and the chosen per-segment trajectories are
-stitched into one trajectory.
+Pose-to-pose motion planning moves the tool to one goal. Many tasks are a
+sequence of goals instead: move above a part, descend onto it, slide it along
+a surface. The multi-waypoint planner takes an *ordered list* of Cartesian
+waypoints and returns a single joint trajectory that passes through all of
+them. Each segment, the motion between two consecutive waypoints, can use its
+own tool pose criteria, for example free motion for a transfer and a
+straight line for an approach.
 
-Each segment (the edge between two consecutive waypoints) may use different
-tool-pose criteria.  A waypoint shared by two segments uses the *merge* of both
-segments' criteria (stronger axis weights, stricter convergence tolerances), so
-the trajectory satisfies both segments at the junction.
+By the end of this tutorial you will have:
 
-Run the tutorial
-----------------
+- Created a multi-waypoint planner for the Franka Panda robot
+- Built three reachable Cartesian waypoints
+- Set tool pose criteria for each segment
+- Planned one stitched trajectory through all waypoints and saved a plot
+
+Step 1: Run the tutorial
+------------------------
 
 .. code-block:: bash
 
    python -m curobo.examples.getting_started.multi_waypoint_motion_planning
 
-Output files are written to ``~/.cache/curobo/`` by default.
+Step 2: Check the output
+------------------------
 
-Pipeline
---------
+When the tutorial finishes successfully you will see output like::
 
-1. **Initialize the planner**: Load the robot config (``franka.yml``).
-2. **Build waypoints**: Here we derive three reachable waypoints by running
-   forward kinematics on perturbed joint configurations, guaranteeing IK
-   solutions exist.
-3. **Per-segment criteria**: Provide one tool-pose criteria dict per segment.
-4. **Plan**: ``plan_waypoints`` returns a ``MultiWaypointPlanResult`` with the
-   stitched ``composed_trajectory`` and the raw per-segment solver results.
+    === Multi-Waypoint Motion Planning ===
+    ✓ Multi-waypoint planning succeeded!
+      Attempts: 1
+      Chosen IK node per waypoint: [0, 3, 1]
+      Segments: 2
+      Composed trajectory has 180 waypoints
+    Trajectory plot saved to: ~/.cache/curobo/examples/multi_waypoint_motion_planning/multi_waypoint_plan.pdf
+
+The chosen IK indices and the trajectory length vary between runs. Output
+files are written to ``~/.cache/curobo/`` by default; override with
+``--output-dir``.
+
+Step 3: Understand the pipeline
+-------------------------------
+
+1. **Create the planner**: ``MultiWaypointMotionPlannerCfg.create`` takes the
+   robot and the multi-waypoint settings, such as ``ik_return_seeds`` (IK
+   solutions kept per waypoint). Any other keyword argument, such as
+   ``scene_model``, ``num_ik_seeds``, or ``mesh_collision_check``, is
+   forwarded to ``MotionPlannerCfg.create``.
+
+2. **Build waypoints**: Each waypoint is a ``GoalToolPose``. The tutorial
+   derives them with forward kinematics from joint configurations near the
+   default configuration, so every waypoint is reachable.
+
+3. **Set per-segment criteria**: ``segment_tool_pose_criteria`` holds one
+   dictionary per segment, so ``num_waypoints - 1`` in total, mapping tool
+   frame names to ``ToolPoseCriteria``. Both segments here track position and
+   orientation. Use ``ToolPoseCriteria.linear_motion("z")`` for a segment
+   that must move in a straight line along the goal z axis, or set
+   ``bound`` on the criteria to keep the tool within limits
+   (:ref:`tool_pose_bounds_guide`). An empty dictionary tracks position and
+   orientation.
+
+4. **Plan**: ``plan_waypoints`` returns a ``MultiWaypointPlanResult``:
+
+   - ``success`` and ``status``, which names the failing waypoint or segment
+     when planning fails.
+   - ``composed_trajectory``, the stitched joint trajectory, sampled at the
+     trajectory optimizer's ``interpolation_dt``.
+   - ``segment_results``, the trajectory optimization result of each segment.
+   - ``chosen_ik_indices``, ``attempts``, and ``planning_time``.
+
+.. note::
+
+   The trajectory starts at an IK solution of the **first waypoint**, not at
+   ``start_state``, which only seeds IK. To execute it from the robot's
+   current configuration, first move to
+   ``result.composed_trajectory.position[0]``, for example with
+   ``planner.motion_planner.plan_cspace``.
+
+To learn how the planner chooses IK solutions and merges the criteria of
+neighbouring segments, see :ref:`multi_waypoint_planner_note`.
 """
 
 import argparse
