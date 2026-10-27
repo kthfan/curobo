@@ -93,7 +93,7 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 | `ToolPoseCost` 旋轉梯度 0.5 倍 | `use_lie_group=False`（預設）時，kinematics 收到的旋轉梯度是 cost 真實梯度的一半，方向正確；`use_lie_group=True` 精確。成因見下 | 待決定是否另開 PR |
 | Graph planner（PRM） | 也使用 `metrics_base.yml`，但不會收到約束，只提供 seed，由 trajopt 修正。接上約束的難處：等式約束在關節空間取樣幾乎命中不到；關節空間直線邊會離開平面或直線；goal/start 錨點讓 roadmap 無法跨查詢重用；PRM rollout 沒有 goal/start pose。已寫進 `MotionPlanner.update_tool_pose_bounds` docstring 與使用指南 | 決定先不處理 |
 | 使用指南 | `docs/guides/tool_pose_bounds.md`（how-to）：設定、錨點、常見形狀、margin/tolerance、錯誤訊息、限制 | 已完成 |
-| `MultiWaypointMotionPlanner` | 已修正：新增 `update_tool_pose_bounds`（各段預設值，段內 `bound` 優先，跨規劃保留）；waypoint IK 的 criteria 一律去掉約束（錨點指向段的端點，不適用 IK），改為 IK 後以 FK 篩選前後兩段的約束（前段 start 錨點留給 trajopt）；全被篩掉時回報 `No IK solution at waypoint i satisfies the tool pose bounds of its segments.`。CPU 單元測試 11 個；GPU 整合測試 2 個（`test_segment_bound_keeps_trajectory_on_plane`、`test_default_bound_rejects_off_plane_waypoint`）待跑 | 待 GPU 驗證 |
+| `MultiWaypointMotionPlanner` | 已修正：新增 `update_tool_pose_bounds`（各段預設值，段內 `bound` 優先，跨規劃保留）；waypoint IK 的 criteria 一律去掉約束（錨點指向段的端點，不適用 IK），改為 IK 後以 FK 篩選前後兩段的約束（前段 start 錨點留給 trajopt）；全被篩掉時回報 `No IK solution at waypoint i satisfies the tool pose bounds of its segments.`。CPU 單元測試 11 個；GPU 整合測試 2 個（`test_segment_bound_keeps_trajectory_on_plane`、`test_default_bound_rejects_off_plane_waypoint`）GPU 上 5/5 通過 | 已完成 |
 | MPC | start 錨點每步跟隨目前狀態；違反約束只讓 `success` 為 False，機器人不會停（安全減速 fallback 在程式中被停用） | 已記錄 |
 
 ### ToolPoseCost 0.5 倍的來源（依 git 紀錄）
