@@ -91,7 +91,9 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 |---|---|---|
 | `plan_grasp` 與約束 | 呼叫前設定的 `bound` 只作用在 goalset 與 approach；grasp、lift 用固定的 linear-motion criteria（沒有約束），結束後所有 criteria 重設為預設值。已寫進 `plan_grasp` docstring（commit `0419744`） | 暫不修改 |
 | `ToolPoseCost` 旋轉梯度 0.5 倍 | `use_lie_group=False`（預設）時，kinematics 收到的旋轉梯度是 cost 真實梯度的一半，方向正確；`use_lie_group=True` 精確。成因見下 | 待決定是否另開 PR |
-| Graph planner（PRM） | 也使用 `metrics_base.yml`，但 `update_tool_pose_criteria` 不會傳給它，初始路徑不受約束 | 待處理 |
+| Graph planner（PRM） | 也使用 `metrics_base.yml`，但不會收到約束，只提供 seed，由 trajopt 修正。接上約束的難處：等式約束在關節空間取樣幾乎命中不到；關節空間直線邊會離開平面或直線；goal/start 錨點讓 roadmap 無法跨查詢重用；PRM rollout 沒有 goal/start pose。已寫進 `MotionPlanner.update_tool_pose_bounds` docstring 與使用指南 | 決定先不處理 |
+| 使用指南 | `docs/guides/tool_pose_bounds.md`（how-to）：設定、錨點、常見形狀、margin/tolerance、錯誤訊息、限制 | 已完成 |
+| `MultiWaypointMotionPlanner` | 每段自行設定 criteria，會覆蓋 `update_tool_pose_bounds`；`_merge_two_criteria` 建立新的 `ToolPoseCriteria` 時沒有帶 `bound`，所以中間 waypoint 的 IK 不受約束；也不跑 `plan_pose` 的 start/goal 檢查。已寫進使用指南 | 待決定是否處理 |
 | MPC | start 錨點每步跟隨目前狀態；違反約束只讓 `success` 為 False，機器人不會停（安全減速 fallback 在程式中被停用） | 已記錄 |
 
 ### ToolPoseCost 0.5 倍的來源（依 git 紀錄）
