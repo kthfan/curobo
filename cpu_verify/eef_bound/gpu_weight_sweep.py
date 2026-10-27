@@ -32,7 +32,7 @@ import torch
 from curobo._src.cost.tool_pose_bound import _quat_rotate, tool_pose_bound_violation
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import GoalToolPose, JointState, ToolPoseBound
-from gpu_check import active_positions, configured_criteria, with_bound
+from gpu_check import active_positions
 
 Scenario = Callable[["Sweep", torch.Generator], Tuple[ToolPoseBound, torch.Tensor, torch.Tensor]]
 
@@ -81,7 +81,6 @@ class Sweep:
         self.device = self.start.position.device
         p, q = self.fk(self.start.position)
         self.start_p, self.start_q = p[0], q[0]
-        self.criteria = configured_criteria(self.planner.trajopt_solver.core, self.ee)
         self.interpolation_dt = self.planner.trajopt_solver.config.interpolation_dt
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -94,7 +93,7 @@ class Sweep:
     def plan(
         self, bound: ToolPoseBound, goal_p: torch.Tensor, goal_q: torch.Tensor
     ) -> Dict[str, float]:
-        self.planner.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
+        self.planner.update_tool_pose_bounds({self.ee: bound})
         goal = GoalToolPose(
             tool_frames=[self.ee],
             position=goal_p.view(1, 1, 1, 1, 3).clone(),
@@ -107,6 +106,7 @@ class Sweep:
             "duration_s": math.nan,
             "path_rad": math.nan,
             "pos_violation_mm": math.nan,
+            "rms_pos_violation_mm": math.nan,
             "rot_violation_deg": math.nan,
         }
         torch.cuda.synchronize()
@@ -123,14 +123,19 @@ class Sweep:
         traj = active_positions(result.get_interpolated_plan(), self.planner.joint_names)
         p, q = self.fk(traj)
         anchor_p, anchor_q = self.anchor(bound, goal_p, goal_q)
-        violation = tool_pose_bound_violation(
+        per_step = tool_pose_bound_violation(
             bound, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), use_tolerance=False
-        ).amax(dim=0)
+        )
+        violation = per_step.amax(dim=0)
+        # RMS over the trajectory of the distance outside the cost interval; for an equality
+        # axis this is the distance from the reference (how centred the path stays).
+        rms_pos = per_step[:, :3].norm(dim=-1).pow(2).mean().sqrt()
         row.update(
             success=1.0,
             duration_s=traj.shape[0] * self.interpolation_dt,
             path_rad=(traj[1:] - traj[:-1]).abs().sum().item(),
             pos_violation_mm=1e3 * violation[:3].max().item(),
+            rms_pos_violation_mm=1e3 * rms_pos.item(),
             rot_violation_deg=math.degrees(violation[3:].max().item()),
         )
         return row
@@ -207,6 +212,7 @@ def summarize(rows: List[Dict]) -> List[Dict]:
                 "max_rot_violation_deg": max(
                     (r["rot_violation_deg"] for r in ok), default=math.nan
                 ),
+                "median_rms_pos_violation_mm": median("rms_pos_violation_mm"),
             }
         )
     return summary
@@ -291,7 +297,7 @@ def sweep_mpc(args, weights: List[float]) -> List[Dict]:
     bound = ToolPoseBound.plane(
         "z", anchor="base", offset_position=[None, None, start_p[2].item()], tolerance=0.002
     )
-    mpc.update_tool_pose_criteria({ee: with_bound(configured_criteria(mpc.core, ee), bound)})
+    mpc.update_tool_pose_bounds({ee: bound})
     goal_p = start_p + torch.tensor([0.0, 0.2, 0.0], device=start_p.device)
     goal = GoalToolPose(
         tool_frames=[ee],
@@ -370,18 +376,20 @@ def main() -> int:
             done = [r for r in rows if r["scenario"] == name and r["weight"] == weight]
             rate = sum(r["success"] for r in done) / len(done)
             print(f"{name:12s} weight={weight:<10g} success={rate:.0%}")
-    sweep.planner.update_tool_pose_criteria({sweep.ee: with_bound(sweep.criteria, None)})
+    sweep.planner.update_tool_pose_bounds({sweep.ee: None})
 
     summary = summarize(rows)
     write_csv(os.path.join(args.out, "sweep_raw.csv"), rows)
     write_csv(os.path.join(args.out, "sweep_summary.csv"), summary)
     plot(summary, os.path.join(args.out, "sweep.png"))
-    print("\nscenario      weight      success  time[ms]  pos viol[mm]  rot viol[deg]")
+    print(
+        "\nscenario      weight      success  time[ms]  pos viol[mm]  rms pos[mm]  rot viol[deg]"
+    )
     for r in summary:
         print(
             f"{r['scenario']:12s}  {r['weight']:<10g}  {r['success_rate']:6.0%}  "
             f"{r['median_time_ms']:8.0f}  {r['max_pos_violation_mm']:12.2f}  "
-            f"{r['max_rot_violation_deg']:13.2f}"
+            f"{r['median_rms_pos_violation_mm']:11.2f}  {r['max_rot_violation_deg']:13.2f}"
         )
     print("\nbest weight per scenario (success rate, then planning time):")
     for scenario, r in best_weights(summary).items():

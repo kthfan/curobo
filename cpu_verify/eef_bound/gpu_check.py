@@ -27,7 +27,7 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import _quat_rotate, tool_pose_bound_violation
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-from curobo.types import GoalToolPose, JointState, ToolPoseBound, ToolPoseCriteria
+from curobo.types import GoalToolPose, JointState, ToolPoseBound
 
 RESULTS: List[Tuple[str, bool, str]] = []
 
@@ -45,24 +45,6 @@ def active_positions(joint_state: JointState, joint_names: List[str]) -> torch.T
             raise ValueError(f"cannot pick {joint_names} from unnamed {position.shape[-1]} joints")
         return position
     return position[:, [list(names).index(n) for n in joint_names]]
-
-
-def configured_criteria(core, tool_frame: str) -> ToolPoseCriteria:
-    """Tool pose criteria the solver was configured with (yml), so a bound can be added to them.
-
-    Building ``ToolPoseCriteria(bound=...)`` from scratch would reset the configured weights and
-    tolerances to the dataclass defaults.
-    """
-    for rollout in core.optimizer_rollouts:
-        for cost in rollout.get_cost_component_by_name("tool_pose"):
-            return cost._stacked_tool_pose_criteria._tool_pose_criteria[tool_frame].clone()
-    raise RuntimeError("no tool_pose cost found")
-
-
-def with_bound(criteria: ToolPoseCriteria, bound: Optional[ToolPoseBound]) -> ToolPoseCriteria:
-    updated = criteria.clone()
-    updated.bound = bound
-    return updated
 
 
 class Setup:
@@ -85,7 +67,6 @@ class Setup:
         start_pose = self.fk(self.start.position)
         self.start_p = start_pose[0][0]
         self.start_q = start_pose[1][0]
-        self.criteria = configured_criteria(self.planner.trajopt_solver.core, self.ee)
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tool positions ``(T, 3)`` and quaternions ``(T, 4)`` for joint positions ``(T, dof)``."""
@@ -100,7 +81,7 @@ class Setup:
         )
 
     def set_bound(self, bound: Optional[ToolPoseBound]):
-        self.planner.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
+        self.planner.update_tool_pose_bounds({self.ee: bound})
 
     def plan(self, goal: GoalToolPose) -> Tuple[bool, Optional[torch.Tensor], float]:
         """Return success, interpolated joint positions ``(T, dof)`` and wall time."""
@@ -350,14 +331,13 @@ class MPCSetup:
         self.device = self.start.position.device
         self.start_p, self.start_q = self.fk(self.start.position)
         self.start_p, self.start_q = self.start_p[0], self.start_q[0]
-        self.criteria = configured_criteria(self.mpc.core, self.ee)
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         tool = self.mpc.compute_kinematics(JointState.from_position(positions)).tool_poses
         return tool.position[:, 0, 0], tool.quaternion[:, 0, 0]
 
     def set_bound(self, bound: Optional[ToolPoseBound]):
-        self.mpc.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
+        self.mpc.update_tool_pose_bounds({self.ee: bound})
 
     def set_goal(self, goal: GoalToolPose) -> str:
         """Set the goal with IK when MPC's single-seed IK succeeds, else track it in Cartesian space.
