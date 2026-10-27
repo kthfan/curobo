@@ -97,7 +97,10 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 5. Tests
 
-- [ ] **P1 – End-to-end solver test on GPU.** No test checks that a solver actually rejects a
+- [ ] **P1 – End-to-end solver test on GPU.** Written in
+  `curobo/tests/_src/motion/test_mesh_collision_end_to_end.py` (gripper spheres disabled, box
+  pushed into the palm; scene checked on the CPU by `cpu_verify/verify_mesh_collision_scene.py`).
+  **Still to run on a GPU.** No test checks that a solver actually rejects a
   mesh-colliding solution. Add a scene where the spheres are clear but a link mesh
   collides (e.g. a thin plate between the fingers), and assert that IK / `plan_pose` fails
   with `mesh_collision_check=True` and succeeds without it.

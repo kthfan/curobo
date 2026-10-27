@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""End-to-end tests: solvers reject solutions whose collision meshes hit the scene.
+
+The scene is built so that the spheres are clear but a link mesh collides, independently of
+how well the spheres cover the meshes: the gripper spheres are disabled, and a box pushes into
+the palm of a top-down grasp pose. Every solution for that pose puts the hand mesh into the
+box, while the closest remaining sphere (on ``panda_link7``) stays 2.7 cm away.
+"""
+
+# Third Party
+import pytest
+import torch
+
+# CuRobo
+from curobo._src.geom.types import Cuboid, SceneCfg
+from curobo._src.motion.motion_planner import MotionPlanner
+from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
+from curobo._src.solver.solver_ik import IKSolver
+from curobo._src.solver.solver_ik_cfg import IKSolverCfg
+from curobo._src.state.state_joint import JointState
+from curobo._src.types.device_cfg import DeviceCfg
+from curobo._src.types.pose import Pose
+from curobo._src.types.tool_pose import GoalToolPose
+
+#: Links whose spheres are disabled, leaving the mesh check as their only collision test.
+GRIPPER_LINKS = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
+
+#: Top-down grasp pose of ``panda_hand``: (x, y, z, qw, qx, qy, qz).
+GOAL_POSE = [0.5, 0.0, 0.3, 0.0, 1.0, 0.0, 0.0]
+
+
+def palm_box(offset=(0.0, 0.0, 0.0)) -> SceneCfg:
+    """Box spanning 3.5 cm to 15 cm below the hand frame, across the palm and fingers."""
+    x, y, z = offset
+    return SceneCfg(
+        cuboid=[
+            Cuboid(
+                name="palm_box",
+                pose=[0.5 + x, 0.0 + y, 0.3 - 0.0925 + z, 1.0, 0.0, 0.0, 0.0],
+                dims=[0.1, 0.24, 0.115],
+            )
+        ]
+    )
+
+
+@pytest.fixture(scope="module")
+def cuda_device_cfg():
+    """CUDA device configuration."""
+    if torch.cuda.is_available():
+        return DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    pytest.skip("CUDA not available")
+
+
+def _ik_solver(device_cfg: DeviceCfg, mesh_collision_check: bool) -> IKSolver:
+    config = IKSolverCfg.create(
+        robot="franka.yml",
+        scene_model=palm_box(),
+        mesh_collision_check=mesh_collision_check,
+        device_cfg=device_cfg,
+        num_seeds=32,
+        use_cuda_graph=False,
+    )
+    solver = IKSolver(config)
+    for link_name in GRIPPER_LINKS:
+        solver.kinematics.config.kinematics_config.disable_link_spheres(link_name)
+    return solver
+
+
+@pytest.fixture(scope="module")
+def sphere_ik_solver(cuda_device_cfg) -> IKSolver:
+    return _ik_solver(cuda_device_cfg, mesh_collision_check=False)
+
+
+@pytest.fixture(scope="module")
+def mesh_ik_solver(cuda_device_cfg) -> IKSolver:
+    return _ik_solver(cuda_device_cfg, mesh_collision_check=True)
+
+
+def _goal(tool_frames, device_cfg: DeviceCfg) -> GoalToolPose:
+    pose = Pose.from_list(GOAL_POSE, device_cfg=device_cfg)
+    return GoalToolPose.from_poses(
+        {tool_frames[0]: pose.unsqueeze(1)}, ordered_tool_frames=tool_frames
+    )
+
+
+def _solve(solver: IKSolver, device_cfg: DeviceCfg):
+    goal = _goal(solver.kinematics.tool_frames, device_cfg)
+    return solver.solve_pose(goal_tool_poses=goal, return_seeds=1)
+
+
+# =============================================================================
+# IK solver
+# =============================================================================
+
+
+def test_sphere_only_ik_accepts_mesh_colliding_solution(sphere_ik_solver, cuda_device_cfg):
+    """Without the mesh check the box is invisible to the gripper, so IK succeeds."""
+    result = _solve(sphere_ik_solver, cuda_device_cfg)
+    assert result.success.any().item()
+
+
+def test_mesh_collision_check_rejects_solution(mesh_ik_solver, cuda_device_cfg):
+    """With the mesh check every solution is infeasible, so IK fails."""
+    result = _solve(mesh_ik_solver, cuda_device_cfg)
+    assert not result.success.any().item()
+
+
+def test_mesh_collision_check_accepts_clear_scene(mesh_ik_solver, cuda_device_cfg):
+    """The same solver succeeds once the box is moved away, so the failure is the box."""
+    checker = mesh_ik_solver.scene_collision_checker
+    try:
+        checker.load_collision_model(palm_box(offset=(0.0, 1.5, 0.0)))
+        result = _solve(mesh_ik_solver, cuda_device_cfg)
+        assert result.success.any().item()
+    finally:
+        checker.load_collision_model(palm_box())
+
+
+# =============================================================================
+# Motion planner
+# =============================================================================
+
+
+def _planner(device_cfg: DeviceCfg, mesh_collision_check: bool) -> MotionPlanner:
+    config = MotionPlannerCfg.create(
+        robot="franka.yml",
+        scene_model=palm_box(),
+        mesh_collision_check=mesh_collision_check,
+        device_cfg=device_cfg,
+        num_ik_seeds=32,
+        num_trajopt_seeds=4,
+        use_cuda_graph=False,
+    )
+    planner = MotionPlanner(config)
+    planner.disable_link_collision(GRIPPER_LINKS)
+    return planner
+
+
+def _plan(planner: MotionPlanner, device_cfg: DeviceCfg):
+    start = JointState.from_position(
+        planner.default_joint_state.position.clone().unsqueeze(0),
+        joint_names=planner.joint_names,
+    )
+    goal = _goal(planner.kinematics.tool_frames, device_cfg)
+    return planner.plan_pose(goal_tool_poses=goal, current_state=start, max_attempts=3)
+
+
+def test_sphere_only_plan_pose_reaches_mesh_colliding_goal(cuda_device_cfg):
+    """Without the mesh check the planner reaches the goal through the box."""
+    result = _plan(_planner(cuda_device_cfg, mesh_collision_check=False), cuda_device_cfg)
+    assert result is not None
+    assert result.success.any().item()
+
+
+def test_mesh_collision_check_plan_pose_fails(cuda_device_cfg):
+    """With the mesh check no goal configuration is feasible, so planning fails."""
+    result = _plan(_planner(cuda_device_cfg, mesh_collision_check=True), cuda_device_cfg)
+    assert result is None or not result.success.any().item()

@@ -33,3 +33,12 @@ cpu_verify/.venv/bin/pip install warp-lang numpy trimesh scipy pytest pyyaml imp
   ```bash
   PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_triangle_distance.py --pairs 2000
   ```
+
+- `verify_mesh_collision_scene.py`: checks the scene of
+  `curobo/tests/_src/motion/test_mesh_collision_end_to_end.py` with URDF forward kinematics:
+  the enabled spheres must stay farther from the box than the optimizer's activation distance,
+  and the gripper mesh must collide while the wrist meshes do not:
+
+  ```bash
+  PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_mesh_collision_scene.py
+  ```
