@@ -105,7 +105,7 @@ class Setup:
         """Largest per-component violation (with tolerance) over a trajectory, shape ``(7,)``."""
         p, q = self.fk(positions)
         violation = tool_pose_bound_violation(
-            bound, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), use_tolerance=True
+            bound, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), metric=True
         )
         return violation.amax(dim=0)
 
@@ -283,9 +283,41 @@ def g10_timing(s: Setup):
 @check("G11 equality bound with zero tolerance (informational)")
 def g11_zero_tolerance(s: Setup):
     z0 = s.start_p[2].item()
-    s.set_bound(ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0]))
+    s.set_bound(
+        ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0], tolerance=0.0)
+    )
     ok, _, elapsed = s.plan(_plane_goal(s))
     return True, f"success={ok} in {elapsed * 1e3:.0f} ms (expected to fail: no slack)"
+
+
+def _band(z0: float, half_width: float, margin: float) -> ToolPoseBound:
+    return ToolPoseBound(
+        anchor="base",
+        offset_position=[None, None, z0],
+        position_lower=[None, None, -half_width],
+        position_upper=[None, None, half_width],
+        position_margin=margin,
+    )
+
+
+@check("G12 band bound is met strictly thanks to the margin")
+def g12_band(s: Setup):
+    z0 = s.start_p[2].item()
+    s.set_bound(_band(z0, 0.003, margin=0.001))
+    ok, traj, elapsed = s.plan(_plane_goal(s))
+    if not ok:
+        return False, "planning failed with a ±3 mm band and 1 mm margin"
+    dz = (s.fk(traj)[0][:, 2] - z0).abs().max().item()
+    return dz <= 0.003 + 1e-5, f"{elapsed * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm (band 3 mm)"
+
+
+@check("G13 band bound without margin (informational)")
+def g13_band_no_margin(s: Setup):
+    z0 = s.start_p[2].item()
+    s.set_bound(_band(z0, 0.003, margin=0.0))
+    ok, traj, elapsed = s.plan(_plane_goal(s))
+    dz = math.nan if traj is None else (s.fk(traj)[0][:, 2] - z0).abs().max().item()
+    return True, f"success={ok} in {elapsed * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm"
 
 
 CHECKS = [
@@ -300,6 +332,8 @@ CHECKS = [
     g9_ik,
     g10_timing,
     g11_zero_tolerance,
+    g12_band,
+    g13_band_no_margin,
 ]
 
 

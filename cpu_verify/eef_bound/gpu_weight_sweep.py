@@ -4,7 +4,7 @@
 
 NOT for main: see ``cpu_verify/README.md``. Needs a CUDA GPU and a curobo build.
 
-The weight of the optimization cost (task configs, ``use_tolerance: False``) is changed in place
+The weight of the optimization cost (task configs, ``metric: False``) is changed in place
 on the solvers' optimizer rollouts, so the planner and its CUDA graphs are built once. The
 metrics constraint is binary and does not depend on the weight.
 
@@ -13,14 +13,17 @@ Run from the repository root::
     python cpu_verify/eef_bound/gpu_weight_sweep.py
     python cpu_verify/eef_bound/gpu_weight_sweep.py --weights 0 1e3 1e4 1e5 --goals 16
     python cpu_verify/eef_bound/gpu_weight_sweep.py --mpc   # also sweep the MPC weight
+    python cpu_verify/eef_bound/gpu_weight_sweep.py --weights 1e5 --margins 0 0.0005 0.001 0.002
 
 Writes ``sweep_raw.csv``, ``sweep_summary.csv`` and ``sweep.png`` to ``--out`` and prints the
-best weight per scenario: highest success rate, then lowest median planning time.
+best weight and margin per scenario: highest success rate, then lowest median planning time.
+Violations are measured against the user's bounds (no margin, no tolerance).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import csv
 import math
 import os
@@ -47,7 +50,7 @@ def optimizer_bound_costs(solver) -> List:
     for core in cores:
         for rollout in core.optimizer_rollouts:
             for cost in rollout.get_cost_component_by_name("eef_bound"):
-                if not cost.config.use_tolerance:
+                if not cost.config.metric:
                     costs.append(cost)
     return costs
 
@@ -123,8 +126,16 @@ class Sweep:
         traj = active_positions(result.get_interpolated_plan(), self.planner.joint_names)
         p, q = self.fk(traj)
         anchor_p, anchor_q = self.anchor(bound, goal_p, goal_q)
+        # Violation of the user's bounds themselves (no margin, no tolerance).
+        raw = dataclasses.replace(
+            bound,
+            position_margin=0.0,
+            rotation_margin=0.0,
+            position_tolerance=0.0,
+            rotation_tolerance=0.0,
+        )
         per_step = tool_pose_bound_violation(
-            bound, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), use_tolerance=False
+            raw, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), metric=True
         )
         violation = per_step.amax(dim=0)
         # RMS over the trajectory of the distance outside the cost interval; for an equality
@@ -161,6 +172,19 @@ def plane_scenario(s: Sweep, gen: torch.Generator):
     return bound, s.start_p + offset, s.start_q
 
 
+def band_scenario(s: Sweep, gen: torch.Generator):
+    """Stay within ±3 mm of the start height (an inequality, so the margin applies)."""
+    z0 = s.start_p[2].item()
+    bound = ToolPoseBound(
+        anchor="base",
+        offset_position=[None, None, z0],
+        position_lower=[None, None, -0.003],
+        position_upper=[None, None, 0.003],
+    )
+    offset = torch.cat([s.uniform(gen, -0.25, 0.25, 2), torch.zeros(1, device=s.device)])
+    return bound, s.start_p + offset, s.start_q
+
+
 def line_scenario(s: Sweep, gen: torch.Generator):
     """Approach the goal along its tool z axis from the start."""
     d = s.uniform(gen, 0.05, 0.15).item()
@@ -183,6 +207,7 @@ def orientation_scenario(s: Sweep, gen: torch.Generator):
 
 SCENARIOS: Dict[str, Scenario] = {
     "plane": plane_scenario,
+    "band": band_scenario,
     "line": line_scenario,
     "orientation": orientation_scenario,
 }
@@ -190,9 +215,13 @@ SCENARIOS: Dict[str, Scenario] = {
 
 def summarize(rows: List[Dict]) -> List[Dict]:
     summary = []
-    keys = sorted({(r["scenario"], r["weight"]) for r in rows}, key=lambda k: (k[0], k[1]))
-    for scenario, weight in keys:
-        group = [r for r in rows if r["scenario"] == scenario and r["weight"] == weight]
+    keys = sorted({(r["scenario"], r["margin"], r["weight"]) for r in rows})
+    for scenario, margin, weight in keys:
+        group = [
+            r
+            for r in rows
+            if r["scenario"] == scenario and r["margin"] == margin and r["weight"] == weight
+        ]
         ok = [r for r in group if r["success"] == 1.0]
 
         def median(key):
@@ -202,6 +231,7 @@ def summarize(rows: List[Dict]) -> List[Dict]:
         summary.append(
             {
                 "scenario": scenario,
+                "margin": margin,
                 "weight": weight,
                 "success_rate": len(ok) / len(group),
                 "errors": sum(1 for r in group if r["error"]),
@@ -241,7 +271,8 @@ def plot(summary: List[Dict], path: str) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+    colors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+    styles = ["o-", "s--", "^:", "d-."]
     panels = [
         ("success_rate", "success rate"),
         ("median_time_ms", "median planning time [ms]"),
@@ -250,11 +281,15 @@ def plot(summary: List[Dict], path: str) -> None:
     ]
     fig, axes = plt.subplots(1, len(panels), figsize=(18, 4))
     scenarios = sorted({r["scenario"] for r in summary})
+    margins = sorted({r["margin"] for r in summary})
     for ax, (key, label) in zip(axes, panels):
-        for color, scenario in zip(colors, scenarios):
-            rows = [r for r in summary if r["scenario"] == scenario]
+        for (color, scenario), (style, margin) in (
+            (c, m) for c in zip(colors, scenarios) for m in zip(styles, margins)
+        ):
+            rows = [r for r in summary if r["scenario"] == scenario and r["margin"] == margin]
             x = [max(r["weight"], 1e-1) for r in rows]  # weight 0 drawn at 0.1 on the log axis
-            ax.plot(x, [r[key] for r in rows], "o-", color=color, label=scenario)
+            name = scenario if len(margins) == 1 else f"{scenario} m={margin * 1e3:g}mm"
+            ax.plot(x, [r[key] for r in rows], style, color=color, label=name)
         ax.set_xscale("log")
         ax.set_xlabel("eef_bound weight (0 shown at 0.1)")
         ax.set_title(label, fontsize=10)
@@ -346,6 +381,13 @@ def main() -> int:
     parser.add_argument("--scene", default="collision_test.yml", help="'none' for no scene")
     parser.add_argument("--weights", nargs="+", type=float, default=[0, 1e2, 1e3, 1e4, 1e5, 1e6])
     parser.add_argument("--goals", type=int, default=8, help="random goals per scenario")
+    parser.add_argument(
+        "--margins",
+        nargs="+",
+        type=float,
+        default=[0.001],
+        help="position margins (m) to sweep; the rotation margin is 10x the value in rad",
+    )
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=list(SCENARIOS))
     parser.add_argument("--target", default="both", choices=["both", "ik", "trajopt"])
     parser.add_argument("--no-cuda-graph", action="store_true")
@@ -367,15 +409,20 @@ def main() -> int:
     for name in args.scenarios:
         gen = torch.Generator().manual_seed(args.seed)
         problems = [SCENARIOS[name](sweep, gen) for _ in range(args.goals)]
-        for weight in args.weights:
-            set_weight(sweep.costs, weight)
-            for i, (bound, goal_p, goal_q) in enumerate(problems):
-                row = {"scenario": name, "weight": weight, "goal": i}
-                row.update(sweep.plan(bound, goal_p, goal_q))
-                rows.append(row)
-            done = [r for r in rows if r["scenario"] == name and r["weight"] == weight]
-            rate = sum(r["success"] for r in done) / len(done)
-            print(f"{name:12s} weight={weight:<10g} success={rate:.0%}")
+        for margin in args.margins:
+            for weight in args.weights:
+                set_weight(sweep.costs, weight)
+                done = []
+                for i, (bound, goal_p, goal_q) in enumerate(problems):
+                    bound = dataclasses.replace(
+                        bound, position_margin=margin, rotation_margin=10.0 * margin
+                    )
+                    row = {"scenario": name, "margin": margin, "weight": weight, "goal": i}
+                    row.update(sweep.plan(bound, goal_p, goal_q))
+                    rows.append(row)
+                    done.append(row)
+                rate = sum(r["success"] for r in done) / len(done)
+                print(f"{name:12s} margin={margin:<8g} weight={weight:<10g} success={rate:.0%}")
     sweep.planner.update_tool_pose_bounds({sweep.ee: None})
 
     summary = summarize(rows)
@@ -383,17 +430,19 @@ def main() -> int:
     write_csv(os.path.join(args.out, "sweep_summary.csv"), summary)
     plot(summary, os.path.join(args.out, "sweep.png"))
     print(
-        "\nscenario      weight      success  time[ms]  pos viol[mm]  rms pos[mm]  rot viol[deg]"
+        "\nscenario     margin[mm]  weight      success  time[ms]  pos viol[mm]  rms pos[mm]"
+        "  rot viol[deg]"
     )
     for r in summary:
         print(
-            f"{r['scenario']:12s}  {r['weight']:<10g}  {r['success_rate']:6.0%}  "
+            f"{r['scenario']:12s} {r['margin'] * 1e3:10g}  {r['weight']:<10g}  "
+            f"{r['success_rate']:6.0%}  "
             f"{r['median_time_ms']:8.0f}  {r['max_pos_violation_mm']:12.2f}  "
             f"{r['median_rms_pos_violation_mm']:11.2f}  {r['max_rot_violation_deg']:13.2f}"
         )
-    print("\nbest weight per scenario (success rate, then planning time):")
+    print("\nbest setting per scenario (success rate, then planning time):")
     for scenario, r in best_weights(summary).items():
-        print(f"  {scenario:12s} {r['weight']:g}")
+        print(f"  {scenario:12s} weight {r['weight']:g}, margin {r['margin'] * 1e3:g} mm")
 
     if args.mpc:
         del sweep
