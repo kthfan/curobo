@@ -49,4 +49,5 @@ and uploads the figures as an artifact.
 | `eef_bound/illustrate_corridor_options.py` | Geometry sketch used during the design discussion. |
 | `eef_bound/gpu_check.py` | End-to-end planner and MPC checks on a CUDA GPU. |
 | `eef_bound/gpu_weight_sweep.py` | Sweep of the `eef_bound` weight on a CUDA GPU (planner, optionally MPC). |
+| `eef_bound/diagnose_crash.py` | Runs each suspect step of the tests in its own subprocess to locate crashes or hangs. |
 | `eef_bound/REVIEW.md` | Review findings, the verification plan, and the redesign status. |
