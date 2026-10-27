@@ -174,6 +174,81 @@ def test_mesh_containment_requires_the_flag(robot_mesh):
     assert _check(robot_mesh, scene, tf, check_containment=True)[0].tolist() == [1]
 
 
+def _mesh_scene(name: str, tri_mesh: trimesh.Trimesh, pose=None) -> SceneData:
+    return SceneData.from_scene_cfg(
+        SceneCfg(
+            mesh=[
+                Mesh(
+                    name=name,
+                    vertices=np.asarray(tri_mesh.vertices),
+                    faces=np.asarray(tri_mesh.faces),
+                    pose=pose if pose is not None else [0, 0, 0, 1, 0, 0, 0],
+                )
+            ]
+        ),
+        device_cfg=DEVICE_CFG,
+    )
+
+
+@pytest.mark.parametrize("check_containment", [False, True])
+def test_mesh_margin_expands_collision(robot_mesh, check_containment):
+    """Face-to-face clearance: the link face at x + 0.1 faces the plate face at x = 0.5.
+
+    With the link at x = 0.35 the gap is 0.05, so only a margin above 0.05 collides.
+    """
+    plate = trimesh.creation.box(extents=(0.01, 1.0, 1.0))
+    scene = _mesh_scene("plate", plate, pose=[0.505, 0, 0, 1, 0, 0, 0])
+    tf = _link_transforms([0.35])
+    for margin, expected in [(0.0, 0), (0.04, 0), (0.06, 1)]:
+        coll, _ = _check(robot_mesh, scene, tf, margin=margin, check_containment=check_containment)
+        assert coll.tolist() == [expected], margin
+
+
+def test_mesh_margin_vertex_to_face(robot_mesh):
+    """An obstacle apex 0.015 from the interior of a link face, away from any link edge.
+
+    Sampling only the link's own vertices or edges would miss this clearance violation.
+    """
+    gap = 0.015
+    apex = np.array([0.1 + gap, 0.05, 0.01])
+    spike = trimesh.Trimesh(
+        vertices=np.vstack(
+            [
+                apex,
+                apex + [0.2, 0.02, 0.02],
+                apex + [0.2, -0.02, 0.02],
+                apex + [0.2, -0.02, -0.02],
+                apex + [0.2, 0.02, -0.02],
+            ]
+        ),
+        faces=[[0, 2, 1], [0, 3, 2], [0, 4, 3], [0, 1, 4], [1, 2, 3], [1, 3, 4]],
+    )
+    scene = _mesh_scene("spike", spike)
+    tf = _link_transforms([0.0])
+    assert _check(robot_mesh, scene, tf, margin=0.01, check_containment=False)[0].tolist() == [0]
+    assert _check(robot_mesh, scene, tf, margin=0.02, check_containment=False)[0].tolist() == [1]
+
+
+def test_mesh_margin_edge_to_edge(robot_mesh):
+    """A horizontal obstacle edge crosses the link's vertical edge at x = y = 0.1, 0.015 away.
+
+    The closest points lie in the middle of both edges, so no vertex is involved.
+    """
+    gap = 0.015
+    side = 0.05
+    bar = trimesh.creation.box(extents=(0.5, side, side))
+    # Turn a long edge of the bar towards -y, then align the bar with (1, -1, 0) so that edge
+    # faces the link corner along w = (1, 1, 0) / sqrt(2).
+    bar.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 4, [1, 0, 0]))
+    bar.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 4, [0, 0, 1]))
+    w = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+    bar.apply_translation(np.array([0.1, 0.1, 0.0]) + w * (gap + side / np.sqrt(2.0)))
+    scene = _mesh_scene("bar", bar)
+    tf = _link_transforms([0.0])
+    assert _check(robot_mesh, scene, tf, margin=0.01, check_containment=False)[0].tolist() == [0]
+    assert _check(robot_mesh, scene, tf, margin=0.02, check_containment=False)[0].tolist() == [1]
+
+
 # =============================================================================
 # Voxel obstacles
 # =============================================================================

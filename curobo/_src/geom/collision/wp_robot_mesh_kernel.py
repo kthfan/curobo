@@ -13,7 +13,8 @@ obstacle's own acceleration structure, so once a configuration is known to colli
 remaining threads exit immediately.
 
 Accuracy per obstacle type:
-    - Mesh: exact triangle-triangle intersection, plus an optional containment pass so a
+    - Mesh: exact triangle-triangle intersection, plus an exact triangle-triangle distance
+      test against ``margin`` when it is positive, plus an optional containment pass so a
       link fully swallowed by a large obstacle is still detected.
     - Cuboid: exact triangle-box overlap via the separating axis theorem. Containment is
       handled inherently by the test, so no second pass is needed.
@@ -103,6 +104,134 @@ def tri_aabb_hi(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, margin: wp.float32) -> wp
 # =============================================================================
 
 
+@wp.func
+def point_face_within(
+    p: wp.vec3,
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    dist_sq: wp.float32,
+) -> wp.bool:
+    """Check whether ``p`` projects inside triangle ``abc`` closer than ``sqrt(dist_sq)``.
+
+    Only the face interior is tested. A closest point on the triangle boundary is covered by
+    the edge-edge tests in :func:`triangles_within`, and a degenerate triangle, having no face
+    interior, is skipped.
+    """
+    n = wp.cross(b - a, c - a)
+    n_sq = wp.dot(n, n)
+    if n_sq <= 1.0e-20:
+        return False
+    h = wp.dot(p - a, n)
+    # Compare h^2 / |n|^2 < dist_sq without dividing.
+    if h * h >= dist_sq * n_sq:
+        return False
+    if wp.dot(wp.cross(b - a, p - a), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(c - b, p - b), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(a - c, p - c), n) < 0.0:
+        return False
+    return True
+
+
+@wp.func
+def segment_segment_dist_sq(
+    p1: wp.vec3,
+    q1: wp.vec3,
+    p2: wp.vec3,
+    q2: wp.vec3,
+) -> wp.float32:
+    """Squared distance between segments ``p1q1`` and ``p2q2`` (Ericson, RTCD 5.1.9)."""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, r)
+    eps = wp.float32(1.0e-12)
+
+    s = wp.float32(0.0)
+    t = wp.float32(0.0)
+    if a <= eps and e <= eps:
+        s = 0.0
+        t = 0.0
+    elif a <= eps:
+        s = 0.0
+        t = wp.clamp(f / e, 0.0, 1.0)
+    else:
+        c = wp.dot(d1, r)
+        if e <= eps:
+            t = 0.0
+            s = wp.clamp(-c / a, 0.0, 1.0)
+        else:
+            b = wp.dot(d1, d2)
+            denom = a * e - b * b
+            # Near-parallel segments: any s works, the clamps below fix up t.
+            if denom > 1.0e-6 * a * e:
+                s = wp.clamp((b * f - c * e) / denom, 0.0, 1.0)
+            else:
+                s = 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = wp.clamp(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = wp.clamp((b - c) / a, 0.0, 1.0)
+
+    diff = (p1 + d1 * s) - (p2 + d2 * t)
+    return wp.dot(diff, diff)
+
+
+@wp.func
+def triangles_within(
+    a0: wp.vec3,
+    a1: wp.vec3,
+    a2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+    dist_sq: wp.float32,
+) -> wp.bool:
+    """Check whether two non-intersecting triangles are closer than ``sqrt(dist_sq)``.
+
+    The distance between two disjoint triangles is attained either between a vertex of one
+    and the face interior of the other, or between an edge of each. Testing the 6
+    vertex-face and 9 edge-edge pairs is therefore exact. Intersecting triangles must be
+    caught beforehand with ``wp.intersect_tri_tri``.
+    """
+    if point_face_within(a0, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(a1, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(a2, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(b0, a0, a1, a2, dist_sq):
+        return True
+    if point_face_within(b1, a0, a1, a2, dist_sq):
+        return True
+    if point_face_within(b2, a0, a1, a2, dist_sq):
+        return True
+
+    for i in range(3):
+        pa = a0
+        qa = a1
+        if i == 1:
+            pa = a1
+            qa = a2
+        elif i == 2:
+            pa = a2
+            qa = a0
+        if segment_segment_dist_sq(pa, qa, b0, b1) < dist_sq:
+            return True
+        if segment_segment_dist_sq(pa, qa, b1, b2) < dist_sq:
+            return True
+        if segment_segment_dist_sq(pa, qa, b2, b0) < dist_sq:
+            return True
+    return False
+
+
 @wp.kernel(enable_backward=False)
 def robot_mesh_collision_kernel(
     robot: RobotMeshWarp,
@@ -127,7 +256,7 @@ def robot_mesh_collision_kernel(
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
         batch_horizon: Number of configurations (batch * horizon).
-        margin: Clearance distance added to the broadphase AABB.
+        margin: Clearance distance. A pair of triangles closer than ``margin`` collides.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
         check_containment: If 1, also flag links that lie entirely inside an obstacle.
     """
@@ -155,6 +284,7 @@ def robot_mesh_collision_kernel(
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
+    margin_sq = margin * margin
 
     n_obs = obs.n_per_env[env_idx]
     for o in range(n_obs):
@@ -179,14 +309,18 @@ def robot_mesh_collision_kernel(
             b1 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 1)
             b2 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 2)
 
-            # Narrowphase: exact triangle-triangle predicate.
+            # Narrowphase: exact triangle-triangle predicate, then exact distance < margin.
             if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
+                report_collision(in_collision, contact_link, cfg_idx, link_idx)
+                return
+            if margin_sq > 0.0 and triangles_within(a0, a1, a2, b0, b1, b2, margin_sq):
                 report_collision(in_collision, contact_link, cfg_idx, link_idx)
                 return
 
         # Containment: surface crossing alone misses a link sitting entirely inside a large
         # obstacle, because no triangle pair intersects. A point-in-mesh test on one vertex
-        # suffices, since a non-crossing triangle is wholly inside or wholly outside.
+        # suffices: a triangle that passed the test above keeps at least ``margin`` from the
+        # surface everywhere, so it is wholly inside or wholly outside by that much.
         if check_containment == wp.uint8(1):
             if compute_local_sdf(obs, env_idx, o, a0) < margin:
                 report_collision(in_collision, contact_link, cfg_idx, link_idx)

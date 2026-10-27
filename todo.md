@@ -1,7 +1,7 @@
 # TODO: Exact Mesh Collision Constraint
 
-Working notes for `dev/improve_mesh`. This file lives only on this branch; remove it before
-merging into `dev/main`.
+Working notes for `dev/improve_mesh`. This file and the `cpu_verify/` directory live only on
+this branch; remove both before merging into `dev/main`.
 
 Scope: the exact robot-mesh collision constraint (`RobotMeshConstraint`, the Warp kernels in
 `curobo/_src/geom/collision/wp_robot_mesh_kernel.py`, `RobotMeshData`, and its wiring into the
@@ -11,7 +11,9 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 1. Correctness
 
-- [ ] **P1 – `margin` is not a clearance for mesh obstacles.**
+- [x] **P1 – `margin` is not a clearance for mesh obstacles.** Done with option A
+  (`triangles_within` in the narrowphase). Tests added in `test_robot_mesh_constraint.py`
+  and passing on the CPU (`cpu_verify/`); **still to run on a GPU**.
   In `robot_mesh_collision_kernel`, `margin` only inflates the broadphase AABB
   (`wp_robot_mesh_kernel.py:174`). The narrowphase is an exact `wp.intersect_tri_tri`
   (`:183`) that ignores it, and the containment pass compares the SDF of a single vertex
@@ -23,8 +25,9 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   - Option B: keep the exact predicate and also flag when any vertex or edge sample of the
     robot triangle has `compute_local_sdf < margin` (cheaper, not exact).
   - Add a test like `test_cuboid_margin_expands_collision` for mesh obstacles.
-- [ ] **P1 – Fix the docs that rely on the margin.** `docs/guides/mesh_collision.md`
-  ("Keep a clearance") recommends a positive margin to compensate for decimation shrinkage.
+- [x] **P1 – Fix the docs that rely on the margin.** With option A the guide and the
+  docstrings are correct as written; the concept page now states the margin per obstacle
+  type. `docs/guides/mesh_collision.md` ("Keep a clearance") recommends a positive margin to compensate for decimation shrinkage.
   That is wrong for mesh obstacles until the item above is fixed. Update the guide, the
   concept page, and the `mesh_collision_margin` docstrings in the solver configs.
 - [ ] **P2 – Voxel sampling cap.** `MAX_VOXEL_SAMPLES_PER_EDGE = 16`
@@ -104,7 +107,7 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 - [ ] **P2 – CUDA graph test.** Capture a graph with the mesh constraint, then
   `update_world` (move / replace obstacles) and `update_link_mesh`, and check the replayed
   results match eager execution.
-- [ ] **P2 – Mesh margin test** (see Correctness).
+- [x] **P2 – Mesh margin test** (see Correctness). GPU run pending.
 
 ## Future work
 

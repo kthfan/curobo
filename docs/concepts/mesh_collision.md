@@ -57,6 +57,11 @@ collision, its remaining threads stop early.
 | Mesh | triangle-triangle intersection, plus an optional containment pass that catches a link fully inside a closed mesh | yes |
 | Voxel (ESDF) | points sampled on each triangle at most half a voxel apart, tested against the distance field | no, limited by the voxel size |
 
+`mesh_collision_margin` is a distance between the robot triangles and the obstacle surface. For
+mesh obstacles it is the exact triangle-to-triangle distance, for voxels it is compared with the
+sampled distance field, and for cuboids it enlarges the box by the margin on every side, which
+is slightly more conservative near the box corners.
+
 One case is missed for every obstacle type: an obstacle small enough to lie entirely inside a
 link, crossing none of its triangles. Detecting it would need a point-in-robot test, which is
 expensive because the robot geometry moves with every configuration.
