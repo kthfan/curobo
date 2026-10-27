@@ -39,6 +39,13 @@ STEPS = [
         """,
     ),
     (
+        "torch.sqrt on CPU (uses MKL VML when torch is built with MKL)",
+        """
+        import torch
+        print(torch.sqrt(torch.rand(1000)).sum(), torch.sqrt(torch.tensor(2.0)))
+        """,
+    ),
+    (
         "import curobo tool_pose_bound",
         """
         import curobo._src.cost.tool_pose_bound as m
@@ -84,12 +91,17 @@ STEPS = [
     (
         "warp trivial CPU kernel",
         """
+        # Warp needs kernel source in a file, so write a tiny module and import it.
+        import importlib, tempfile
         import warp as wp
         from curobo._src.util.warp import init_warp
         init_warp()
-        @wp.kernel
-        def add_one(x: wp.array(dtype=float)):
-            x[wp.tid()] += 1.0
+        folder = tempfile.mkdtemp()
+        with open(os.path.join(folder, "diag_kernel.py"), "w") as f:
+            f.write("import warp as wp\\n@wp.kernel\\ndef add_one(x: wp.array(dtype=float)):\\n"
+                    "    x[wp.tid()] += 1.0\\n")
+        sys.path.insert(0, folder)
+        add_one = importlib.import_module("diag_kernel").add_one
         a = wp.zeros(4, dtype=float, device="cpu")
         wp.launch(add_one, dim=4, inputs=[a], device="cpu"); wp.synchronize()
         print(a.numpy())
@@ -140,6 +152,12 @@ STEPS = [
 
 PRELUDE = "import os, sys\nsys.path.insert(0, os.getcwd())\n"
 
+#: Run with ``LD_DEBUG=libs`` to show which libraries pull MKL in, and from where.
+MKL_TRACE = """
+import torch
+torch.sqrt(torch.rand(1000))
+"""
+
 
 def main() -> int:
     timeout = float(os.environ.get("DIAG_TIMEOUT", "180"))
@@ -170,6 +188,20 @@ def main() -> int:
         tail = "\n".join(output.strip().splitlines()[-25:])
         if tail:
             print(textwrap.indent(tail, "    "))
+    print("=== MKL loader trace (LD_DEBUG=libs, lines mentioning mkl)")
+    env = dict(os.environ, LD_DEBUG="libs")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", PRELUDE + MKL_TRACE],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        lines = [ln for ln in (proc.stdout + proc.stderr).splitlines() if "mkl" in ln.lower()]
+        print(textwrap.indent("\n".join(lines[:40]) or "(no MKL libraries loaded)", "    "))
+    except subprocess.TimeoutExpired:
+        print("    TIMEOUT")
     print(f"\n{failed} step(s) not OK")
     return failed
 
