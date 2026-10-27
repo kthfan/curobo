@@ -665,7 +665,8 @@ class MotionPlanner:
         """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria.
 
         Bounds are enforced over the whole trajectory, and :meth:`plan_pose` raises if the start
-        state or every goal violates them.
+        state or every goal violates them. The graph planner ignores bounds; its seeds are
+        corrected by trajectory optimization.
 
         Args:
             tool_pose_bounds: Map from tool frame name to its bound.
