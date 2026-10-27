@@ -13,7 +13,7 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 - [x] **P1 – `margin` is not a clearance for mesh obstacles.** Done with option A
   (`triangles_within` in the narrowphase). Tests added in `test_robot_mesh_constraint.py`
-  and passing on the CPU (`cpu_verify/`); **still to run on a GPU**.
+  and passing on the CPU (`cpu_verify/`) and on a GPU.
   In `robot_mesh_collision_kernel`, `margin` only inflates the broadphase AABB
   (`wp_robot_mesh_kernel.py:174`). The narrowphase is an exact `wp.intersect_tri_tri`
   (`:183`) that ignores it, and the containment pass compares the SDF of a single vertex
@@ -101,13 +101,14 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   mesh-colliding solution. Add a scene where the spheres are clear but a link mesh
   collides (e.g. a thin plate between the fingers), and assert that IK / `plan_pose` fails
   with `mesh_collision_check=True` and succeeds without it.
-- [ ] **P1 – Run the CUDA-only tests added for `mesh_collision_check`**
+- [x] **P1 – Run the CUDA-only tests added for `mesh_collision_check`**
   (`curobo/tests/_src/solver/test_solver_core_cfg_mesh_collision.py`,
-  `curobo/tests/_src/motion/test_motion_planner_cfg.py`); they were never run on a GPU.
+  `curobo/tests/_src/motion/test_motion_planner_cfg.py`). Passing on a GPU after fixing the
+  shared metrics rollout dict in `resolve_yaml_configs`.
 - [ ] **P2 – CUDA graph test.** Capture a graph with the mesh constraint, then
   `update_world` (move / replace obstacles) and `update_link_mesh`, and check the replayed
   results match eager execution.
-- [x] **P2 – Mesh margin test** (see Correctness). GPU run pending.
+- [x] **P2 – Mesh margin test** (see Correctness). Passing on a GPU.
 
 ## Future work
 

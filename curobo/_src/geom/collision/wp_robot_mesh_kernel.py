@@ -256,6 +256,7 @@ def robot_mesh_collision_kernel(
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
         batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance. A pair of triangles closer than ``margin`` collides.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
         check_containment: If 1, also flag links that lie entirely inside an obstacle.
@@ -448,6 +449,7 @@ def robot_cuboid_collision_kernel(
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
         batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; inflates the box half-extents.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
     """
@@ -528,6 +530,7 @@ def robot_voxel_collision_kernel(
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
         batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; a sample collides when its ESDF value is <= margin.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
         max_samples_per_edge: Upper bound on lattice subdivisions, capping per-thread cost
