@@ -86,7 +86,7 @@ class EEFBoundCost(BaseCost):
                 self._anchor[i] = -1
                 continue
             offset_p, offset_q, pos_lo, pos_hi, rot_lo, rot_hi, max_swing = bound.stacked_values(
-                self.config.use_tolerance
+                self.config.metric
             )
             self._offset_position[i] = self._offset_position.new_tensor(offset_p)
             self._offset_quaternion[i] = self._offset_quaternion.new_tensor(offset_q)

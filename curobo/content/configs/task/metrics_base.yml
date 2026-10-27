@@ -19,7 +19,7 @@ rollout:
       cost_type: STATE
     eef_bound_cfg:
       weight: 5000.0
-      use_tolerance: True
+      metric: True
       convert_to_binary: True
 
 

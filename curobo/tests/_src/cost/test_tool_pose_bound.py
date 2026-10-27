@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from curobo._src.cost.tool_pose_bound import (
+    METRIC_EPSILON,
     UNBOUNDED,
     ToolPoseBound,
     ToolPoseBoundAnchor,
@@ -55,29 +56,20 @@ class TestToolPoseBoundValidation:
 
     def test_unfilled_axes_are_unchecked(self):
         bound = ToolPoseBound(position_lower=[None, -0.1, None], position_upper=[None, 0.2, None])
-        _, _, lo, hi, rot_lo, rot_hi, max_swing = bound.stacked_values(use_tolerance=False)
-        assert lo == [-UNBOUNDED, -0.1, -UNBOUNDED]
-        assert hi == [UNBOUNDED, 0.2, UNBOUNDED]
+        _, _, lo, hi, rot_lo, rot_hi, max_swing = bound.stacked_values(metric=False)
+        assert lo[0] == -UNBOUNDED and lo[2] == -UNBOUNDED
+        assert hi[0] == UNBOUNDED and hi[2] == UNBOUNDED
         assert rot_lo == [-UNBOUNDED] * 3 and rot_hi == [UNBOUNDED] * 3
         assert max_swing == [UNBOUNDED]
         assert not bound.uses_rotation
 
-    def test_tolerance_widens_only_filled_bounds(self):
-        bound = ToolPoseBound(
-            position_lower=[0.0, None, None],
-            position_upper=[0.0, None, None],
-            max_swing=0.1,
-            position_tolerance=0.002,
-            rotation_tolerance=0.01,
-        )
-        _, _, lo, hi, _, _, max_swing = bound.stacked_values(use_tolerance=True)
-        assert lo[0] == pytest.approx(-0.002) and hi[0] == pytest.approx(0.002)
-        assert lo[1] == -UNBOUNDED
-        assert max_swing[0] == pytest.approx(0.11)
+    def test_negative_margin_raises(self):
+        with pytest.raises(ValueError):
+            ToolPoseBound(position_margin=-0.001)
 
     def test_offset_defaults(self):
         offset_p, offset_q, *_ = ToolPoseBound(offset_position=[None, 0.1, None]).stacked_values(
-            use_tolerance=False
+            metric=False
         )
         assert offset_p == [0.0, 0.1, 0.0]
         assert offset_q == [1.0, 0.0, 0.0, 0.0]
@@ -95,6 +87,72 @@ class TestToolPoseBoundValidation:
         assert criteria.bound is None
         bounded = ToolPoseCriteria(bound=ToolPoseBound.plane(), device_cfg=cpu_device_cfg)
         assert bounded.clone().bound is not None
+
+
+def _z_intervals(bound: ToolPoseBound):
+    """``(cost lower, cost upper, metric lower, metric upper)`` of the z position component."""
+    _, _, cost_lo, cost_hi, *_ = bound.stacked_values(metric=False)
+    _, _, metric_lo, metric_hi, *_ = bound.stacked_values(metric=True)
+    return cost_lo[2], cost_hi[2], metric_lo[2], metric_hi[2]
+
+
+class TestIntervals:
+    """Cost and feasibility intervals.
+
+    Cost sides shrink by the margin (never past the reference); feasibility keeps the user
+    bounds and adds the tolerance only on sides the cost could not shrink.
+    """
+
+    def _bound(self, lower, upper, **kwargs):
+        kwargs.setdefault("position_margin", 0.001)
+        kwargs.setdefault("position_tolerance", 0.002)
+        return ToolPoseBound(
+            position_lower=[None, None, lower], position_upper=[None, None, upper], **kwargs
+        )
+
+    def test_equality_uses_tolerance(self):
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(0.0, 0.0))
+        assert (cost_lo, cost_hi) == (0.0, 0.0)
+        assert lo == pytest.approx(-0.002 - METRIC_EPSILON)
+        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
+
+    def test_band_is_strict(self):
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.005, 0.005))
+        assert cost_lo == pytest.approx(-0.004) and cost_hi == pytest.approx(0.004)
+        assert lo == pytest.approx(-0.005 - METRIC_EPSILON)
+        assert hi == pytest.approx(0.005 + METRIC_EPSILON)
+
+    def test_narrow_band_behaves_like_equality(self):
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.0005, 0.0005))
+        assert (cost_lo, cost_hi) == (0.0, 0.0)
+        assert lo == pytest.approx(-0.0025 - METRIC_EPSILON)
+        assert hi == pytest.approx(0.0025 + METRIC_EPSILON)
+
+    def test_side_at_reference_is_soft(self):
+        # Approach line: the goal end (0) cannot shrink, the far end can.
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.15, 0.0))
+        assert cost_lo == pytest.approx(-0.149) and cost_hi == 0.0
+        assert lo == pytest.approx(-0.15 - METRIC_EPSILON)
+        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
+
+    def test_one_sided(self):
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.05, None))
+        assert cost_lo == pytest.approx(-0.049) and cost_hi == UNBOUNDED
+        assert lo == pytest.approx(-0.05 - METRIC_EPSILON) and hi == UNBOUNDED
+
+    def test_zero_margin_keeps_equality_soft(self):
+        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(0.0, 0.0, position_margin=0.0))
+        assert (cost_lo, cost_hi) == (0.0, 0.0)
+        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
+
+    @pytest.mark.parametrize(
+        "max_swing, cost, metric",
+        [(0.1, 0.09, 0.1 + METRIC_EPSILON), (0.0, 0.0, 0.02 + METRIC_EPSILON)],
+    )
+    def test_max_swing(self, max_swing, cost, metric):
+        bound = ToolPoseBound(max_swing=max_swing, rotation_margin=0.01, rotation_tolerance=0.02)
+        assert bound.stacked_values(metric=False)[6][0] == pytest.approx(cost)
+        assert bound.stacked_values(metric=True)[6][0] == pytest.approx(metric)
 
 
 class TestSwingTwist:
@@ -126,7 +184,12 @@ class TestViolation:
         bound = ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, 0.8])
         position = torch.tensor([[0.3, -0.2, 0.83]])
         violation = tool_pose_bound_violation(
-            bound, position, IDENTITY.unsqueeze(0), torch.zeros(1, 3), IDENTITY.unsqueeze(0)
+            bound,
+            position,
+            IDENTITY.unsqueeze(0),
+            torch.zeros(1, 3),
+            IDENTITY.unsqueeze(0),
+            metric=False,
         )
         assert violation[0, 2].item() == pytest.approx(0.03, abs=1e-6)
         assert violation[0, [0, 1, 3, 4, 5, 6]].abs().sum().item() == 0.0
@@ -141,6 +204,7 @@ class TestViolation:
             IDENTITY.unsqueeze(0),
             torch.zeros(1, 3),
             anchor_q,
+            metric=False,
         )
         off_line = tool_pose_bound_violation(
             bound,
@@ -148,6 +212,7 @@ class TestViolation:
             IDENTITY.unsqueeze(0),
             torch.zeros(1, 3),
             anchor_q,
+            metric=False,
         )
         assert on_line.sum().item() == pytest.approx(0.0, abs=1e-6)
         assert off_line[0, 1].item() == pytest.approx(0.5, abs=1e-6)
@@ -156,8 +221,8 @@ class TestViolation:
         bound = ToolPoseBound.plane("z", anchor="base", tolerance=0.005)
         position = torch.tensor([[0.0, 0.0, 0.004]])
         args = (position, IDENTITY.unsqueeze(0), torch.zeros(1, 3), IDENTITY.unsqueeze(0))
-        assert tool_pose_bound_violation(bound, *args, use_tolerance=True).sum().item() == 0.0
-        assert tool_pose_bound_violation(bound, *args, use_tolerance=False)[0, 2].item() > 0.0
+        assert tool_pose_bound_violation(bound, *args, metric=True).sum().item() == 0.0
+        assert tool_pose_bound_violation(bound, *args, metric=False)[0, 2].item() > 0.0
 
 
 def _poses(start_p, goal_p, goal_q=None):
