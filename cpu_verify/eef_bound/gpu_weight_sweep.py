@@ -31,7 +31,8 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import _quat_rotate, tool_pose_bound_violation
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
-from curobo.types import GoalToolPose, JointState, ToolPoseBound, ToolPoseCriteria
+from curobo.types import GoalToolPose, JointState, ToolPoseBound
+from gpu_check import active_positions, configured_criteria, with_bound
 
 Scenario = Callable[["Sweep", torch.Generator], Tuple[ToolPoseBound, torch.Tensor, torch.Tensor]]
 
@@ -80,6 +81,7 @@ class Sweep:
         self.device = self.start.position.device
         p, q = self.fk(self.start.position)
         self.start_p, self.start_q = p[0], q[0]
+        self.criteria = configured_criteria(self.planner.trajopt_solver.core, self.ee)
         self.interpolation_dt = self.planner.trajopt_solver.config.interpolation_dt
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -92,9 +94,7 @@ class Sweep:
     def plan(
         self, bound: ToolPoseBound, goal_p: torch.Tensor, goal_q: torch.Tensor
     ) -> Dict[str, float]:
-        self.planner.update_tool_pose_criteria(
-            {self.ee: ToolPoseCriteria(bound=bound, device_cfg=self.planner.device_cfg)}
-        )
+        self.planner.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
         goal = GoalToolPose(
             tool_frames=[self.ee],
             position=goal_p.view(1, 1, 1, 1, 3).clone(),
@@ -120,8 +120,7 @@ class Sweep:
         row["time_ms"] = 1e3 * (time.perf_counter() - t0)
         if result is None or not bool(result.success.any()):
             return row
-        traj = result.get_interpolated_plan().position
-        traj = traj.reshape(-1, traj.shape[-1])
+        traj = active_positions(result.get_interpolated_plan(), self.planner.joint_names)
         p, q = self.fk(traj)
         anchor_p, anchor_q = self.anchor(bound, goal_p, goal_q)
         violation = tool_pose_bound_violation(
@@ -292,7 +291,7 @@ def sweep_mpc(args, weights: List[float]) -> List[Dict]:
     bound = ToolPoseBound.plane(
         "z", anchor="base", offset_position=[None, None, start_p[2].item()], tolerance=0.002
     )
-    mpc.update_tool_pose_criteria({ee: ToolPoseCriteria(bound=bound, device_cfg=mpc.device_cfg)})
+    mpc.update_tool_pose_criteria({ee: with_bound(configured_criteria(mpc.core, ee), bound)})
     goal_p = start_p + torch.tensor([0.0, 0.2, 0.0], device=start_p.device)
     goal = GoalToolPose(
         tool_frames=[ee],
@@ -304,7 +303,9 @@ def sweep_mpc(args, weights: List[float]) -> List[Dict]:
         set_weight(costs, weight)
         state = start.clone()
         mpc.reset_robot(state.clone())
-        mpc.update_goal_tool_poses(goal, run_ik=True)
+        # MPC's goal IK uses a single seed; fall back to Cartesian tracking when it fails.
+        run_ik = bool(mpc._solve_ik_for_goal(goal).success.all())
+        mpc.update_goal_tool_poses(goal, run_ik=run_ik)
         positions, success, times = [state.position.clone()], [], []
         for _ in range(args.mpc_steps):
             torch.cuda.synchronize()
@@ -326,6 +327,7 @@ def sweep_mpc(args, weights: List[float]) -> List[Dict]:
                 "max_dz_mm": 1e3 * (p[:, 2] - start_p[2]).abs().max().item(),
                 "final_error_mm": 1e3 * (p[-1] - goal_p).norm().item(),
                 "median_step_ms": sorted(times)[len(times) // 2],
+                "goal_ik": run_ik,
             }
         )
         print("mpc", rows[-1])
@@ -368,9 +370,7 @@ def main() -> int:
             done = [r for r in rows if r["scenario"] == name and r["weight"] == weight]
             rate = sum(r["success"] for r in done) / len(done)
             print(f"{name:12s} weight={weight:<10g} success={rate:.0%}")
-    sweep.planner.update_tool_pose_criteria(
-        {sweep.ee: ToolPoseCriteria(device_cfg=sweep.planner.device_cfg)}
-    )
+    sweep.planner.update_tool_pose_criteria({sweep.ee: with_bound(sweep.criteria, None)})
 
     summary = summarize(rows)
     write_csv(os.path.join(args.out, "sweep_raw.csv"), rows)

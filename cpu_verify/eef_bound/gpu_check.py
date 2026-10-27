@@ -32,6 +32,39 @@ from curobo.types import GoalToolPose, JointState, ToolPoseBound, ToolPoseCriter
 RESULTS: List[Tuple[str, bool, str]] = []
 
 
+def active_positions(joint_state: JointState, joint_names: List[str]) -> torch.Tensor:
+    """``(T, dof)`` positions of ``joint_names`` from a trajectory that may hold locked joints.
+
+    Planner trajectories carry every articulated joint (e.g. Franka fingers); forward kinematics
+    takes the active joints only.
+    """
+    position = joint_state.position.reshape(-1, joint_state.position.shape[-1])
+    names = joint_state.joint_names
+    if names is None:
+        if position.shape[-1] != len(joint_names):
+            raise ValueError(f"cannot pick {joint_names} from unnamed {position.shape[-1]} joints")
+        return position
+    return position[:, [list(names).index(n) for n in joint_names]]
+
+
+def configured_criteria(core, tool_frame: str) -> ToolPoseCriteria:
+    """Tool pose criteria the solver was configured with (yml), so a bound can be added to them.
+
+    Building ``ToolPoseCriteria(bound=...)`` from scratch would reset the configured weights and
+    tolerances to the dataclass defaults.
+    """
+    for rollout in core.optimizer_rollouts:
+        for cost in rollout.get_cost_component_by_name("tool_pose"):
+            return cost._stacked_tool_pose_criteria._tool_pose_criteria[tool_frame].clone()
+    raise RuntimeError("no tool_pose cost found")
+
+
+def with_bound(criteria: ToolPoseCriteria, bound: Optional[ToolPoseBound]) -> ToolPoseCriteria:
+    updated = criteria.clone()
+    updated.bound = bound
+    return updated
+
+
 class Setup:
     """Planner, start state, and helpers shared by the checks."""
 
@@ -52,6 +85,7 @@ class Setup:
         start_pose = self.fk(self.start.position)
         self.start_p = start_pose[0][0]
         self.start_q = start_pose[1][0]
+        self.criteria = configured_criteria(self.planner.trajopt_solver.core, self.ee)
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tool positions ``(T, 3)`` and quaternions ``(T, 4)`` for joint positions ``(T, dof)``."""
@@ -66,8 +100,7 @@ class Setup:
         )
 
     def set_bound(self, bound: Optional[ToolPoseBound]):
-        criteria = ToolPoseCriteria(bound=bound, device_cfg=self.planner.device_cfg)
-        self.planner.update_tool_pose_criteria({self.ee: criteria})
+        self.planner.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
 
     def plan(self, goal: GoalToolPose) -> Tuple[bool, Optional[torch.Tensor], float]:
         """Return success, interpolated joint positions ``(T, dof)`` and wall time."""
@@ -78,8 +111,8 @@ class Setup:
         elapsed = time.perf_counter() - t0
         if result is None or not bool(result.success.any()):
             return False, None, elapsed
-        traj = result.get_interpolated_plan().position
-        return True, traj.reshape(-1, traj.shape[-1]), elapsed
+        traj = active_positions(result.get_interpolated_plan(), self.planner.joint_names)
+        return True, traj, elapsed
 
     def max_violation(
         self,
@@ -246,14 +279,32 @@ def g9_ik(s: Setup):
 def g10_timing(s: Setup):
     goal = _plane_goal(s)
     z0 = s.start_p[2].item()
+    # With zero tolerance an equality bound is never feasible, so every attempt fails and the
+    # planner retries; use a realistic tolerance here.
+    plane = ToolPoseBound.plane(
+        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
+    )
     times: Dict[str, List[float]] = {"none": [], "plane": []}
+    successes: Dict[str, int] = {"none": 0, "plane": 0}
     for _ in range(5):
-        s.set_bound(None)
-        times["none"].append(s.plan(goal)[2])
-        s.set_bound(ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0]))
-        times["plane"].append(s.plan(goal)[2])
+        for key, bound in (("none", None), ("plane", plane)):
+            s.set_bound(bound)
+            ok, _, elapsed = s.plan(goal)
+            times[key].append(elapsed)
+            successes[key] += int(ok)
     med = {k: sorted(v)[len(v) // 2] * 1e3 for k, v in times.items()}
-    return True, f"median {med['none']:.0f} ms without, {med['plane']:.0f} ms with plane"
+    return successes["plane"] == 5, (
+        f"median {med['none']:.0f} ms without ({successes['none']}/5 ok), "
+        f"{med['plane']:.0f} ms with plane ({successes['plane']}/5 ok)"
+    )
+
+
+@check("G11 equality bound with zero tolerance (informational)")
+def g11_zero_tolerance(s: Setup):
+    z0 = s.start_p[2].item()
+    s.set_bound(ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0]))
+    ok, _, elapsed = s.plan(_plane_goal(s))
+    return True, f"success={ok} in {elapsed * 1e3:.0f} ms (expected to fail: no slack)"
 
 
 CHECKS = [
@@ -267,6 +318,7 @@ CHECKS = [
     g8_clear,
     g9_ik,
     g10_timing,
+    g11_zero_tolerance,
 ]
 
 
@@ -298,14 +350,28 @@ class MPCSetup:
         self.device = self.start.position.device
         self.start_p, self.start_q = self.fk(self.start.position)
         self.start_p, self.start_q = self.start_p[0], self.start_q[0]
+        self.criteria = configured_criteria(self.mpc.core, self.ee)
 
     def fk(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         tool = self.mpc.compute_kinematics(JointState.from_position(positions)).tool_poses
         return tool.position[:, 0, 0], tool.quaternion[:, 0, 0]
 
     def set_bound(self, bound: Optional[ToolPoseBound]):
-        criteria = ToolPoseCriteria(bound=bound, device_cfg=self.mpc.device_cfg)
-        self.mpc.update_tool_pose_criteria({self.ee: criteria})
+        self.mpc.update_tool_pose_criteria({self.ee: with_bound(self.criteria, bound)})
+
+    def set_goal(self, goal: GoalToolPose) -> str:
+        """Set the goal with IK when MPC's single-seed IK succeeds, else track it in Cartesian space.
+
+        Returns a short description of what was used.
+        """
+        ik = self.mpc._solve_ik_for_goal(goal)
+        if bool(ik.success.all()):
+            self.mpc.update_goal_tool_poses(goal, run_ik=True)
+            return "ik goal"
+        self.mpc.update_goal_tool_poses(goal, run_ik=False)
+        pos = ik.position_error.max().item() * 1e3 if ik.position_error is not None else math.nan
+        rot = ik.rotation_error.max().item() if ik.rotation_error is not None else math.nan
+        return f"cartesian goal (MPC IK failed: pos err {pos:.1f} mm, rot err {rot:.3f})"
 
     def run(self, goal_p: torch.Tensor, goal_q: torch.Tensor) -> Dict[str, object]:
         """Track the goal in closed loop; return executed positions, success flags and timing."""
@@ -316,8 +382,7 @@ class MPCSetup:
             position=goal_p.view(1, 1, 1, 1, 3).clone(),
             quaternion=goal_q.view(1, 1, 1, 1, 4).clone(),
         )
-        if not self.mpc.update_goal_tool_poses(goal, run_ik=True):
-            raise RuntimeError("MPC goal IK failed")
+        goal_mode = self.set_goal(goal)
         executed, success, times = [state.position.clone()], [], []
         for _ in range(self.steps):
             torch.cuda.synchronize()
@@ -340,6 +405,7 @@ class MPCSetup:
             "success_rate": sum(success) / len(success),
             "step_ms": 1e3 * sorted(times)[len(times) // 2],
             "final_error": (final_p - goal_p).norm().item(),
+            "goal_mode": goal_mode,
         }
 
 
@@ -350,7 +416,7 @@ def m1_baseline(s: MPCSetup):
     dz = (s.fk(r["positions"])[0][:, 2] - s.start_p[2]).abs().max().item()
     return r["final_error"] < 0.02, (
         f"final error {r['final_error'] * 1e3:.1f} mm, max |dz| {dz * 1e3:.1f} mm, "
-        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms"
+        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms, {r['goal_mode']}"
     )
 
 
@@ -367,7 +433,7 @@ def m2_plane(s: MPCSetup):
     ok = dz <= 0.0025 and r["final_error"] < 0.02 and r["success_rate"] >= 0.9
     return ok, (
         f"max |dz| {dz * 1e3:.2f} mm (tol 2 mm), final error {r['final_error'] * 1e3:.1f} mm, "
-        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms"
+        f"success {r['success_rate']:.0%}, step {r['step_ms']:.1f} ms, {r['goal_mode']}"
     )
 
 
@@ -383,7 +449,8 @@ def m3_orientation(s: MPCSetup):
     ok = v.max().item() == 0.0 and r["final_error"] < 0.02
     return ok, (
         f"max swing violation {math.degrees(v[:, 6].max().item()):.2f} deg, "
-        f"final error {r['final_error'] * 1e3:.1f} mm, success {r['success_rate']:.0%}"
+        f"final error {r['final_error'] * 1e3:.1f} mm, success {r['success_rate']:.0%}, "
+        f"{r['goal_mode']}"
     )
 
 
@@ -400,7 +467,7 @@ def m4_start_anchor(s: MPCSetup):
     )
     return True, (
         f"max drift along the start normal {drift.abs().max().item() * 1e3:.2f} mm, "
-        f"success {r['success_rate']:.0%}"
+        f"success {r['success_rate']:.0%}, {r['goal_mode']}"
     )
 
 
