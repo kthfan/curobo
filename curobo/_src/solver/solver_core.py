@@ -20,6 +20,7 @@ import torch
 import torch.autograd.profiler as profiler
 
 import curobo._src.runtime as curobo_runtime
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.collision.attachment_manager import AttachmentManager
 from curobo._src.geom.collision.collision_scene import (
@@ -97,7 +98,10 @@ class SolverCore:
 
         # Start-anchored tool pose bounds read the start pose from the goal buffer.
         rollouts = [self.metrics_rollout, self.auxiliary_rollout] + self.optimizer_rollouts
-        if any("eef_bound" in r.get_cost_component_names() for r in rollouts):
+        self._has_eef_bound_cost = any(
+            "eef_bound" in r.get_cost_component_names() for r in rollouts
+        )
+        if self._has_eef_bound_cost:
             # Positions only: like the c-space costs, current_js is in solver joint order.
             self.goal_registry_manager.set_start_pose_fn(
                 lambda joint_state: self.compute_kinematics(
@@ -448,6 +452,30 @@ class SolverCore:
         for rollout in self.optimizer_rollouts:
             rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
         self.auxiliary_rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
+
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        """Set or clear (``None``) tool pose bounds in all rollouts.
+
+        Unlike :meth:`update_tool_pose_criteria`, the other tool pose criteria (weights,
+        tolerances) are left unchanged.
+
+        Args:
+            tool_pose_bounds: Map from tool frame name to its bound.
+        """
+        unknown = [name for name in tool_pose_bounds if name not in self.kinematics.tool_frames]
+        if unknown:
+            log_and_raise(f"Unknown tool frames {unknown}; have {self.kinematics.tool_frames}")
+        if not self._has_eef_bound_cost and any(
+            bound is not None for bound in tool_pose_bounds.values()
+        ):
+            log_and_raise("Tool pose bounds need an eef_bound cost in the solver configuration")
+        rollouts = (
+            [self.metrics_rollout, self.auxiliary_rollout]
+            + list(self.additional_metrics_rollouts.values())
+            + self.optimizer_rollouts
+        )
+        for rollout in rollouts:
+            rollout.update_params_cost_managers(tool_pose_bounds=tool_pose_bounds)
 
     # -----------------------------------------------------------------------
     # Sample configs (collision activation distance passed as arg)
