@@ -422,6 +422,10 @@ class RobotCostManager:
             eef_bound_cost = self.get_cost("eef_bound")
             if eef_bound_cost is not None:
                 eef_bound_cost.update_tool_pose_criteria(tool_pose_criteria)
+        if "tool_pose_bounds" in kwargs:
+            eef_bound_cost = self.get_cost("eef_bound")
+            if eef_bound_cost is not None:
+                eef_bound_cost.update_tool_pose_bounds(kwargs["tool_pose_bounds"])
         if "dt" in kwargs:
             self.update_dt(kwargs["dt"])
 

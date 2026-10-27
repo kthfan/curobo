@@ -659,11 +659,27 @@ class MotionPlanner:
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.ik_solver.update_tool_pose_criteria(tool_pose_criteria)
         self.trajopt_solver.update_tool_pose_criteria(tool_pose_criteria)
-        for name, criteria in tool_pose_criteria.items():
-            if criteria.bound is None:
+        self._track_tool_pose_bounds({k: v.bound for k, v in tool_pose_criteria.items()})
+
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria.
+
+        Bounds are enforced over the whole trajectory, and :meth:`plan_pose` raises if the start
+        state or every goal violates them.
+
+        Args:
+            tool_pose_bounds: Map from tool frame name to its bound.
+        """
+        self.ik_solver.update_tool_pose_bounds(tool_pose_bounds)
+        self.trajopt_solver.update_tool_pose_bounds(tool_pose_bounds)
+        self._track_tool_pose_bounds(tool_pose_bounds)
+
+    def _track_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        for name, bound in tool_pose_bounds.items():
+            if bound is None:
                 self._tool_pose_bounds.pop(name, None)
             else:
-                self._tool_pose_bounds[name] = criteria.bound
+                self._tool_pose_bounds[name] = bound
 
     def _check_tool_pose_bounds(self, goal_tool_poses: GoalToolPose, current_state: JointState):
         """Raise if the start state or every goal violates a tool pose bound."""

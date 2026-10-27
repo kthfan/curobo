@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 # CuRobo
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.collision.collision_scene import SceneCollision
 from curobo._src.rollout.goal_registry import GoalRegistry
@@ -221,6 +222,14 @@ class MPCSolver:
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.ik_solver.update_tool_pose_criteria(tool_pose_criteria)
         self.core.update_tool_pose_criteria(tool_pose_criteria)
+
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria.
+
+        A start-anchored bound follows the current state at every MPC step.
+        """
+        self.ik_solver.update_tool_pose_bounds(tool_pose_bounds)
+        self.core.update_tool_pose_bounds(tool_pose_bounds)
 
     # -------------------------------------------------------------------
     # Goal buffer

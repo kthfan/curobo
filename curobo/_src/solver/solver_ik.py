@@ -16,6 +16,7 @@ from typing import Dict, Optional
 import torch
 import torch.autograd.profiler as profiler
 
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 
 # CuRobo
@@ -294,6 +295,10 @@ class IKSolver:
         if self.seed_ik_solver is not None:
             self.seed_ik_solver.update_tool_pose_criteria(tool_pose_criteria)
         self.core.update_tool_pose_criteria(tool_pose_criteria)
+
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
+        """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria."""
+        self.core.update_tool_pose_bounds(tool_pose_bounds)
 
     def reset_seed(self):
         if self.config.use_lm_seed:
