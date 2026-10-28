@@ -221,8 +221,9 @@ def test_attached_object_mesh_is_checked(cuda_device_cfg):
     # Rod from the fingertips (z = 0.19) down to z = 0.0, into the box top at z = 0.015.
     rod = Cuboid(name="rod", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.02, 0.02, 0.19])
     rod_pose = Pose.from_list([0.5, 0.0, 0.095, 1.0, 0.0, 0.0, 0.0], device_cfg=cuda_device_cfg)
+    solution = solver.kinematics.get_active_js(result.js_solution)
     grasp_state = JointState.from_position(
-        result.js_solution.position.view(-1, result.js_solution.position.shape[-1])[0:1]
+        solution.position.reshape(-1, solution.position.shape[-1])[0:1]
     )
     solver.core.attachment_manager.attach(
         grasp_state,
