@@ -406,6 +406,80 @@ def test_to_warp_rejects_mismatched_link_count(robot_mesh):
         robot_mesh.to_warp(tf)
 
 
+def _origin_cuboid_scene() -> SceneData:
+    return SceneData.from_scene_cfg(
+        SceneCfg(cuboid=[Cuboid(name="c", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.3, 0.3, 0.3])]),
+        device_cfg=DEVICE_CFG,
+    )
+
+
+def _two_link_transforms(x0: float, x1: float) -> torch.Tensor:
+    """Identity-rotation transforms for two links placed along +x."""
+    tf = torch.zeros(1, 1, 2, 3, 4, device=DEVICE_CFG.device, dtype=torch.float32)
+    tf[..., 0, 0] = 1.0
+    tf[..., 1, 1] = 1.0
+    tf[..., 2, 2] = 1.0
+    tf[0, 0, 0, 0, 3] = x0
+    tf[0, 0, 1, 0, 3] = x1
+    return tf
+
+
+def test_disable_and_enable_static_link_mesh():
+    data = RobotMeshData.from_link_meshes(
+        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
+        link_name_to_idx_map={"l0": 0},
+        num_links=1,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+    )
+    scene = _origin_cuboid_scene()
+    tf = _link_transforms([0.0])
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+    data.disable_link_mesh("l0")
+    assert data.num_active_triangles == 0
+    assert _check(data, scene, tf)[0].tolist() == [0]
+
+    data.enable_link_mesh("l0")
+    assert data.num_active_triangles == 12
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+
+def test_enable_link_mesh_restores_runtime_geometry():
+    """A reserved link comes back with the geometry last written, or stays empty."""
+    data = RobotMeshData.from_link_meshes(
+        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
+        link_name_to_idx_map={"l0": 0, "obj": 1},
+        num_links=2,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+        extra_link_triangles={"obj": 16},
+    )
+    assert data.has_link_mesh("obj")
+    assert not data.has_link_mesh("missing")
+    scene = _origin_cuboid_scene()
+    # The static link sits far away, the reserved link at the obstacle.
+    tf = _two_link_transforms(5.0, 0.0)
+
+    data.enable_link_mesh("obj")
+    assert _check(data, scene, tf)[0].tolist() == [0]
+
+    obj = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+    data.update_link_mesh("obj", obj)
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+    data.disable_link_mesh("obj")
+    assert _check(data, scene, tf)[0].tolist() == [0]
+    data.enable_link_mesh("obj")
+    assert data.num_active_triangles == 24
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+    # Writing while disabled reactivates the slots with the new geometry.
+    data.disable_link_mesh("obj")
+    data.update_link_mesh("obj", obj)
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+
 def test_ignored_links_are_not_packed():
     """An ignored link contributes no geometry, so it can never report a collision."""
     link_meshes = {

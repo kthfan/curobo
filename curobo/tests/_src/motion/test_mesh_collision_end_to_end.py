@@ -53,6 +53,12 @@ def cuda_device_cfg():
     pytest.skip("CUDA not available")
 
 
+def _disable_gripper_spheres(kinematics) -> None:
+    """Disable only the gripper spheres; ``disable_link_collision`` would disable the meshes."""
+    for link_name in GRIPPER_LINKS:
+        kinematics.config.kinematics_config.disable_link_spheres(link_name)
+
+
 def _ik_solver(device_cfg: DeviceCfg, mesh_collision_check: bool) -> IKSolver:
     config = IKSolverCfg.create(
         robot="franka.yml",
@@ -63,8 +69,7 @@ def _ik_solver(device_cfg: DeviceCfg, mesh_collision_check: bool) -> IKSolver:
         use_cuda_graph=False,
     )
     solver = IKSolver(config)
-    for link_name in GRIPPER_LINKS:
-        solver.kinematics.config.kinematics_config.disable_link_spheres(link_name)
+    _disable_gripper_spheres(solver.kinematics)
     return solver
 
 
@@ -123,7 +128,9 @@ def test_mesh_collision_check_accepts_clear_scene(mesh_ik_solver, cuda_device_cf
 # =============================================================================
 
 
-def _planner(device_cfg: DeviceCfg, mesh_collision_check: bool) -> MotionPlanner:
+def _planner(
+    device_cfg: DeviceCfg, mesh_collision_check: bool, disable_gripper_spheres: bool = True
+) -> MotionPlanner:
     config = MotionPlannerCfg.create(
         robot="franka.yml",
         scene_model=palm_box(),
@@ -134,17 +141,21 @@ def _planner(device_cfg: DeviceCfg, mesh_collision_check: bool) -> MotionPlanner
         use_cuda_graph=False,
     )
     planner = MotionPlanner(config)
-    planner.disable_link_collision(GRIPPER_LINKS)
+    if disable_gripper_spheres:
+        _disable_gripper_spheres(planner.kinematics)
     return planner
 
 
-def _plan(planner: MotionPlanner, device_cfg: DeviceCfg):
-    start = JointState.from_position(
+def _start(planner: MotionPlanner) -> JointState:
+    return JointState.from_position(
         planner.default_joint_state.position.clone().unsqueeze(0),
         joint_names=planner.joint_names,
     )
+
+
+def _plan(planner: MotionPlanner, device_cfg: DeviceCfg):
     goal = _goal(planner.kinematics.tool_frames, device_cfg)
-    return planner.plan_pose(goal_tool_poses=goal, current_state=start, max_attempts=3)
+    return planner.plan_pose(goal_tool_poses=goal, current_state=_start(planner), max_attempts=3)
 
 
 def test_sphere_only_plan_pose_reaches_mesh_colliding_goal(cuda_device_cfg):
@@ -157,4 +168,22 @@ def test_sphere_only_plan_pose_reaches_mesh_colliding_goal(cuda_device_cfg):
 def test_mesh_collision_check_plan_pose_fails(cuda_device_cfg):
     """With the mesh check no goal configuration is feasible, so planning fails."""
     result = _plan(_planner(cuda_device_cfg, mesh_collision_check=True), cuda_device_cfg)
+    assert result is None or not result.success.any().item()
+
+
+def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_cfg):
+    """plan_grasp disables collision of the grasp contact links on their meshes as well.
+
+    The grasp pose pushes the palm into the box, which plan_grasp allows for the gripper. With
+    the mesh check on, the gripper meshes must be disabled during the contact phases and
+    restored afterwards.
+    """
+    planner = _planner(cuda_device_cfg, mesh_collision_check=True, disable_gripper_spheres=False)
+    grasp = _goal(planner.kinematics.tool_frames, cuda_device_cfg)
+    result = planner.plan_grasp(grasp_poses=grasp, current_state=_start(planner))
+    assert result.success.any().item(), result.status
+
+    # The gripper meshes are active again: with only the spheres off, the box still blocks it.
+    _disable_gripper_spheres(planner.kinematics)
+    result = _plan(planner, cuda_device_cfg)
     assert result is None or not result.success.any().item()

@@ -69,7 +69,9 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   which is easy to forget in pick-and-place. Make the attachment path also write the
   object's mesh into the reserved `extra_collision_meshes` slots (and clear it on detach),
   when mesh collision is enabled.
-- [ ] **P1 – `plan_grasp` keeps the gripper meshes active.** During the approach and grasp
+- [x] **P1 – `plan_grasp` keeps the gripper meshes active.** Fixed: the planners'
+  `disable_link_collision` / `enable_link_collision` toggle the meshes too, and
+  `enable_link_mesh` restores the geometry last written. During the approach and grasp
   phases `MotionPlanner.plan_grasp` calls `disable_link_collision` on
   `grasp_contact_link_names` (`motion_planner.py:462-597`), which only disables the spheres.
   With `mesh_collision_check=True` the fingers touching the object still fail the mesh

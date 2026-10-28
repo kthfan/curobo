@@ -255,12 +255,17 @@ class RobotMeshData:
     #: :attr:`tri_link` when not supplied.
     link_body_indices: Optional[List[int]] = None
 
+    #: :attr:`tri_link` as last written by packing or :meth:`update_link_mesh`, before any
+    #: :meth:`disable_link_mesh`. :meth:`enable_link_mesh` restores slots from it.
+    reference_tri_link: Optional[torch.Tensor] = None
+
     def __post_init__(self):
-        """Recover the body index of each packed link when it was not supplied."""
-        if self.link_body_indices is not None:
-            return
-        offsets = np.cumsum([0] + list(self.link_triangle_counts[:-1]))
-        self.link_body_indices = [int(self.tri_link[int(o)].item()) for o in offsets]
+        """Recover the body index of each packed link and the reference slot owners."""
+        if self.link_body_indices is None:
+            offsets = np.cumsum([0] + list(self.link_triangle_counts[:-1]))
+            self.link_body_indices = [int(self.tri_link[int(o)].item()) for o in offsets]
+        if self.reference_tri_link is None:
+            self.reference_tri_link = self.tri_link.clone()
 
     @property
     def body_idx_to_link_name(self) -> Dict[int, str]:
@@ -333,20 +338,42 @@ class RobotMeshData:
 
         verts = tris.reshape(-1, 3).to(dtype=self.tri_verts.dtype, device=self.tri_verts.device)
         self.tri_verts[span.start * 3 : (span.start + n) * 3] = verts
-        self.tri_link[span.start : span.start + n] = body_idx
+        self.reference_tri_link[span.start : span.start + n] = body_idx
         if n < capacity:
-            self.tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
+            self.reference_tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
+        self.tri_link[span] = self.reference_tri_link[span]
 
     def disable_link_mesh(self, link_name: str):
         """Deactivate every triangle slot of a link, so it can no longer report a collision.
 
-        The geometry is left in place; :meth:`update_link_mesh` reactivates the slots.
+        The geometry is left in place; :meth:`enable_link_mesh` or :meth:`update_link_mesh`
+        reactivates the slots.
 
         Args:
             link_name: Name of the link to deactivate.
         """
         span = self.get_triangle_slice(link_name)
         self.tri_link[span] = INACTIVE_TRI_LINK
+
+    def enable_link_mesh(self, link_name: str):
+        """Reactivate a link's triangles after :meth:`disable_link_mesh`.
+
+        Restores the geometry last packed or written with :meth:`update_link_mesh`, so a
+        reserved link that holds no geometry stays inactive. The write is in-place.
+
+        Args:
+            link_name: Name of the link to reactivate.
+        """
+        span = self.get_triangle_slice(link_name)
+        self.tri_link[span] = self.reference_tri_link[span]
+
+    def has_link_mesh(self, link_name: str) -> bool:
+        """Whether a link owns triangle slots, packed or reserved.
+
+        Args:
+            link_name: Name of the link.
+        """
+        return link_name in self.link_names
 
     @property
     def num_active_triangles(self) -> int:

@@ -676,6 +676,26 @@ class KinematicsParams:
         """
         self.get_robot_mesh_data().disable_link_mesh(link_name)
 
+    def enable_link_mesh(self, link_name: str):
+        """Reactivate a link's triangles after :meth:`disable_link_mesh`.
+
+        Args:
+            link_name: Name of the link to reactivate.
+        """
+        self.get_robot_mesh_data().enable_link_mesh(link_name)
+
+    def has_link_mesh(self, link_name: str) -> bool:
+        """Whether a link takes part in the exact-mesh constraint.
+
+        False when the collision meshes were not loaded, so this never builds the mesh data
+        for a robot that does not use mesh collision.
+
+        Args:
+            link_name: Name of the link.
+        """
+        if self.link_collision_meshes is None:
+            return False
+        return self.get_robot_mesh_data().has_link_mesh(link_name)
 
     def get_link_masses_com(self, link_name: str) -> torch.Tensor:
         """Get link masses and center of mass for a link

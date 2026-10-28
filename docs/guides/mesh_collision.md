@@ -101,6 +101,14 @@ robot_cfg:
 
 Ignored links are skipped only by the mesh check; the collision spheres still apply to them.
 
+## Let links touch the scene for a while
+
+`MotionPlanner.disable_link_collision(links)` turns off scene collision for links on both
+their spheres and their meshes, and `enable_link_collision(links)` turns it back on.
+`plan_grasp` does this for the robot's `grasp_contact_link_names` while it plans to the grasp,
+moves in and lifts the object, so the fingers may touch it with the mesh check on. To toggle
+only the mesh check, call `disable_link_mesh` and `enable_link_mesh` on the kinematics config.
+
 ## Add geometry at runtime
 
 To check geometry that is known only at runtime, such as a grasped object, reserve triangle

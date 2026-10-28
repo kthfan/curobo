@@ -622,12 +622,20 @@ class MotionPlanner:
     # -- Scene / collision management --
 
     def enable_link_collision(self, enable_collision_links: List[str]):
+        """Re-enable scene collision for links, on both their spheres and their meshes."""
+        kinematics_config = self.kinematics.config.kinematics_config
         for link_name in enable_collision_links:
-            self.kinematics.config.kinematics_config.enable_link_spheres(link_name)
+            kinematics_config.enable_link_spheres(link_name)
+            if kinematics_config.has_link_mesh(link_name):
+                kinematics_config.enable_link_mesh(link_name)
 
     def disable_link_collision(self, disable_collision_links: List[str]):
+        """Disable scene collision for links, on both their spheres and their meshes."""
+        kinematics_config = self.kinematics.config.kinematics_config
         for link_name in disable_collision_links:
-            self.kinematics.config.kinematics_config.disable_link_spheres(link_name)
+            kinematics_config.disable_link_spheres(link_name)
+            if kinematics_config.has_link_mesh(link_name):
+                kinematics_config.disable_link_mesh(link_name)
 
     def update_world(self, scene_cfg: SceneCfg):
         self.scene_collision_checker.load_collision_model(scene_cfg)
