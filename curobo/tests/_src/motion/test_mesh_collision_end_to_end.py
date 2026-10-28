@@ -14,6 +14,7 @@ import pytest
 import torch
 
 # CuRobo
+from curobo._src.geom.sphere_fit.types import SphereFitType
 from curobo._src.geom.types import Cuboid, SceneCfg
 from curobo._src.motion.motion_planner import MotionPlanner
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
@@ -23,6 +24,7 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.types.tool_pose import GoalToolPose
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 
 #: Links whose spheres are disabled, leaving the mesh check as their only collision test.
 GRIPPER_LINKS = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
@@ -189,3 +191,49 @@ def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_c
     _disable_gripper_spheres(planner.kinematics)
     result = _plan(planner, cuda_device_cfg)
     assert result is None or not result.success.any().item()
+
+
+# =============================================================================
+# Attached objects
+# =============================================================================
+
+
+def test_attached_object_mesh_is_checked(cuda_device_cfg):
+    """An attached object's mesh takes part in the mesh check until it is detached.
+
+    A box sits 25 cm below the palm box position, clear of the robot. A rod attached to the
+    hand reaches into it. The rod's spheres are disabled, so only its mesh can see the box.
+    """
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    robot["robot_cfg"]["kinematics"]["extra_collision_meshes"] = {"attached_object": 32}
+    config = IKSolverCfg.create(
+        robot=robot,
+        scene_model=palm_box(offset=(0.0, 0.0, -0.25)),
+        mesh_collision_check=True,
+        device_cfg=cuda_device_cfg,
+        num_seeds=32,
+        use_cuda_graph=False,
+    )
+    solver = IKSolver(config)
+    result = _solve(solver, cuda_device_cfg)
+    assert result.success.any().item()
+
+    # Rod from the fingertips (z = 0.19) down to z = 0.0, into the box top at z = 0.015.
+    rod = Cuboid(name="rod", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.02, 0.02, 0.19])
+    rod_pose = Pose.from_list([0.5, 0.0, 0.095, 1.0, 0.0, 0.0, 0.0], device_cfg=cuda_device_cfg)
+    grasp_state = JointState.from_position(
+        result.js_solution.position.view(-1, result.js_solution.position.shape[-1])[0:1]
+    )
+    solver.core.attachment_manager.attach(
+        grasp_state,
+        [rod],
+        num_spheres=4,
+        sphere_fit_type=SphereFitType.VOXEL,
+        world_objects_pose_offset=rod_pose,
+    )
+    kinematics_config = solver.kinematics.config.kinematics_config
+    kinematics_config.disable_link_spheres("attached_object")
+    assert not _solve(solver, cuda_device_cfg).success.any().item()
+
+    solver.core.attachment_manager.detach()
+    assert _solve(solver, cuda_device_cfg).success.any().item()

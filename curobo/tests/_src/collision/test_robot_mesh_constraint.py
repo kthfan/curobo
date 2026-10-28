@@ -480,6 +480,28 @@ def test_enable_link_mesh_restores_runtime_geometry():
     assert _check(data, scene, tf)[0].tolist() == [1]
 
 
+def test_clear_link_mesh_is_not_undone_by_enable():
+    """Released geometry stays gone when the link's collision is re-enabled."""
+    data = RobotMeshData.from_link_meshes(
+        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
+        link_name_to_idx_map={"l0": 0, "obj": 1},
+        num_links=2,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+        extra_link_triangles={"obj": 16},
+    )
+    scene = _origin_cuboid_scene()
+    tf = _two_link_transforms(5.0, 0.0)
+    data.update_link_mesh("obj", trimesh.creation.box(extents=(0.1, 0.1, 0.1)))
+    assert _check(data, scene, tf)[0].tolist() == [1]
+
+    data.clear_link_mesh("obj")
+    assert _check(data, scene, tf)[0].tolist() == [0]
+    data.enable_link_mesh("obj")
+    assert data.num_active_triangles == 12
+    assert _check(data, scene, tf)[0].tolist() == [0]
+
+
 def test_ignored_links_are_not_packed():
     """An ignored link contributes no geometry, so it can never report a collision."""
     link_meshes = {

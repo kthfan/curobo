@@ -447,3 +447,125 @@ class TestAttachFromScene:
             manager_no_scene.attach_from_scene(
                 grasp_joint_state, ["scene_cube"],
             )
+
+
+# =============================================================================
+# Exact mesh collision geometry
+# =============================================================================
+
+
+def _mesh_robot_model(reserve_mesh_slots: bool = True, num_envs: int = 1) -> Kinematics:
+    robot_data = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    kinematics = robot_data["robot_cfg"]["kinematics"]
+    kinematics["extra_collision_spheres"] = {"attached_object": 100}
+    kinematics["load_collision_meshes"] = True
+    if reserve_mesh_slots:
+        kinematics["extra_collision_meshes"] = {"attached_object": 64}
+    model = Kinematics(KinematicsCfg.from_robot_yaml_file(robot_data, ["panda_hand"]))
+    kparams = model.config.kinematics_config
+    if num_envs > 1:
+        kparams.link_spheres = kparams.link_spheres.repeat(num_envs, 1, 1)
+        kparams.reference_link_spheres = kparams.reference_link_spheres.repeat(num_envs, 1, 1)
+    return model
+
+
+@pytest.fixture(scope="module")
+def mesh_robot_model():
+    return _mesh_robot_model()
+
+
+@pytest.fixture
+def mesh_manager(mesh_robot_model, device_cfg):
+    return AttachmentManager(kinematics=mesh_robot_model, device_cfg=device_cfg)
+
+
+def _attached_triangles(manager: AttachmentManager) -> torch.Tensor:
+    """Active attached-object triangles as ``[n, 3, 3]`` link-local vertices."""
+    data = manager.kinematics_params.get_robot_mesh_data()
+    span = data.get_triangle_slice("attached_object")
+    active = data.tri_link[span] >= 0
+    verts = data.tri_verts[span.start * 3 : span.stop * 3].view(-1, 3, 3)
+    return verts[active]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestAttachMesh:
+    """The attached object's mesh follows the spheres into the mesh collision check."""
+
+    def test_attach_writes_link_mesh(self, mesh_manager, grasp_joint_state, cube_obstacle):
+        mesh_manager.attach(
+            grasp_joint_state, [cube_obstacle], num_spheres=10,
+            sphere_fit_type=SphereFitType.VOXEL,
+        )
+        try:
+            triangles = _attached_triangles(mesh_manager)
+            assert triangles.shape[0] == 12
+            # Identity offset: the mesh stays in the obstacle frame, like the spheres.
+            center = triangles.reshape(-1, 3).mean(0)
+            assert torch.allclose(center, torch.tensor([0.5, 0.0, 0.5], device=center.device),
+                                  atol=1e-4)
+        finally:
+            mesh_manager.detach()
+
+    def test_attach_mesh_uses_the_sphere_offset(
+        self, mesh_manager, grasp_joint_state, device_cfg
+    ):
+        cube = Cuboid(name="c", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.05, 0.05, 0.05])
+        offset = Pose.from_list([0.5, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], device_cfg=device_cfg)
+        mesh_manager.attach(
+            grasp_joint_state, [cube], num_spheres=10, sphere_fit_type=SphereFitType.VOXEL,
+            world_objects_pose_offset=offset,
+        )
+        try:
+            kparams = mesh_manager.kinematics_params
+            sph_idx = kparams.get_sphere_index_from_link_name("attached_object")
+            spheres = kparams.link_spheres[0, sph_idx, :]
+            sphere_center = spheres[spheres[:, 3] > 0, :3].mean(0)
+            mesh_center = _attached_triangles(mesh_manager).reshape(-1, 3).mean(0)
+            assert torch.allclose(sphere_center, mesh_center, atol=0.01)
+        finally:
+            mesh_manager.detach()
+
+    def test_detach_clears_link_mesh_for_good(
+        self, mesh_manager, grasp_joint_state, cube_obstacle
+    ):
+        """After detach, re-enabling the link (as plan_grasp does) must not bring it back."""
+        mesh_manager.attach(
+            grasp_joint_state, [cube_obstacle], num_spheres=10,
+            sphere_fit_type=SphereFitType.VOXEL,
+        )
+        mesh_manager.detach()
+        assert _attached_triangles(mesh_manager).shape[0] == 0
+        mesh_manager.kinematics_params.enable_link_mesh("attached_object")
+        assert _attached_triangles(mesh_manager).shape[0] == 0
+
+    def test_attach_without_reserved_slots_warns(
+        self, device_cfg, grasp_joint_state, cube_obstacle, caplog
+    ):
+        manager = AttachmentManager(
+            kinematics=_mesh_robot_model(reserve_mesh_slots=False), device_cfg=device_cfg
+        )
+        manager.attach(
+            grasp_joint_state, [cube_obstacle], num_spheres=10,
+            sphere_fit_type=SphereFitType.VOXEL,
+        )
+        assert "no triangle slots for mesh collision" in caplog.text
+        assert not manager.kinematics_params.has_link_mesh("attached_object")
+
+    def test_multi_env_different_offsets_leave_mesh_empty(
+        self, device_cfg, cube_obstacle, caplog
+    ):
+        manager = AttachmentManager(
+            kinematics=_mesh_robot_model(num_envs=2), device_cfg=device_cfg
+        )
+        q = torch.tensor(
+            [[0.0, -1.2, 0.0, -2.0, 0.0, 1.0, 0.0], [0.5, -0.8, 0.3, -1.5, 0.2, 0.8, 0.1]],
+            **(device_cfg.as_torch_dict()),
+        )
+        offset = Pose.from_list([0.5, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], device_cfg=device_cfg)
+        manager.attach(
+            JointState.from_position(q), [cube_obstacle], num_spheres=10,
+            sphere_fit_type=SphereFitType.VOXEL, world_objects_pose_offset=offset,
+        )
+        assert "different offset per env" in caplog.text
+        assert _attached_triangles(manager).shape[0] == 0

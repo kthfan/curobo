@@ -367,6 +367,19 @@ class RobotMeshData:
         span = self.get_triangle_slice(link_name)
         self.tri_link[span] = self.reference_tri_link[span]
 
+    def clear_link_mesh(self, link_name: str):
+        """Remove a link's geometry, so that :meth:`enable_link_mesh` keeps it inactive.
+
+        Use this when runtime geometry such as an attached object is released; unlike
+        :meth:`disable_link_mesh`, the geometry is not restored later. The write is in-place.
+
+        Args:
+            link_name: Name of the link to clear.
+        """
+        span = self.get_triangle_slice(link_name)
+        self.reference_tri_link[span] = INACTIVE_TRI_LINK
+        self.tri_link[span] = INACTIVE_TRI_LINK
+
     def has_link_mesh(self, link_name: str) -> bool:
         """Whether a link owns triangle slots, packed or reserved.
 

@@ -120,20 +120,25 @@ robot_cfg:
     extra_collision_meshes: {attached_object: 200}
 ```
 
-Then write the geometry in the link's frame, as a `[n, 3, 3]` triangle tensor or a mesh, and
-clear it when the object is released:
+The attachment manager fills these slots: attaching an object writes its mesh along with its
+collision spheres, and detaching it clears both. The link meshes are shared by all
+environments, so with several environments the object must have the same offset to the link in
+each of them; otherwise the manager warns and checks the object with its spheres only.
+
+To manage the geometry yourself, write it in the link's frame, as a `[n, 3, 3]` triangle tensor
+or a mesh, and clear it when the object is released:
 
 ```python
 kinematics_config = planner.kinematics.config.kinematics_config
 kinematics_config.update_link_mesh("attached_object", object_triangles)
 ...
-kinematics_config.disable_link_mesh("attached_object")
+kinematics_config.clear_link_mesh("attached_object")
 ```
 
-The update is in place: every solver of the planner sees it at once, and captured CUDA graphs
-stay valid. Geometry larger than the reserved slots is decimated to fit.
-Attaching an object with the attachment manager updates the collision spheres only, so call
-`update_link_mesh` as well when the mesh check should cover the object.
+`disable_link_mesh` only pauses the geometry, and `enable_link_mesh` (also called by
+`enable_link_collision` and `plan_grasp`) brings it back, so use `clear_link_mesh` for a
+released object. The update is in place: every solver of the planner sees it at once, and
+captured CUDA graphs stay valid. Geometry larger than the reserved slots is decimated to fit.
 
 ## Check configurations outside a solver
 

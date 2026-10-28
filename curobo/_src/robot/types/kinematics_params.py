@@ -684,6 +684,16 @@ class KinematicsParams:
         """
         self.get_robot_mesh_data().enable_link_mesh(link_name)
 
+    def clear_link_mesh(self, link_name: str):
+        """Remove a link's runtime geometry from the exact-mesh constraint.
+
+        Unlike :meth:`disable_link_mesh`, :meth:`enable_link_mesh` does not restore it.
+
+        Args:
+            link_name: Name of the link to clear.
+        """
+        self.get_robot_mesh_data().clear_link_mesh(link_name)
+
     def has_link_mesh(self, link_name: str) -> bool:
         """Whether a link takes part in the exact-mesh constraint.
 

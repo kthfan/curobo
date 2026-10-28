@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -18,7 +18,10 @@ from curobo._src.robot.types.kinematics_params import KinematicsParams
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
-from curobo._src.util.logging import log_and_raise, log_info
+from curobo._src.util.logging import log_and_raise, log_info, log_warn
+
+if TYPE_CHECKING:
+    import trimesh
 
 
 class AttachmentManager:
@@ -32,6 +35,11 @@ class AttachmentManager:
     is done once. Per-env obstacle-to-link offsets are computed via batched FK, producing
     per-env link-local spheres written to ``link_spheres[i]``. The FK kernel then
     transforms each env's link-local spheres to world frame during optimization.
+
+    When the robot's collision meshes are loaded and the link has triangle slots reserved
+    with ``extra_collision_meshes``, :meth:`attach` also writes the obstacle mesh into those
+    slots for the exact mesh collision check, and :meth:`detach` clears it. The link meshes
+    are shared by all envs, so this needs the same obstacle-to-link offset in every env.
     """
 
     def __init__(
@@ -81,7 +89,21 @@ class AttachmentManager:
         Returns:
             torch.Tensor: Sphere positions and radii in obstacle frame [num_spheres, 4].
         """
-        combined_mesh = self._obstacles_to_trimesh(obstacles)
+        return self._fit_spheres_to_mesh(
+            self._obstacles_to_trimesh(obstacles),
+            num_spheres=num_spheres,
+            surface_radius=surface_radius,
+            sphere_fit_type=sphere_fit_type,
+        )
+
+    def _fit_spheres_to_mesh(
+        self,
+        combined_mesh: trimesh.Trimesh,
+        num_spheres: Optional[int],
+        surface_radius: float,
+        sphere_fit_type: SphereFitType,
+    ) -> torch.Tensor:
+        """Fit spheres to an obstacle mesh; see :meth:`fit_spheres`."""
         result = fit_spheres_to_mesh(
             combined_mesh,
             num_spheres=num_spheres,
@@ -110,7 +132,8 @@ class AttachmentManager:
 
         Runs batched FK on ``joint_states`` to get per-env link poses, computes
         per-env obstacle-to-link transforms, and writes the result to
-        ``link_spheres[i, attached_indices, :]`` for each env.
+        ``link_spheres[i, attached_indices, :]`` for each env. Only the spheres are written;
+        :meth:`attach` also writes the obstacle mesh for the exact mesh collision check.
 
         Args:
             sphere_tensor: Spheres in obstacle frame [num_spheres, 4] (x, y, z, r).
@@ -139,18 +162,7 @@ class AttachmentManager:
         centers = sphere_tensor[:, :3].contiguous()
         radii = sphere_tensor[:, 3]
 
-        if world_objects_pose_offset is not None:
-            ee_link = self._kinematics.tool_frames[0]
-            joint_state = JointState.from_position(
-                q, joint_names=self._kinematics.joint_names,
-            )
-            fk_result = self._kinematics.compute_kinematics(joint_state)
-            if fk_result.tool_poses is None:
-                log_and_raise("FK result has no tool_poses; cannot resolve EE for attachment offset.")
-            ee_poses = fk_result.tool_poses.get_link_pose(ee_link)
-            obj_to_link_poses = ee_poses.inverse().multiply(world_objects_pose_offset)
-        else:
-            obj_to_link_poses = None
+        obj_to_link_poses = self._object_to_link_poses(q, world_objects_pose_offset)
 
         padding = None
         if n_fit_spheres < n_link_spheres:
@@ -193,7 +205,8 @@ class AttachmentManager:
         """Fit spheres, update all envs, and optionally disable world obstacles.
 
         Convenience method combining :meth:`fit_spheres` + :meth:`update` +
-        world obstacle disable.
+        world obstacle disable. Also writes the obstacle mesh into the link's reserved
+        triangle slots when the robot's collision meshes are loaded.
 
         Args:
             joint_states: Per-env grasp configurations [num_envs, dof].
@@ -205,13 +218,15 @@ class AttachmentManager:
             world_objects_pose_offset: Obstacle world pose(s) [num_envs] or [1] (broadcast).
             disable_obstacle_names: World obstacle names to disable across all envs.
         """
-        sphere_tensor = self.fit_spheres(
-            obstacles,
+        combined_mesh = self._obstacles_to_trimesh(obstacles)
+        sphere_tensor = self._fit_spheres_to_mesh(
+            combined_mesh,
             num_spheres=num_spheres,
             surface_radius=surface_radius,
             sphere_fit_type=sphere_fit_type,
         )
         self.update(sphere_tensor, joint_states, link_name, world_objects_pose_offset)
+        self._update_link_mesh(combined_mesh, joint_states, link_name, world_objects_pose_offset)
 
         if disable_obstacle_names and self._scene_collision is not None:
             num_envs = self._get_num_envs(joint_states)
@@ -288,7 +303,8 @@ class AttachmentManager:
     ) -> None:
         """Detach obstacles from all envs.
 
-        Resets link spheres to reference values and re-enables world obstacles.
+        Resets link spheres to reference values, clears the link's attached mesh, and
+        re-enables world obstacles.
 
         Args:
             link_name: Link to detach from. None uses the last attached link.
@@ -301,6 +317,8 @@ class AttachmentManager:
             return
 
         self.kinematics_params.reset_link_spheres(link_name)
+        if self.kinematics_params.has_link_mesh(link_name):
+            self.kinematics_params.clear_link_mesh(link_name)
 
         names_to_enable = enable_obstacle_names or self._disabled_obstacle_names
         if names_to_enable and self._scene_collision is not None:
@@ -313,6 +331,87 @@ class AttachmentManager:
         self._attached_link_name = None
         self._disabled_obstacle_names = []
         self._disabled_num_envs = 0
+
+    def _object_to_link_poses(
+        self, q: torch.Tensor, world_objects_pose_offset: Optional[Pose]
+    ) -> Optional[Pose]:
+        """Per-env pose of the obstacle frame in the attachment link frame.
+
+        Args:
+            q: Per-env joint positions [num_envs, dof].
+            world_objects_pose_offset: Obstacle world pose(s) [num_envs] or [1].
+
+        Returns:
+            Obstacle-to-link poses [num_envs], or None for the identity offset.
+        """
+        if world_objects_pose_offset is None:
+            return None
+        ee_link = self._kinematics.tool_frames[0]
+        joint_state = JointState.from_position(q, joint_names=self._kinematics.joint_names)
+        fk_result = self._kinematics.compute_kinematics(joint_state)
+        if fk_result.tool_poses is None:
+            log_and_raise("FK result has no tool_poses; cannot resolve EE for attachment offset.")
+        ee_poses = fk_result.tool_poses.get_link_pose(ee_link)
+        return ee_poses.inverse().multiply(world_objects_pose_offset)
+
+    def _update_link_mesh(
+        self,
+        combined_mesh: trimesh.Trimesh,
+        joint_states: JointState,
+        link_name: str,
+        world_objects_pose_offset: Optional[Pose],
+    ) -> None:
+        """Write the obstacle mesh into the link's triangle slots for the mesh collision check.
+
+        Does nothing when the robot's collision meshes are not loaded. Warns and leaves the
+        obstacle to the spheres when the link has no reserved slots, or when the envs need
+        different obstacle-to-link offsets, which the shared link meshes cannot represent.
+
+        Args:
+            combined_mesh: Obstacle mesh in obstacle frame.
+            joint_states: Per-env grasp configurations [num_envs, dof].
+            link_name: Robot link to which the obstacles are attached.
+            world_objects_pose_offset: Obstacle world pose(s) [num_envs] or [1].
+        """
+        kparams = self.kinematics_params
+        if kparams.link_collision_meshes is None:
+            return
+        if not kparams.has_link_mesh(link_name):
+            log_warn(
+                f"link '{link_name}' has no triangle slots for mesh collision, so the attached "
+                "object is checked with spheres only; reserve slots with extra_collision_meshes"
+            )
+            return
+
+        q = joint_states.position
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+        poses = self._object_to_link_poses(q, world_objects_pose_offset)
+        vertices = torch.as_tensor(
+            combined_mesh.vertices, device=self._device_cfg.device, dtype=torch.float32
+        )
+        if poses is not None:
+            if poses.position.shape[0] > 1 and not self._poses_match(poses):
+                log_warn(
+                    f"link '{link_name}' meshes are shared by all envs but the attached object "
+                    "has a different offset per env, so it is checked with spheres only"
+                )
+                kparams.clear_link_mesh(link_name)
+                return
+            first = Pose(position=poses.position[0:1], quaternion=poses.quaternion[0:1])
+            vertices = first.transform_points(vertices).view(-1, 3)
+
+        triangles = vertices[torch.as_tensor(combined_mesh.faces, device=vertices.device)]
+        kparams.update_link_mesh(link_name, triangles)
+
+    @staticmethod
+    def _poses_match(poses: Pose, atol: float = 1e-5) -> bool:
+        """Whether all poses in a batch are the same, up to the quaternion sign."""
+        same_position = torch.allclose(
+            poses.position, poses.position[0:1].expand_as(poses.position), atol=atol
+        )
+        quat_dot = (poses.quaternion * poses.quaternion[0:1]).sum(-1).abs()
+        return same_position and bool((quat_dot > 1.0 - atol).all())
 
     @staticmethod
     def _obstacles_to_trimesh(obstacles: List[Obstacle]):

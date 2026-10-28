@@ -64,7 +64,11 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 3. Integration
 
-- [ ] **P1 – AttachmentManager does not update meshes.** Attaching an object updates the
+- [x] **P1 – AttachmentManager does not update meshes.** Done: `attach` writes the object
+  mesh into the reserved slots with the sphere offset, `detach` clears it with the new
+  `clear_link_mesh` (a plain disable would be restored by `enable_link_collision`). With several
+  envs the shared link meshes need the same offset in every env; otherwise it warns and leaves
+  the object to the spheres. franka.yml still reserves no mesh slots by default. Attaching an object updates the
   collision spheres only; users must call `KinematicsParams.update_link_mesh` themselves,
   which is easy to forget in pick-and-place. Make the attachment path also write the
   object's mesh into the reserved `extra_collision_meshes` slots (and clear it on detach),
