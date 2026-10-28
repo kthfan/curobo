@@ -11,25 +11,14 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 1. Correctness
 
-- [x] **P1 – `margin` is not a clearance for mesh obstacles.** Done with option A
-  (`triangles_within` in the narrowphase). Tests added in `test_robot_mesh_constraint.py`
-  and passing on the CPU (`cpu_verify/`) and on a GPU.
-  In `robot_mesh_collision_kernel`, `margin` only inflates the broadphase AABB
-  (`wp_robot_mesh_kernel.py:174`). The narrowphase is an exact `wp.intersect_tri_tri`
-  (`:183`) that ignores it, and the containment pass compares the SDF of a single vertex
-  against it (`:191`). So `mesh_collision_margin > 0` has almost no effect against mesh
-  obstacles, while it works for cuboids (inflated half extents) and voxels (`sdf <= margin`).
-  - Option A: in the narrowphase, flag a pair when the triangle-triangle distance is below
-    `margin` (segment-triangle / vertex-triangle distance), keeping the exact predicate as a
-    fast path for `margin == 0`.
-  - Option B: keep the exact predicate and also flag when any vertex or edge sample of the
-    robot triangle has `compute_local_sdf < margin` (cheaper, not exact).
-  - Add a test like `test_cuboid_margin_expands_collision` for mesh obstacles.
-- [x] **P1 – Fix the docs that rely on the margin.** With option A the guide and the
-  docstrings are correct as written; the concept page now states the margin per obstacle
-  type. `docs/guides/mesh_collision.md` ("Keep a clearance") recommends a positive margin to compensate for decimation shrinkage.
-  That is wrong for mesh obstacles until the item above is fixed. Update the guide, the
-  concept page, and the `mesh_collision_margin` docstrings in the solver configs.
+- [x] **P1 – `margin` is not a clearance for mesh obstacles.** The narrowphase only ran the
+  exact intersection test, so `mesh_collision_margin` had almost no effect against mesh
+  obstacles. Fixed with option A: `triangles_within` flags a triangle pair closer than the
+  margin (6 vertex-face + 9 edge-edge distances); `margin == 0` keeps the old fast path.
+  Tests in `test_robot_mesh_constraint.py`, passing on CPU and GPU.
+- [x] **P1 – Fix the docs that rely on the margin.** With the fix above the guide and the
+  `mesh_collision_margin` docstrings are correct as written; the concept page now states the
+  margin per obstacle type.
 - [ ] **P2 – Voxel sampling cap.** `MAX_VOXEL_SAMPLES_PER_EDGE = 16`
   (`wp_robot_mesh_collision.py:33`) caps the lattice, so a large triangle on a fine grid is
   sampled coarser than voxel/2 (e.g. a 10 cm edge on a 1 cm grid gives ~6 mm spacing).
@@ -64,26 +53,16 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 3. Integration
 
-- [x] **P1 – AttachmentManager does not update meshes.** Done: `attach` writes the object
-  mesh into the reserved slots with the sphere offset, `detach` clears it with the new
-  `clear_link_mesh` (a plain disable would be restored by `enable_link_collision`). With several
-  envs the shared link meshes need the same offset in every env; otherwise it warns and leaves
-  the object to the spheres. franka.yml still reserves no mesh slots by default. Attaching an object updates the
-  collision spheres only; users must call `KinematicsParams.update_link_mesh` themselves,
-  which is easy to forget in pick-and-place. Make the attachment path also write the
-  object's mesh into the reserved `extra_collision_meshes` slots (and clear it on detach),
-  when mesh collision is enabled.
-- [x] **P1 – `plan_grasp` keeps the gripper meshes active.** Fixed: the planners'
-  `disable_link_collision` / `enable_link_collision` toggle the meshes too, and
-  `enable_link_mesh` restores the geometry last written. During the approach and grasp
-  phases `MotionPlanner.plan_grasp` calls `disable_link_collision` on
-  `grasp_contact_link_names` (`motion_planner.py:462-597`), which only disables the spheres.
-  With `mesh_collision_check=True` the fingers touching the object still fail the mesh
-  constraint, so the grasp phase most likely always fails. Make `disable_link_collision` /
-  `enable_link_collision` also toggle the link meshes when mesh collision is enabled.
-  `KinematicsParams.disable_link_mesh` exists but there is no way to re-enable a link mesh
-  yet, so an `enable_link_mesh` (restore from the loaded geometry) is needed too. Add a
-  `plan_grasp` test with the mesh check on.
+- [x] **P1 – AttachmentManager does not update meshes.** `attach` now writes the object mesh
+  into the reserved `extra_collision_meshes` slots with the same offset as the spheres, and
+  `detach` clears it with the new `clear_link_mesh` (a plain disable would be restored by
+  `enable_link_collision`). With several envs the shared link meshes need the same offset in
+  every env; otherwise it warns and leaves the object to the spheres. Without reserved slots
+  it warns too. franka.yml reserves no mesh slots by default (open question).
+- [x] **P1 – `plan_grasp` keeps the gripper meshes active.** `disable_link_collision` only
+  disabled spheres, so the fingers touching the object failed the mesh check. The planners'
+  `disable_link_collision` / `enable_link_collision` now toggle the link meshes too, with the
+  new `enable_link_mesh` restoring the geometry last written.
 - [x] **P1 – `plan_grasp` overwrote its own grasp poses.** Found by the `plan_grasp` test.
   `GoalManager.create_goal_buffer` stored the caller's goal tensors as the reusable buffer, so
   the next solve's `copy_` wrote into them: planning to the approach pose replaced the grasp
@@ -134,13 +113,12 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 5. Tests
 
-- [x] **P1 – End-to-end solver test on GPU.** Written in
-  `curobo/tests/_src/motion/test_mesh_collision_end_to_end.py` (gripper spheres disabled, box
-  pushed into the palm; scene checked on the CPU by `cpu_verify/verify_mesh_collision_scene.py`).
-  Passing on a GPU (Kaggle, 2x T4). No test checks that a solver actually rejects a
-  mesh-colliding solution. Add a scene where the spheres are clear but a link mesh
-  collides (e.g. a thin plate between the fingers), and assert that IK / `plan_pose` fails
-  with `mesh_collision_check=True` and succeeds without it.
+- [x] **P1 – End-to-end solver test on GPU.**
+  `curobo/tests/_src/motion/test_mesh_collision_end_to_end.py`: with the gripper spheres
+  disabled and a box pushed into the palm, IK and `plan_pose` fail with the mesh check and
+  succeed without it; also covers `plan_grasp` with the mesh check and an attached object's
+  mesh. Scene checked on the CPU by `cpu_verify/verify_mesh_collision_scene.py`. Passing on a
+  GPU (Kaggle, 2x T4).
 - [x] **P1 – Run the CUDA-only tests added for `mesh_collision_check`**
   (`curobo/tests/_src/solver/test_solver_core_cfg_mesh_collision.py`,
   `curobo/tests/_src/motion/test_motion_planner_cfg.py`). Passing on a GPU after fixing the
