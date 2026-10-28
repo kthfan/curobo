@@ -197,7 +197,11 @@ class GoalManager:
                 if self._goal_buffer.current_state_dt is not None:
                     self._goal_buffer.current_state_dt.copy_(effective_dt)
                 else:
-                    self._goal_buffer.current_state_dt = effective_dt
+                    self._goal_buffer.current_state_dt = effective_dt.clone()
+            elif current_js is not None and self._goal_buffer.current_state_dt is not None:
+                # A new current state without dt must not inherit the previous solve's dt; a
+                # zero dt leaves the joint position bounds untightened.
+                self._goal_buffer.current_state_dt.zero_()
 
         if use_implicit_goal and self._goal_buffer.seed_enable_implicit_goal_js is not None:
             self._goal_buffer.seed_enable_implicit_goal_js[:] = int(use_implicit_goal)

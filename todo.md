@@ -85,14 +85,14 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   the next solve's `copy_` wrote into them: planning to the approach pose replaced the grasp
   poses, the grasp phase never moved in, and the lift target ended up 30 cm above the grasp.
   The buffer now clones its inputs.
-- [ ] **P1 – `plan_grasp` linear approach-to-grasp phase always fails.** Was hidden by the
-  aliasing bug above (the grasp phase targeted the approach pose, so it never moved). On a GPU,
-  with Franka, grasp pose (0.5, 0, 0.3) top-down and the default approach offset, the IK of
-  the grasp phase fails in free space too, with or without the mesh check: every attempt
-  reports the same position error 0.089 m, rotation error 0.103 and infeasible. Look at how
-  `ToolPoseCriteria.linear_motion` (non-terminal weights, `project_distance_to_goal`) acts in
-  the single-step IK problem. The mesh end-to-end test sets `plan_approach_to_grasp=False`
-  until this is fixed; turn it back on afterwards.
+- [x] **P1 – `plan_grasp` approach-to-grasp and lift phases always failed.** Was hidden by
+  the aliasing bug above, and no test ran these phases (all set `plan_approach_to_grasp=False`
+  and `plan_grasp_to_lift=False`). Root cause: the start states of these phases come from the
+  end of the previous trajectory and carried its trajectory dt, which IK reads as "current
+  state observed dt ago" and so clamps every joint to within max velocity * dt of the start
+  (`CSpacePositionCost`). `GoalManager` also kept a previous solve's dt when the next current
+  state had none. Fixed in both planners and in `GoalManager`; `test_plan_grasp_moves_in_and_lifts`
+  covers all phases.
 - [ ] **P2 – Report which link collided.** `RobotMeshConstraint.get_contact_link_names()` is
   only reachable on the internal cost object. Surface the colliding link and time step in
   the solver result or status, so a failed plan says "mesh collision: panda_hand at step 12"

@@ -175,17 +175,15 @@ def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_c
     """plan_grasp disables collision of the grasp contact links on their meshes as well.
 
     The grasp pose pushes the palm into the box, which plan_grasp allows for the gripper while
-    it plans to the grasp. With the mesh check on, the gripper meshes must be disabled during
-    that phase and restored afterwards. The linear approach-to-grasp phase is left out: it
-    fails even without a box or mesh check (see todo.md).
+    it plans to the grasp, moves in and lifts. With the mesh check on, the gripper meshes must
+    be disabled during those phases and restored afterwards.
     """
     planner = _planner(cuda_device_cfg, mesh_collision_check=True, disable_gripper_spheres=False)
     grasp = _goal(planner.kinematics.tool_frames, cuda_device_cfg)
-    result = planner.plan_grasp(
-        grasp_poses=grasp, current_state=_start(planner), plan_approach_to_grasp=False
-    )
-    # Success needs the goalset phase, which plans to the grasp pose with the palm in the box.
+    result = planner.plan_grasp(grasp_poses=grasp, current_state=_start(planner))
     assert result.success.any().item(), result.status
+    assert result.grasp_success.any().item()
+    assert result.lift_success.any().item()
 
     # The gripper meshes are active again: with only the spheres off, the box still blocks it.
     _disable_gripper_spheres(planner.kinematics)

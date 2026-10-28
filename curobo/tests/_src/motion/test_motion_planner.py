@@ -12,6 +12,7 @@ from curobo._src.motion.motion_planner import MotionPlanner
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
 from curobo._src.state.state_joint import JointState
+from curobo._src.state.state_joint_trajectory_ops import get_joint_state_at_horizon_index
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.types.tool_pose import GoalToolPose
@@ -542,6 +543,32 @@ class TestMotionPlannerPlanGrasp:
         )
 
         assert isinstance(result, GraspPlanResult)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_plan_grasp_moves_in_and_lifts(
+        self, motion_planner, sample_start_state, cuda_device_cfg
+    ):
+        """Every phase succeeds, and the grasp phase ends at the requested grasp pose."""
+        tool_frames = motion_planner.trajopt_solver.kinematics.tool_frames
+        grasp = Pose.from_list([0.5, 0.0, 0.3, 0.0, 1.0, 0.0, 0.0], device_cfg=cuda_device_cfg)
+        goal_tool_pose = GoalToolPose.from_poses(
+            {tool_frames[0]: grasp.unsqueeze(1)}, ordered_tool_frames=tool_frames
+        )
+
+        result = motion_planner.plan_grasp(
+            current_state=sample_start_state, grasp_poses=goal_tool_pose
+        )
+
+        assert result.success.any().item(), result.status
+        assert result.approach_success.any().item()
+        assert result.grasp_success.any().item()
+        assert result.lift_success.any().item()
+        # The caller's grasp poses are left untouched.
+        assert torch.allclose(goal_tool_pose.position.view(-1), grasp.position.view(-1))
+        grasp_end = get_joint_state_at_horizon_index(result.grasp_trajectory, -1).squeeze(0)
+        grasp_end = motion_planner.kinematics.get_active_js(grasp_end)
+        reached = motion_planner.compute_kinematics(grasp_end).tool_poses.position.view(-1)[:3]
+        assert torch.allclose(reached, grasp.position.view(-1), atol=0.01)
 
 
 class TestMotionPlannerUpdateMethods:

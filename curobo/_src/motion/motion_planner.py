@@ -541,6 +541,10 @@ class MotionPlanner:
         # Step 3: Linear motion from approach to grasp
         approach_end = get_joint_state_at_horizon_index(approach_result.js_solution, -1).squeeze(0)
         approach_end = self.kinematics.get_active_js(approach_end)
+        # The end of a planned trajectory is the start of the next plan, not a state observed
+        # one trajectory step ago: keep its trajectory dt out, or IK clamps every joint to
+        # within max velocity * dt of it and cannot reach the next pose.
+        approach_end.dt = None
 
         linear_motion = ToolPoseCriteria.linear_motion(
             axis=grasp_approach_axis, non_terminal_scale=1.0,
@@ -577,6 +581,7 @@ class MotionPlanner:
         # Step 4: Lift motion
         lift_start = get_joint_state_at_horizon_index(grasp_result.js_solution, -1).squeeze(0)
         lift_start = self.kinematics.get_active_js(lift_start)
+        lift_start.dt = None
 
         lift_offset = Pose.from_list([
             grasp_lift_offset * v

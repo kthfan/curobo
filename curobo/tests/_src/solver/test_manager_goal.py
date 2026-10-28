@@ -214,6 +214,28 @@ class TestGoalManagerUpdateGoalBuffer:
         assert torch.equal(first_seed.position, torch.zeros(4, 32, 7, **tensor_args))
         assert torch.equal(first_dt, torch.full((4,), 0.1, **tensor_args))
 
+    def test_update_goal_buffer_does_not_keep_previous_dt(
+        self, goal_manager, sample_solve_state, sample_goal_poses, cpu_device_cfg
+    ):
+        """A current state without dt must not inherit the dt of the previous solve.
+
+        A stale non-zero dt tightens the joint position bounds around the new current state.
+        """
+        tensor_args = cpu_device_cfg.as_torch_dict()
+        goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=sample_goal_poses,
+            current_js=JointState.from_position(torch.zeros(4, 7, **tensor_args)),
+            current_state_dt=torch.full((4,), 0.025, **tensor_args),
+        )
+        buffer, update_reference = goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=sample_goal_poses,
+            current_js=JointState.from_position(torch.ones(4, 7, **tensor_args)),
+        )
+        assert not update_reference
+        assert torch.equal(buffer.current_state_dt, torch.zeros(4, **tensor_args))
+
 
 class TestGoalManagerBatchHelper:
     """Test GoalManager batch helper property."""
