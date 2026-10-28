@@ -85,7 +85,7 @@ robot_cfg:
 ```
 
 Increase the budget for links whose shape matters, such as fingers. Lower it for large, simple
-links.
+links. {ref}`mesh_collision_cost` lists measured costs for different budgets and scenes.
 
 ## Ignore links that touch the scene by design
 

@@ -81,3 +81,42 @@ expensive because the robot geometry moves with every configuration.
 The interpolated trajectory is skipped to keep the check affordable, since it has many more
 steps than the optimized trajectory. A collision that happens only between two optimized steps
 is therefore not detected.
+
+(mesh_collision_cost)=
+## Cost
+
+The numbers below were measured on one NVIDIA Tesla T4 with Franka and CUDA graphs on, with
+`benchmark/mesh_collision_benchmark.py`. The scene is a table and a box, represented as
+cuboids, as a 24-triangle mesh, as a 192k-triangle mesh, or as an ESDF with 2 cm voxels. The
+base link is ignored by the mesh check, since it sits on the table.
+
+Solve time without and with the mesh check:
+
+| Solver | Cuboid scene | Mesh scene (24 triangles) | Voxel scene |
+| --- | --- | --- | --- |
+| IK, 1 problem | 20.7 → 20.9 ms | 22.9 → 22.4 ms | 21.1 → 21.2 ms |
+| IK, 100 problems | 149 → 154 ms | 278 → 308 ms | 163 → 244 ms |
+| `plan_pose` | 105 → 102 ms | 180 → 184 ms | 109 → 116 ms |
+| MPC step | 28.5 → 28.4 ms | 47.5 → 48.3 ms | 29.3 → 30.2 ms |
+
+Differences of a few percent are within run-to-run noise. Time of one mesh check query with the
+default budget of 256 triangles per link (1944 robot triangles), for configurations that are
+free of sphere collisions:
+
+| Configurations | Cuboid | Mesh, 24 triangles | Mesh, 192k triangles | Voxel |
+| --- | --- | --- | --- | --- |
+| 32 | 0.48 ms | 0.52 ms | 0.76 ms | 0.80 ms |
+| 512 | 0.47 ms | 1.7 ms | 4.7 ms | 6.3 ms |
+| 4096 | 1.4 ms | 11.6 ms | 32 ms | 49 ms |
+
+- The cost grows with the number of configurations times robot triangles. Because the check
+  only runs in the metrics rollout, a single IK problem, a plan or an MPC step shows no
+  measurable overhead. Large IK batches pay the most, above all against voxels, where every
+  robot triangle is sampled against the distance field.
+- A budget of 64 triangles per link (576 robot triangles) makes a 4096-configuration query 2.2
+  to 3 times faster than the default. Full fidelity (2164 robot triangles) costs about 20 %
+  more than the default.
+- A positive `mesh_collision_margin` costs little against cuboids, voxels and coarse meshes.
+  Against the 192k-triangle mesh it adds about 10 % for sphere-free configurations and up to 125 %
+  for random ones (61 → 138 ms for 4096), because more triangle pairs pass the broadphase and
+  need the exact distance test.

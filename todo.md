@@ -111,15 +111,24 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 4. Performance
 
-- [ ] **P2 – Benchmark.** No numbers exist yet. Measure IK, TrajOpt and MPC solve time with
-  and without `mesh_collision_check` on Franka with cuboid, mesh and voxel scenes, and with
-  different `max_triangles_per_link`. Add the results to the docs.
+- [x] **P2 – Benchmark.** `benchmark/mesh_collision_benchmark.py`; results (Tesla T4) in the
+  "Cost" section of `docs/concepts/mesh_collision.md`. Single IK / `plan_pose` / MPC step show
+  no measurable overhead; IK with 100 problems costs +3 % (cuboid), +11 % (mesh), +50 % (voxel).
+  The voxel kernel is the slowest at large batches (49 ms for 4096 configs vs 1.4 ms cuboid).
+  The solver rows come from few samples (2 batches of 100 for IK, 10 plans); rerun with more
+  goals before quoting small differences.
 - [ ] **P2 – Link-level broadphase.** Each thread tests its triangle against every obstacle
   in the environment. Add a per-link AABB (from the transformed link bounds) vs obstacle
-  AABB cull before the per-triangle work.
+  AABB cull before the per-triangle work. Most useful for voxels, the slowest case in the
+  benchmark (every triangle is sampled against the ESDF even far from obstacles).
 - [ ] **P2 – Skip links far from obstacles using the sphere distances.** The sphere collision
   cost already computes distances per sphere. A link whose spheres are all farther than a
   threshold (sphere coverage error + margin) cannot touch an obstacle and can be skipped.
+- [ ] **P3 – Cheaper margin test on dense meshes.** With a 1 cm margin against a 192k-triangle
+  mesh, a 4096-config query goes from 61 to 138 ms for random configs (+10 % for sphere-free
+  ones): the inflated broadphase passes many more pairs to the 15 exact distance tests. Try a
+  per-pair reject first (e.g. distance between triangle bounding spheres > margin), and
+  measure with the benchmark.
 - [ ] **P3 – Cache decimated meshes.** Decimation runs at every start-up. Cache the packed
   triangle soup per (URDF hash, budget) under the runtime cache dir.
 
@@ -138,7 +147,8 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   shared metrics rollout dict in `resolve_yaml_configs`.
 - [ ] **P2 – CUDA graph test.** Capture a graph with the mesh constraint, then
   `update_world` (move / replace obstacles) and `update_link_mesh`, and check the replayed
-  results match eager execution.
+  results match eager execution. The benchmark ran IK, `plan_pose` and MPC with CUDA graphs and
+  the mesh check without errors, but did not compare against eager results.
 - [x] **P2 – Mesh margin test** (see Correctness). Passing on a GPU.
 
 ## Future work
