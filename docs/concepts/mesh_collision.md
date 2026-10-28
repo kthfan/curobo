@@ -78,11 +78,12 @@ expensive because the robot geometry moves with every configuration.
 | Self-collision | no, spheres only |
 | Robot collision checker (`validate`) | yes, when created with `use_mesh_constraint=True` |
 
-The interpolated trajectory is sampled every `interpolation_dt` (25 ms by default), so a motion
-that crosses a thin obstacle between two optimized steps is still caught. A collision shorter
-than one interpolation step can still be missed; a continuous (swept) check would close that
-gap. Checking the interpolated trajectory adds 1 to 6 % to a `plan_pose` call in the scenes of
-the cost section below.
+The optimized trajectory is already dense: in measured Franka plans its steps were about 14 ms
+apart, and the hand moved at most 1 to 2 cm between two of them. The interpolated trajectory,
+sampled every `interpolation_dt` (25 ms by default), is the one sent to the robot, so it is
+checked as well, at a cost of 1 to 6 % per `plan_pose` call in the scenes of the cost section
+below. Either way the check samples the motion: an obstacle thinner than the distance a link
+moves between two samples can be missed. A continuous (swept) check would close that gap.
 
 (mesh_collision_cost)=
 ## Cost

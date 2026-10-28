@@ -172,6 +172,14 @@ def test_mesh_collision_check_plan_pose_fails(cuda_device_cfg):
     assert result is None or not result.success.any().item()
 
 
+def test_trajopt_checks_the_interpolated_trajectory(cuda_device_cfg):
+    """The interpolated trajectory, which is sent to the robot, is checked as well."""
+    planner = _planner(cuda_device_cfg, mesh_collision_check=True)
+    rollout = planner.trajopt_solver.additional_metrics_rollouts["interpolated_rollout"]
+    assert rollout.metrics_constraint_manager.get_cost("mesh_collision").enabled
+    assert rollout.metrics_transition_model.robot_model.compute_link_transforms
+
+
 def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_cfg):
     """plan_grasp disables collision of the grasp contact links on their meshes as well.
 

@@ -166,8 +166,8 @@ is_valid = checker.validate(joint_positions)
 
 - The check covers robot-scene collisions. Self-collision is still checked with the spheres.
 - Trajectory optimization checks the optimized steps and every step of the interpolated
-  trajectory, `interpolation_dt` apart. A collision shorter than one interpolation step can be
-  missed.
+  trajectory. Both sample the motion, so an obstacle thinner than the distance a link moves
+  between two samples (about 1 to 2 cm for the hand in typical plans) can be missed.
 - The graph planner that seeds trajectory optimization uses the spheres only; the trajectory
   optimization that follows the seed applies the mesh check.
 - Voxel (ESDF) obstacles are checked by sampling, so features thinner than the voxel size can

@@ -34,13 +34,13 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 2. Coverage
 
-- [ ] **P2 – No check between optimized steps.** `solver_trajopt.py:61` disables the mesh
-  constraint on the interpolated rollout, so a fast motion can pass through a thin obstacle
-  between two optimized steps. Options:
-  - run the mesh check on the interpolated trajectory with a stride (every k-th step);
-  - add a swept check between consecutive steps (continuous collision for the triangles,
-    or conservative advancement using the sphere distances);
-  - expose a config switch and measure the cost.
+- [x] **P2 – No check between optimized steps.** The mesh constraint now also runs on the
+  interpolated trajectory (every `interpolation_dt`), computed with the metrics transition
+  model so the link transforms exist. Cost 1–6 % per `plan_pose`. The gap was smaller than
+  assumed: the optimized B-spline trajectory is evaluated about every 14 ms (hand steps of at
+  most 1–2 cm in measured plans), and a 5 mm plate on the path was already rejected before the
+  change. Both checks sample the motion, so thinner obstacles than one step can still be missed;
+  see the swept check under "Future work".
 - [ ] **P2 – Graph planner ignores meshes.** Graph seeds can be mesh-infeasible, wasting
   trajopt attempts. Add an option to run the mesh constraint in the graph planner's edge
   validation rollout (`graph_planner_rollout`).
@@ -136,5 +136,8 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   cause of mesh-only collisions and keeps the optimizer gradient-based.
 - **Distance output.** Return a signed clearance per configuration (not just a flag), for
   diagnostics and as an optional soft metric.
-- **Swept / continuous collision checking** between trajectory steps (see Coverage).
+- **Swept / continuous collision checking** between trajectory steps: test the volume a
+  triangle sweeps between two samples (continuous triangle collision, or conservative
+  advancement with the link bounding spheres used by the culling) so that no obstacle is
+  missed between samples.
 - **Mesh self-collision** (see Coverage).
