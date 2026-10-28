@@ -94,10 +94,10 @@ Solve time without and with the mesh check:
 
 | Solver | Cuboid scene | Mesh scene (24 triangles) | Voxel scene |
 | --- | --- | --- | --- |
-| IK, 1 problem | 20.7 → 20.9 ms | 22.9 → 22.4 ms | 21.1 → 21.2 ms |
-| IK, 100 problems | 149 → 154 ms | 278 → 308 ms | 163 → 244 ms |
-| `plan_pose` | 105 → 102 ms | 180 → 184 ms | 109 → 116 ms |
-| MPC step | 28.5 → 28.4 ms | 47.5 → 48.3 ms | 29.3 → 30.2 ms |
+| IK, 1 problem | 20.9 → 21.0 ms | 22.8 → 23.1 ms | 21.3 → 21.1 ms |
+| IK, 100 problems | 146 → 149 ms | 265 → 273 ms | 161 → 174 ms |
+| `plan_pose` | 108 → 104 ms | 180 → 181 ms | 108 → 116 ms |
+| MPC step | 28.7 → 28.6 ms | 46.4 → 46.8 ms | 29.6 → 29.3 ms |
 
 Differences of a few percent are within run-to-run noise. Time of one mesh check query with the
 default budget of 256 triangles per link (1944 robot triangles), for configurations that are
@@ -105,18 +105,19 @@ free of sphere collisions:
 
 | Configurations | Cuboid | Mesh, 24 triangles | Mesh, 192k triangles | Voxel |
 | --- | --- | --- | --- | --- |
-| 32 | 0.48 ms | 0.52 ms | 0.76 ms | 0.80 ms |
-| 512 | 0.47 ms | 1.7 ms | 4.7 ms | 6.3 ms |
-| 4096 | 1.4 ms | 11.6 ms | 32 ms | 49 ms |
+| 32 | 0.55 ms | 0.64 ms | 0.75 ms | 0.74 ms |
+| 512 | 0.60 ms | 0.75 ms | 1.5 ms | 1.3 ms |
+| 4096 | 0.75 ms | 1.8 ms | 2.7 ms | 5.8 ms |
 
-- The cost grows with the number of configurations times robot triangles. Because the check
-  only runs in the metrics rollout, a single IK problem, a plan or an MPC step shows no
-  measurable overhead. Large IK batches pay the most, above all against voxels, where every
-  robot triangle is sampled against the distance field.
-- A budget of 64 triangles per link (576 robot triangles) makes a 4096-configuration query 2.2
-  to 3 times faster than the default. Full fidelity (2164 robot triangles) costs about 20 %
-  more than the default.
+- Before testing triangles, the check tests each link's bounding sphere against the obstacles
+  with one distance query and skips the links that are clearly free. The cost therefore grows
+  with the number of configurations times the robot triangles near obstacles. A single IK
+  problem, a plan or an MPC step shows no measurable overhead, and IK with 100 problems costs
+  2 to 8 % more. For 32 configurations the extra query adds about 0.1 to 0.2 ms.
+- A budget of 64 triangles per link (576 robot triangles) makes a 4096-configuration query 1.1
+  to 2.3 times faster than the default. Full fidelity (2164 robot triangles) costs less than
+  10 % more than the default.
 - A positive `mesh_collision_margin` costs little against cuboids, voxels and coarse meshes.
-  Against the 192k-triangle mesh it adds about 10 % for sphere-free configurations and up to 125 %
-  for random ones (61 → 138 ms for 4096), because more triangle pairs pass the broadphase and
-  need the exact distance test.
+  Against the 192k-triangle mesh it makes the query about 2.7 times slower (2.7 → 7.3 ms for
+  4096 sphere-free configurations), because more triangle pairs pass the broadphase and need
+  the exact distance test.
