@@ -69,6 +69,14 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   which is easy to forget in pick-and-place. Make the attachment path also write the
   object's mesh into the reserved `extra_collision_meshes` slots (and clear it on detach),
   when mesh collision is enabled.
+- [ ] **P1 – `plan_grasp` keeps the gripper meshes active.** During the approach and grasp
+  phases `MotionPlanner.plan_grasp` calls `disable_link_collision` on
+  `grasp_contact_link_names` (`motion_planner.py:462-597`), which only disables the spheres.
+  With `mesh_collision_check=True` the fingers touching the object still fail the mesh
+  constraint, so the grasp phase most likely always fails. Make `disable_link_collision` /
+  `enable_link_collision` also toggle the link meshes (`KinematicsParams.disable_link_mesh` /
+  `enable_link_mesh`) when mesh collision is enabled, and add a `plan_grasp` test with the
+  mesh check on.
 - [ ] **P2 – Report which link collided.** `RobotMeshConstraint.get_contact_link_names()` is
   only reachable on the internal cost object. Surface the colliding link and time step in
   the solver result or status, so a failed plan says "mesh collision: panda_hand at step 12"
