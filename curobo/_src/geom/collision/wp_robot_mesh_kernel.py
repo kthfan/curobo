@@ -29,6 +29,7 @@ geometry is re-posed for every configuration.
 
 # Standard Library
 from importlib import import_module
+from typing import Any
 
 # Third Party
 import warp as wp
@@ -97,6 +98,142 @@ def tri_aabb_hi(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, margin: wp.float32) -> wp
         wp.max(wp.max(a0[1], a1[1]), a2[1]) + margin,
         wp.max(wp.max(a0[2], a1[2]), a2[2]) + margin,
     )
+
+
+# =============================================================================
+# Link-level culling
+# =============================================================================
+#
+# Before the per-triangle work, each (configuration, link) pair tests the link's bounding
+# sphere against every obstacle of one type with a single SDF query. A link that is clear of
+# all of them by more than what the per-triangle test could still flag is skipped. Each
+# ``link_clear_of_obstacle`` overload (one per obstacle type, resolved by Warp from the argument
+# type) is conservative with respect to the matching kernel.
+
+#: Absolute slack added to every culling threshold, covering float round-off.
+LINK_CULL_EPS = wp.constant(1.0e-4)
+
+
+@wp.func
+def link_clear_of_obstacle(
+    obs: CuboidDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether no triangle inside the sphere can overlap the margin-inflated cuboid.
+
+    The kernel inflates each half extent by ``margin``, which reaches up to ``sqrt(3) *
+    margin`` from the box at its corners.
+    """
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    return compute_local_sdf(obs, env_idx, o, local) > radius + 1.7320508 * margin + LINK_CULL_EPS
+
+
+@wp.func
+def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
+    obs: MeshDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether every point of the sphere is farther than ``margin`` outside the mesh.
+
+    Requiring a positive distance also covers the containment pass, which uses the same SDF.
+    """
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    return compute_local_sdf(obs, env_idx, o, local) > radius + margin + LINK_CULL_EPS
+
+
+@wp.func
+def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
+    obs: VoxelDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether no sample inside the sphere can read an ESDF value ``<= margin``.
+
+    Assumes the ESDF holds distances, as the sphere collision cost does. Trilinear
+    interpolation stays within ``sqrt(3) * voxel_size`` of the stored distance, once at the
+    centre and once at a sample, hence the ``2 sqrt(3) voxel_size`` slack. Outside the grid
+    the ESDF reads as free, so a centre outside the grid only proves clearance when the whole
+    sphere is outside it.
+    """
+    flat = env_idx * obs.max_n + o
+    voxel_size = obs.params[flat, 3]
+    half = wp.vec3(
+        obs.params[flat, 0] * voxel_size * 0.5,
+        obs.params[flat, 1] * voxel_size * 0.5,
+        obs.params[flat, 2] * voxel_size * 0.5,
+    )
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    outside = wp.vec3(
+        wp.max(wp.abs(local[0]) - half[0], 0.0),
+        wp.max(wp.abs(local[1]) - half[1], 0.0),
+        wp.max(wp.abs(local[2]) - half[2], 0.0),
+    )
+    distance_to_grid = wp.length(outside)
+    if distance_to_grid > 0.0:
+        return distance_to_grid > radius + LINK_CULL_EPS
+    slack = radius + margin + 3.4641016 * voxel_size + LINK_CULL_EPS
+    return compute_local_sdf(obs, env_idx, o, local) > slack
+
+
+@wp.kernel(enable_backward=False)
+def robot_link_near_kernel(
+    robot: RobotMeshWarp,
+    obs: Any,
+    env_query_idx: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
+    batch_horizon: wp.int32,
+    horizon: wp.int32,
+    margin: wp.float32,
+    use_multi_env: wp.uint8,
+):
+    """Flag the (configuration, link) pairs whose bounding sphere may reach an obstacle.
+
+    Thread ``tid`` is ``cfg_idx * num_links + link_idx``, the same row as ``link_tf``.
+
+    Args:
+        robot: Robot collision triangles, link bounds and per-link transforms.
+        obs: Obstacle set of one type.
+        env_query_idx: Environment index per batch element.
+        link_near: Output flag per (configuration, link), pre-zeroed; 1 where the link must
+            be tested triangle by triangle.
+        batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
+        margin: Clearance distance used by the per-triangle kernel.
+        use_multi_env: If 1, look up the environment from ``env_query_idx``.
+    """
+    tid = wp.tid()
+    cfg_idx = tid / robot.num_links
+    link_idx = tid - cfg_idx * robot.num_links
+    if cfg_idx >= batch_horizon:
+        return
+
+    bound = robot.link_bounds[link_idx]
+    if bound[3] < 0.0:
+        return
+    center = transform_point_link(robot.link_tf, tid, wp.vec3(bound[0], bound[1], bound[2]))
+
+    env_idx = wp.int32(0)
+    if use_multi_env == wp.uint8(1):
+        env_idx = env_query_idx[cfg_idx / horizon]
+
+    n_obs = obs.n_per_env[env_idx]
+    for o in range(n_obs):
+        if not is_obs_enabled(obs, env_idx, o):
+            continue
+        if not link_clear_of_obstacle(obs, env_idx, o, center, bound[3], margin):
+            link_near[tid] = 1
+            return
 
 
 # =============================================================================
@@ -239,6 +376,7 @@ def robot_mesh_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
@@ -255,6 +393,8 @@ def robot_mesh_collision_kernel(
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
         horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance. A pair of triangles closer than ``margin`` collides.
@@ -282,6 +422,8 @@ def robot_mesh_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
@@ -435,6 +577,7 @@ def robot_cuboid_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
@@ -448,6 +591,8 @@ def robot_cuboid_collision_kernel(
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
         horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; inflates the box half-extents.
@@ -472,6 +617,8 @@ def robot_cuboid_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
@@ -511,6 +658,7 @@ def robot_voxel_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
@@ -529,6 +677,8 @@ def robot_voxel_collision_kernel(
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
         horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; a sample collides when its ESDF value is <= margin.
@@ -555,6 +705,8 @@ def robot_voxel_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])

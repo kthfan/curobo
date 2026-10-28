@@ -20,6 +20,7 @@ import warp as wp
 # CuRobo
 from curobo._src.geom.collision.wp_robot_mesh_kernel import (
     robot_cuboid_collision_kernel,
+    robot_link_near_kernel,
     robot_mesh_collision_kernel,
     robot_voxel_collision_kernel,
 )
@@ -43,6 +44,7 @@ def check_robot_mesh_collision(
     check_containment: bool = True,
     in_collision: Optional[torch.Tensor] = None,
     contact_link: Optional[torch.Tensor] = None,
+    link_near: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Test the robot's exact triangle geometry against every obstacle in a scene.
 
@@ -56,6 +58,8 @@ def check_robot_mesh_collision(
         check_containment: If True, also flag links fully contained in a mesh obstacle.
         in_collision: Optional pre-allocated output ``[batch * horizon]`` int32 buffer.
         contact_link: Optional pre-allocated output ``[batch * horizon]`` int32 buffer.
+        link_near: Optional pre-allocated ``[3, batch * horizon * num_links]`` int32 scratch
+            buffer for the link-level culling, one row per obstacle type.
 
     Returns:
         Tuple of ``(in_collision, contact_link)``, each of shape ``[batch * horizon]``.
@@ -75,6 +79,12 @@ def check_robot_mesh_collision(
         contact_link = torch.empty(batch_horizon, dtype=torch.int32, device=device)
     contact_link.fill_(-1)
 
+    near_size = batch_horizon * robot_mesh.num_links
+    if link_near is None:
+        link_near = torch.zeros(3, near_size, dtype=torch.int32, device=device)
+    else:
+        link_near.zero_()
+
     wp_device, stream = get_warp_device_stream(link_transforms)
 
     robot_wp = robot_mesh.to_warp(link_transforms.detach())
@@ -85,17 +95,40 @@ def check_robot_mesh_collision(
     dim = batch_horizon * robot_mesh.total_tris
     use_multi_env_wp = wp.uint8(use_multi_env)
     margin_wp = wp.float32(margin)
-    # print(batch, horizon, robot_mesh.total_tris, use_multi_env, list(env_query_idx.aminmax()))
+
+    def flag_near_links(obs_wp: object, row: int) -> wp.array:
+        """Flag the links near obstacles of one type; the per-triangle kernel skips the rest."""
+        near_wp = wp.from_torch(link_near[row], dtype=wp.int32)
+        wp.launch(
+            kernel=robot_link_near_kernel,
+            dim=near_size,
+            inputs=[
+                robot_wp,
+                obs_wp,
+                env_idx_wp,
+                near_wp,
+                batch_horizon,
+                horizon,
+                margin_wp,
+                use_multi_env_wp,
+            ],
+            stream=stream,
+            device=wp_device,
+        )
+        return near_wp
     if scene.cuboids is not None:
+        cuboids_wp = scene.cuboids.to_warp()
+        near_wp = flag_near_links(cuboids_wp, 0)
         wp.launch(
             kernel=robot_cuboid_collision_kernel,
             dim=dim,
             inputs=[
                 robot_wp,
-                scene.cuboids.to_warp(),
+                cuboids_wp,
                 env_idx_wp,
                 in_collision_wp,
                 contact_link_wp,
+                near_wp,
                 batch_horizon,
                 horizon,
                 margin_wp,
@@ -106,15 +139,18 @@ def check_robot_mesh_collision(
         )
 
     if scene.meshes is not None:
+        meshes_wp = scene.meshes.to_warp()
+        near_wp = flag_near_links(meshes_wp, 1)
         wp.launch(
             kernel=robot_mesh_collision_kernel,
             dim=dim,
             inputs=[
                 robot_wp,
-                scene.meshes.to_warp(),
+                meshes_wp,
                 env_idx_wp,
                 in_collision_wp,
                 contact_link_wp,
+                near_wp,
                 batch_horizon,
                 horizon,
                 margin_wp,
@@ -126,15 +162,18 @@ def check_robot_mesh_collision(
         )
 
     if scene.voxels is not None:
+        voxels_wp = scene.voxels.to_warp()
+        near_wp = flag_near_links(voxels_wp, 2)
         wp.launch(
             kernel=robot_voxel_collision_kernel,
             dim=dim,
             inputs=[
                 robot_wp,
-                scene.voxels.to_warp(),
+                voxels_wp,
                 env_idx_wp,
                 in_collision_wp,
                 contact_link_wp,
+                near_wp,
                 batch_horizon,
                 horizon,
                 margin_wp,

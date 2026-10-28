@@ -79,11 +79,14 @@ class RobotMeshWarp:
             Shape: (batch * horizon * num_links, 12).
         num_links: Number of links in the kinematic tree (stride of ``link_tf``).
         total_tris: Total number of robot collision triangles.
+        link_bounds: Link-local bounding sphere ``(x, y, z, radius)`` per body index; a
+            negative radius marks a link without geometry. Shape: (num_links,).
     """
 
     tri_verts: wp.array(dtype=wp.vec3)
     tri_link: wp.array(dtype=wp.int32)
     link_tf: wp.array2d(dtype=wp.float32)
+    link_bounds: wp.array(dtype=wp.vec4)
     num_links: wp.int32
     total_tris: wp.int32
 
@@ -259,13 +262,29 @@ class RobotMeshData:
     #: :meth:`disable_link_mesh`. :meth:`enable_link_mesh` restores slots from it.
     reference_tri_link: Optional[torch.Tensor] = None
 
+    #: Link-local bounding sphere ``(x, y, z, radius)`` of each link's geometry, indexed by body
+    #: index, shape ``[num_links, 4]``. A negative radius marks a link without geometry. The
+    #: kernels skip a link whose sphere is far from every obstacle.
+    link_bounds: Optional[torch.Tensor] = None
+
     def __post_init__(self):
-        """Recover the body index of each packed link and the reference slot owners."""
+        """Recover the body indices, the reference slot owners and the link bounds."""
         if self.link_body_indices is None:
             offsets = np.cumsum([0] + list(self.link_triangle_counts[:-1]))
             self.link_body_indices = [int(self.tri_link[int(o)].item()) for o in offsets]
         if self.reference_tri_link is None:
             self.reference_tri_link = self.tri_link.clone()
+        if self.link_bounds is None:
+            self.link_bounds = torch.full(
+                (self.num_links, 4), -1.0, dtype=torch.float32, device=self.tri_verts.device
+            )
+            active = (self.reference_tri_link >= 0).cpu().numpy()
+            for link_name in self.link_names:
+                span = self.get_triangle_slice(link_name)
+                count = int(active[span].sum())
+                # Packing fills a link's slots from the start, so active slots come first.
+                tris = self.tri_verts[span.start * 3 : (span.start + count) * 3].view(-1, 3, 3)
+                self._write_link_bounds(link_name, tris)
 
     @property
     def body_idx_to_link_name(self) -> Dict[int, str]:
@@ -342,6 +361,18 @@ class RobotMeshData:
         if n < capacity:
             self.reference_tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
         self.tri_link[span] = self.reference_tri_link[span]
+        self._write_link_bounds(link_name, verts.view(-1, 3, 3))
+
+    def _write_link_bounds(self, link_name: str, tris: torch.Tensor):
+        """Store the bounding sphere of a link's triangles ``[n, 3, 3]``; none if ``n == 0``."""
+        body_idx = self.link_body_indices[self.link_names.index(link_name)]
+        if tris.shape[0] == 0:
+            self.link_bounds[body_idx, 3] = -1.0
+            return
+        verts = tris.reshape(-1, 3).to(self.link_bounds)
+        center = 0.5 * (verts.min(dim=0).values + verts.max(dim=0).values)
+        self.link_bounds[body_idx, :3] = center
+        self.link_bounds[body_idx, 3] = (verts - center).norm(dim=-1).max()
 
     def disable_link_mesh(self, link_name: str):
         """Deactivate every triangle slot of a link, so it can no longer report a collision.
@@ -379,6 +410,7 @@ class RobotMeshData:
         span = self.get_triangle_slice(link_name)
         self.reference_tri_link[span] = INACTIVE_TRI_LINK
         self.tri_link[span] = INACTIVE_TRI_LINK
+        self._write_link_bounds(link_name, self.tri_verts[:0].view(0, 3, 3))
 
     def has_link_mesh(self, link_name: str) -> bool:
         """Whether a link owns triangle slots, packed or reserved.
@@ -572,4 +604,5 @@ class RobotMeshData:
         )
         s.num_links = self.num_links
         s.total_tris = self.total_tris
+        s.link_bounds = wp.from_torch(self.link_bounds, dtype=wp.vec4)
         return s

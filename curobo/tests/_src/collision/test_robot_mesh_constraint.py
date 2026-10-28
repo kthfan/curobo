@@ -556,3 +556,141 @@ def test_ignored_link_reports_no_collision():
             max_triangles_per_link=0,
             ignored_link_names=["l0"],
         )
+
+
+# =============================================================================
+# Link-level culling
+# =============================================================================
+
+
+def _random_link_transforms(generator: torch.Generator, batch: int, num_links: int,
+                            low: float, high: float) -> torch.Tensor:
+    """Random rigid transforms ``[batch, 1, num_links, 3, 4]`` with positions in a cube."""
+    q = torch.randn(batch * num_links, 4, generator=generator)
+    q = q / q.norm(dim=-1, keepdim=True)
+    w, x, y, z = q.unbind(-1)
+    rot = torch.stack(
+        [
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).view(-1, 3, 3)
+    pos = low + (high - low) * torch.rand(batch * num_links, 3, 1, generator=generator)
+    tf = torch.cat([rot, pos], dim=-1).view(batch, 1, num_links, 3, 4)
+    return tf.to(device=DEVICE_CFG.device, dtype=torch.float32)
+
+
+def _two_link_robot() -> RobotMeshData:
+    plank = trimesh.creation.box(extents=(0.3, 0.04, 0.02))
+    return RobotMeshData.from_link_meshes(
+        link_meshes={
+            "a": _box_mesh("a", (0.1, 0.1, 0.1)),
+            "b": Mesh(
+                name="b",
+                vertices=np.asarray(plank.vertices),
+                faces=np.asarray(plank.faces),
+                pose=[0, 0, 0, 1, 0, 0, 0],
+            ),
+        },
+        link_name_to_idx_map={"a": 0, "b": 1},
+        num_links=2,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+    )
+
+
+def _culling_scenes():
+    plate = trimesh.creation.box(extents=(0.02, 0.6, 0.6))
+    return {
+        "cuboid": SceneData.from_scene_cfg(
+            SceneCfg(
+                cuboid=[
+                    Cuboid(name="c", pose=[0.1, 0, 0, 1, 0, 0, 0], dims=[0.2, 0.3, 0.25]),
+                ]
+            ),
+            device_cfg=DEVICE_CFG,
+        ),
+        "mesh": _mesh_scene("plate", plate, pose=[0.0, 0.05, 0, 1, 0, 0, 0]),
+        "voxel": SceneData.from_scene_cfg(
+            SceneCfg(voxel=[_box_esdf(voxel_size=0.02, grid_dims=(0.8, 0.8, 0.8))]),
+            device_cfg=DEVICE_CFG,
+        ),
+    }
+
+
+@pytest.mark.parametrize("scene_name", ["cuboid", "mesh", "voxel"])
+@pytest.mark.parametrize("margin", [0.0, 0.02])
+def test_link_culling_matches_unculled_results(scene_name, margin):
+    """Skipping links far from obstacles never changes a result.
+
+    Random poses span collisions, near misses and far links. Inflating every link's bounding
+    sphere disables the culling and gives the reference.
+    """
+    scene = _culling_scenes()[scene_name]
+    generator = torch.Generator().manual_seed(0)
+    tf = _random_link_transforms(generator, 512, 2, -0.6, 0.6)
+
+    robot = _two_link_robot()
+    culled, culled_link = _check(robot, scene, tf, margin=margin)
+
+    reference_robot = _two_link_robot()
+    reference_robot.link_bounds[:, 3] = 1.0e3
+    reference, reference_link = _check(reference_robot, scene, tf, margin=margin)
+
+    assert 0 < int(reference.sum()) < reference.numel()
+    assert torch.equal(culled, reference)
+    assert torch.equal(culled_link, reference_link)
+
+
+def test_link_culling_skips_only_far_links():
+    """With one link at the obstacle and one far away, only the first is tested."""
+    robot = _two_link_robot()
+    scene = _culling_scenes()["cuboid"]
+    tf = _two_link_transforms(0.1, 3.0)
+    link_near = torch.zeros(3, 2, dtype=torch.int32, device=DEVICE_CFG.device)
+    coll, _ = _check(robot, scene, tf, link_near=link_near)
+    assert coll.tolist() == [1]
+    assert link_near[0].tolist() == [1, 0]
+
+
+def test_link_bounds_follow_runtime_geometry():
+    data = RobotMeshData.from_link_meshes(
+        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
+        link_name_to_idx_map={"l0": 0, "obj": 1},
+        num_links=2,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+        extra_link_triangles={"obj": 16},
+    )
+    # Half the cube diagonal, centred at the origin.
+    assert data.link_bounds[0].tolist() == pytest.approx([0, 0, 0, 0.1 * np.sqrt(3)], abs=1e-6)
+    assert data.link_bounds[1, 3].item() < 0
+
+    obj = trimesh.creation.box(extents=(0.1, 0.2, 0.3))
+    obj.apply_translation([0.5, 0.0, 0.0])
+    data.update_link_mesh("obj", obj)
+    radius = 0.5 * np.sqrt(0.1**2 + 0.2**2 + 0.3**2)
+    assert data.link_bounds[1].tolist() == pytest.approx([0.5, 0, 0, radius], abs=1e-6)
+
+    data.clear_link_mesh("obj")
+    assert data.link_bounds[1, 3].item() < 0
+
+
+def test_voxel_culling_keeps_links_reaching_into_the_grid():
+    """A link centred outside the grid can still reach an obstacle at the grid edge.
+
+    The ESDF reads as free outside the grid, so the link centre alone would wrongly clear it.
+    The grid spans |x| < 0.2 and the box |x| < 0.15; the plank spans x in [0.12, 0.42].
+    """
+    scene = SceneData.from_scene_cfg(
+        SceneCfg(
+            voxel=[
+                _box_esdf(voxel_size=0.02, grid_dims=(0.4, 0.4, 0.4), box_half=(0.15, 0.15, 0.15))
+            ]
+        ),
+        device_cfg=DEVICE_CFG,
+    )
+    tf = _two_link_transforms(3.0, 0.27)
+    assert _check(_two_link_robot(), scene, tf)[0].tolist() == [1]
