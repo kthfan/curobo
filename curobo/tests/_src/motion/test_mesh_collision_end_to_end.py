@@ -24,7 +24,6 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.types.tool_pose import GoalToolPose
-from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 
 #: Links whose spheres are disabled, leaving the mesh check as their only collision test.
 GRIPPER_LINKS = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
@@ -204,10 +203,9 @@ def test_attached_object_mesh_is_checked(cuda_device_cfg):
     A box sits 25 cm below the palm box position, clear of the robot. A rod attached to the
     hand reaches into it. The rod's spheres are disabled, so only its mesh can see the box.
     """
-    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
-    robot["robot_cfg"]["kinematics"]["extra_collision_meshes"] = {"attached_object": 32}
+    # franka.yml reserves triangle slots for attached_object.
     config = IKSolverCfg.create(
-        robot=robot,
+        robot="franka.yml",
         scene_model=palm_box(offset=(0.0, 0.0, -0.25)),
         mesh_collision_check=True,
         device_cfg=cuda_device_cfg,

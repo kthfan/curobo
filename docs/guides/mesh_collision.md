@@ -117,8 +117,11 @@ slots for a link in the robot YAML:
 ```yaml
 robot_cfg:
   kinematics:
-    extra_collision_meshes: {attached_object: 200}
+    extra_collision_meshes: {attached_object: 256}
 ```
+
+`franka.yml` already reserves 256 slots for `attached_object`. Reserved slots cost nothing
+without the mesh check; with it, empty slots are skipped right away.
 
 The attachment manager fills these slots: attaching an object writes its mesh along with its
 collision spheres, and detaching it clears both. The link meshes are shared by all

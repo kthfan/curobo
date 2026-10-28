@@ -459,8 +459,7 @@ def _mesh_robot_model(reserve_mesh_slots: bool = True, num_envs: int = 1) -> Kin
     kinematics = robot_data["robot_cfg"]["kinematics"]
     kinematics["extra_collision_spheres"] = {"attached_object": 100}
     kinematics["load_collision_meshes"] = True
-    if reserve_mesh_slots:
-        kinematics["extra_collision_meshes"] = {"attached_object": 64}
+    kinematics["extra_collision_meshes"] = {"attached_object": 64} if reserve_mesh_slots else {}
     model = Kinematics(KinematicsCfg.from_robot_yaml_file(robot_data, ["panda_hand"]))
     kparams = model.config.kinematics_config
     if num_envs > 1:

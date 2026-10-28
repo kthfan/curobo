@@ -58,7 +58,7 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   `detach` clears it with the new `clear_link_mesh` (a plain disable would be restored by
   `enable_link_collision`). With several envs the shared link meshes need the same offset in
   every env; otherwise it warns and leaves the object to the spheres. Without reserved slots
-  it warns too. franka.yml reserves no mesh slots by default (open question).
+  it warns too. franka.yml now reserves 256 slots for `attached_object`.
 - [x] **P1 – `plan_grasp` keeps the gripper meshes active.** `disable_link_collision` only
   disabled spheres, so the fingers touching the object failed the mesh check. The planners'
   `disable_link_collision` / `enable_link_collision` now toggle the link meshes too, with the
