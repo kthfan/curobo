@@ -72,15 +72,17 @@ expensive because the robot geometry moves with every configuration.
 | --- | --- |
 | IK metrics | yes |
 | Trajectory optimization metrics, at the optimized steps | yes |
-| Densely interpolated trajectory | no |
+| Densely interpolated trajectory, at every interpolation step | yes |
 | MPC metrics | yes |
 | Graph planner seeding | no, spheres only |
 | Self-collision | no, spheres only |
 | Robot collision checker (`validate`) | yes, when created with `use_mesh_constraint=True` |
 
-The interpolated trajectory is skipped to keep the check affordable, since it has many more
-steps than the optimized trajectory. A collision that happens only between two optimized steps
-is therefore not detected.
+The interpolated trajectory is sampled every `interpolation_dt` (25 ms by default), so a motion
+that crosses a thin obstacle between two optimized steps is still caught. A collision shorter
+than one interpolation step can still be missed; a continuous (swept) check would close that
+gap. Checking the interpolated trajectory adds 1 to 6 % to a `plan_pose` call in the scenes of
+the cost section below.
 
 (mesh_collision_cost)=
 ## Cost
