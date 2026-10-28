@@ -173,6 +173,47 @@ class TestGoalManagerUpdateGoalBuffer:
         # Should reuse buffer
         assert buffer2 is buffer1 or not update_reference
 
+    def test_update_goal_buffer_does_not_write_into_caller_tensors(
+        self, goal_manager, sample_solve_state, sample_goal_poses, cpu_device_cfg
+    ):
+        """Reusing the buffer must not overwrite the inputs of an earlier call.
+
+        ``plan_grasp`` keeps views of its grasp poses while it plans to the approach pose; an
+        aliased buffer replaced the grasp poses with the approach poses.
+        """
+        tensor_args = cpu_device_cfg.as_torch_dict()
+        first_current = JointState.from_position(torch.zeros(4, 7, **tensor_args))
+        first_goal_js = JointState.from_position(torch.zeros(4, 7, **tensor_args))
+        first_seed = JointState.from_position(torch.zeros(4, 32, 7, **tensor_args))
+        first_dt = torch.full((4,), 0.1, **tensor_args)
+        first_poses = sample_goal_poses.clone()
+        goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=first_poses,
+            current_js=first_current,
+            seed_goal_js=first_seed,
+            goal_js=first_goal_js,
+            current_state_dt=first_dt,
+        )
+
+        second_poses = sample_goal_poses.clone()
+        second_poses.position += 1.0
+        _, update_reference = goal_manager.update_goal_buffer(
+            sample_solve_state,
+            goal_tool_poses=second_poses,
+            current_js=JointState.from_position(torch.ones(4, 7, **tensor_args)),
+            seed_goal_js=JointState.from_position(torch.ones(4, 32, 7, **tensor_args)),
+            goal_js=JointState.from_position(torch.ones(4, 7, **tensor_args)),
+            current_state_dt=torch.full((4,), 0.2, **tensor_args),
+        )
+
+        assert not update_reference
+        assert torch.equal(first_poses.position, sample_goal_poses.position)
+        assert torch.equal(first_current.position, torch.zeros(4, 7, **tensor_args))
+        assert torch.equal(first_goal_js.position, torch.zeros(4, 7, **tensor_args))
+        assert torch.equal(first_seed.position, torch.zeros(4, 32, 7, **tensor_args))
+        assert torch.equal(first_dt, torch.full((4,), 0.1, **tensor_args))
+
 
 class TestGoalManagerBatchHelper:
     """Test GoalManager batch helper property."""

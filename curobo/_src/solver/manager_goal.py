@@ -83,6 +83,13 @@ class GoalManager:
         """
         if solve_state.num_seeds is None:
             log_and_raise("Number of seeds is not set. Please set the number of seeds.")
+        # The buffer is reused across solves and updated in place with copy_, so it must own
+        # its tensors: aliasing the inputs would overwrite the caller's goals on the next solve.
+        goal_tool_poses = goal_tool_poses.clone() if goal_tool_poses is not None else None
+        goal_js = goal_js.clone() if goal_js is not None else None
+        current_js = current_js.clone() if current_js is not None else None
+        seed_goal_js = seed_goal_js.clone() if seed_goal_js is not None else None
+        current_state_dt = current_state_dt.clone() if current_state_dt is not None else None
         goal_buffer = GoalRegistry.create_idx(
             pose_batch_size=solve_state.batch_size,
             multi_env=solve_state.multi_env,

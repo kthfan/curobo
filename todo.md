@@ -80,6 +80,11 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   `KinematicsParams.disable_link_mesh` exists but there is no way to re-enable a link mesh
   yet, so an `enable_link_mesh` (restore from the loaded geometry) is needed too. Add a
   `plan_grasp` test with the mesh check on.
+- [x] **P1 – `plan_grasp` overwrote its own grasp poses.** Found by the `plan_grasp` test.
+  `GoalManager.create_goal_buffer` stored the caller's goal tensors as the reusable buffer, so
+  the next solve's `copy_` wrote into them: planning to the approach pose replaced the grasp
+  poses, the grasp phase never moved in, and the lift target ended up 30 cm above the grasp.
+  The buffer now clones its inputs.
 - [ ] **P2 – Report which link collided.** `RobotMeshConstraint.get_contact_link_names()` is
   only reachable on the internal cost object. Surface the colliding link and time step in
   the solver result or status, so a failed plan says "mesh collision: panda_hand at step 12"
