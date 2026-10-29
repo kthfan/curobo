@@ -217,14 +217,12 @@ class TestBuildWaypointCriteria:
 
 def _bounded(bound: ToolPoseBound) -> ToolPoseCriteria:
     criteria = _cpu_criteria([1.0] * 6)
-    criteria.bound = bound
+    criteria.bounds = [bound]
     return criteria
 
 
 def _x_band(half_width: float, **kwargs) -> ToolPoseBound:
-    return ToolPoseBound(
-        position_lower=[-half_width, None, None], position_upper=[half_width, None, None], **kwargs
-    )
+    return ToolPoseBound(x=(-half_width, half_width), **kwargs)
 
 
 def _waypoint(*xs: float) -> GoalToolPose:
@@ -277,9 +275,9 @@ class TestToolPoseBounds:
 
         wp = planner._build_waypoint_criteria([c0, c1])
 
-        assert all(criteria["ee"].bound is None for criteria in wp)
+        assert all(criteria["ee"].bounds == [] for criteria in wp)
         # The segment criteria themselves keep their bounds.
-        assert c0["ee"].bound is not None and c1["ee"].bound is not None
+        assert c0["ee"].bounds and c1["ee"].bounds
 
     def test_default_bound_fills_unbounded_segments(self):
         planner = _bound_planner(segment_constraints=[])
@@ -291,9 +289,9 @@ class TestToolPoseBounds:
             [{"ee": _bounded(own)}, {"ee": _cpu_criteria([1.0] * 6)}, {}], 3
         )
 
-        assert segments[0]["ee"].bound is own
-        assert segments[1]["ee"].bound is default
-        assert segments[2]["ee"].bound is default
+        assert segments[0]["ee"].bounds == [own]
+        assert segments[1]["ee"].bounds == [default]
+        assert segments[2]["ee"].bounds == [default]
         assert planner.motion_planner.bound_updates == [{"ee": default}]
 
     def test_default_bound_fills_missing_frame(self):
@@ -303,8 +301,8 @@ class TestToolPoseBounds:
 
         segments = planner._resolve_segment_criteria([{"other": _cpu_criteria([1.0] * 6)}], 1)
 
-        assert segments[0]["ee"].bound is default
-        assert segments[0]["other"].bound is None
+        assert segments[0]["ee"].bounds == [default]
+        assert segments[0]["other"].bounds == []
 
     def test_clear_default_bound(self):
         planner = _bound_planner(segment_constraints=[])
@@ -313,8 +311,8 @@ class TestToolPoseBounds:
 
         segments = planner._resolve_segment_criteria([{}], 1)
 
-        assert segments[0]["ee"].bound is None
-        assert planner._baseline_criteria["ee"].bound is None
+        assert segments[0]["ee"].bounds == []
+        assert planner._baseline_criteria["ee"].bounds == []
 
     def test_unknown_frame_raises(self):
         planner = _bound_planner()
@@ -352,8 +350,8 @@ class TestToolPoseBounds:
 
     def test_filter_outgoing_start_anchor_with_offset(self):
         planner = _bound_planner()
-        # The reference sits 0.2 m ahead of the segment start, outside the 5 cm band.
-        bound = _x_band(0.05, anchor="start", offset_position=[0.2, None, None])
+        # The band lies 0.15 to 0.25 m ahead of the segment start, which is outside it.
+        bound = ToolPoseBound(anchor="start", x=(0.15, 0.25))
         segments = [{"ee": _bounded(bound)}]
         q = torch.tensor([[0.0], [0.5]])
 
@@ -365,7 +363,7 @@ class TestToolPoseBounds:
         planner = _bound_planner()
         segments = [
             {"ee": _bounded(_x_band(0.4, anchor="base"))},
-            {"ee": _bounded(ToolPoseBound(anchor="base", position_lower=[-0.1, None, None]))},
+            {"ee": _bounded(ToolPoseBound(anchor="base", x=(-0.1, None)))},
         ]
         q = torch.tensor([[-0.2], [0.0], [0.3], [0.5]])
         waypoints = [_waypoint(0.0), _waypoint(0.0), _waypoint(0.0)]
@@ -562,9 +560,7 @@ class TestPlanWaypointsIntegration:
         frame = planner.tool_frames[0]
         z0 = w0.position[0, 0, 0, 0, 2].item()
         criteria = self._segment_criteria(planner, 1)
-        criteria[0][frame].bound = ToolPoseBound.plane(
-            "z", anchor="base", offset_position=[None, None, z0]
-        )
+        criteria[0][frame].bounds = [ToolPoseBound.plane(point=[0.0, 0.0, z0], anchor="base")]
 
         result = planner.plan_waypoints(
             [w0, w1], start, segment_tool_pose_criteria=criteria, max_attempts=5
@@ -588,7 +584,7 @@ class TestPlanWaypointsIntegration:
         frame = planner.tool_frames[0]
         z0 = w0.position[0, 0, 0, 0, 2].item()
         planner.update_tool_pose_bounds(
-            {frame: ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0])}
+            {frame: ToolPoseBound.plane(point=[0.0, 0.0, z0], anchor="base")}
         )
         try:
             result = planner.plan_waypoints(

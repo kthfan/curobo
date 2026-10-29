@@ -1,21 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tool-frame bound cost: keeps tool frames inside per-link :class:`ToolPoseBound` limits.
+"""Tool-frame bound cost: keeps tool frames inside their :class:`ToolPoseBound` limits.
 
 Bounds are set per tool frame through
-:attr:`ToolPoseCriteria.bound <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bound>` and
-stored in fixed-size tensors, so updating them never changes the launched kernel (CUDA graph
-safe). Links without a bound contribute zero cost.
+:attr:`ToolPoseCriteria.bounds <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bounds>`
+or ``update_tool_pose_bounds``, and stored in fixed-size tensors with
+:attr:`EEFBoundCostCfg.max_bounds_per_tool_frame` slots per tool frame, so updating them never
+changes the launched kernel (CUDA graph safe). Tool frames without bounds contribute zero cost.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
 from curobo._src.cost.cost_base import BaseCost
-from curobo._src.cost.tool_pose_bound import UNBOUNDED, ToolPoseBound, ToolPoseBoundAnchor
+from curobo._src.cost.tool_pose_bound import (
+    UNBOUNDED,
+    ToolPoseBound,
+    ToolPoseBoundAnchor,
+    normalize_tool_pose_bounds,
+)
 from curobo._src.cost.wp_eef_bound import EEFBoundCostFunction
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.logging import log_and_raise
@@ -27,13 +33,18 @@ if TYPE_CHECKING:
 
 
 class EEFBoundCost(BaseCost):
-    """Squared-hinge cost on tool-frame components expressed in a reference frame."""
+    """Squared-hinge cost on tool-frame components expressed in reference frames."""
 
     def __init__(self, config: EEFBoundCostCfg):
-        """Allocate per-link bound tensors; all tool frames start unbounded."""
+        """Allocate bound slot tensors; all tool frames start unbounded."""
         super().__init__(config)
         if not config.tool_frames:
             log_and_raise("EEFBoundCostCfg.tool_frames must be set before creating the cost")
+        if config.max_bounds_per_tool_frame < 1:
+            log_and_raise(
+                "EEFBoundCostCfg.max_bounds_per_tool_frame must be >= 1, "
+                + f"got {config.max_bounds_per_tool_frame}"
+            )
         self.tool_frames = list(config.tool_frames)
         num_links = len(self.tool_frames)
         if self._weight.numel() not in (1, num_links):
@@ -45,62 +56,68 @@ class EEFBoundCost(BaseCost):
 
         device = self.device_cfg.device
         dtype = self.device_cfg.dtype
-        self._bounds: Dict[str, Optional[ToolPoseBound]] = {
-            name: None for name in self.tool_frames
-        }
-        self._anchor = torch.full((num_links,), -1, device=device, dtype=torch.int32)
-        self._offset_position = torch.zeros((num_links, 3), device=device, dtype=dtype)
-        self._offset_quaternion = torch.zeros((num_links, 4), device=device, dtype=dtype)
-        self._offset_quaternion[:, 0] = 1.0
-        self._position_lower = torch.full((num_links, 3), -UNBOUNDED, device=device, dtype=dtype)
-        self._position_upper = torch.full((num_links, 3), UNBOUNDED, device=device, dtype=dtype)
-        self._rotation_lower = torch.full((num_links, 3), -UNBOUNDED, device=device, dtype=dtype)
-        self._rotation_upper = torch.full((num_links, 3), UNBOUNDED, device=device, dtype=dtype)
-        self._max_swing = torch.full((num_links,), UNBOUNDED, device=device, dtype=dtype)
-        self._use_rotation = torch.zeros((num_links,), device=device, dtype=torch.int32)
+        slots = (num_links, config.max_bounds_per_tool_frame)
+        self._bounds: Dict[str, List[ToolPoseBound]] = {name: [] for name in self.tool_frames}
+        self._anchor = torch.full(slots, -1, device=device, dtype=torch.int32)
+        self._axes = torch.zeros(slots, device=device, dtype=torch.int32)
+        self._reference_rotation = torch.zeros((*slots, 4), device=device, dtype=dtype)
+        self._reference_rotation[..., 0] = 1.0
+        self._tool_rotation = self._reference_rotation.clone()
+        self._center = torch.zeros((*slots, 6), device=device, dtype=dtype)
+        self._lower = torch.full((*slots, 6), -UNBOUNDED, device=device, dtype=dtype)
+        self._upper = torch.full((*slots, 6), UNBOUNDED, device=device, dtype=dtype)
+        self._use_rotation = torch.zeros(slots, device=device, dtype=torch.int32)
         # Placeholders for anchors that are not in use.
         self._unused_position = torch.zeros((1, 3), device=device, dtype=dtype)
         self._unused_quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
 
     @property
-    def tool_pose_bounds(self) -> Dict[str, Optional[ToolPoseBound]]:
-        """Current bound per tool frame (``None`` when unbounded)."""
-        return dict(self._bounds)
+    def tool_pose_bounds(self) -> Dict[str, List[ToolPoseBound]]:
+        """Current bounds per tool frame (empty when unbounded)."""
+        return {name: list(bounds) for name, bounds in self._bounds.items()}
 
     def uses_anchor(self, anchor: ToolPoseBoundAnchor) -> bool:
-        """True if any tool frame's bound is attached to ``anchor``."""
-        return any(b is not None and b.anchor == anchor for b in self._bounds.values())
+        """True if any bound is attached to ``anchor``."""
+        return any(b.anchor == anchor for bounds in self._bounds.values() for b in bounds)
 
-    def update_tool_pose_bounds(self, bounds: Dict[str, Optional[ToolPoseBound]]) -> None:
-        """Set or clear (``None``) the bound of the given tool frames.
+    def update_tool_pose_bounds(
+        self,
+        bounds: Dict[str, Optional[Union[ToolPoseBound, Sequence[ToolPoseBound]]]],
+    ) -> None:
+        """Replace the bounds of the given tool frames.
 
         Args:
-            bounds: Map from tool frame name to its bound.
+            bounds: Map from tool frame name to a bound, a list of bounds, or ``None`` to clear.
         """
-        for name, bound in bounds.items():
+        num_slots = self._anchor.shape[1]
+        for name, value in bounds.items():
             if name not in self._bounds:
                 log_and_raise(f"EEFBoundCost: unknown tool frame {name}, have {self.tool_frames}")
+            frame_bounds = normalize_tool_pose_bounds(value)
+            if len(frame_bounds) > num_slots:
+                log_and_raise(
+                    f"EEFBoundCost: tool frame {name} has {len(frame_bounds)} bounds, at most "
+                    + f"{num_slots} are supported (EEFBoundCostCfg.max_bounds_per_tool_frame)"
+                )
             i = self.tool_frames.index(name)
-            self._bounds[name] = bound
-            if bound is None:
-                self._anchor[i] = -1
-                continue
-            offset_p, offset_q, pos_lo, pos_hi, rot_lo, rot_hi, max_swing = bound.stacked_values(
-                self.config.metric
-            )
-            self._offset_position[i] = self._offset_position.new_tensor(offset_p)
-            self._offset_quaternion[i] = self._offset_quaternion.new_tensor(offset_q)
-            self._position_lower[i] = self._position_lower.new_tensor(pos_lo)
-            self._position_upper[i] = self._position_upper.new_tensor(pos_hi)
-            self._rotation_lower[i] = self._rotation_lower.new_tensor(rot_lo)
-            self._rotation_upper[i] = self._rotation_upper.new_tensor(rot_hi)
-            self._max_swing[i] = max_swing[0]
-            self._use_rotation[i] = int(bound.uses_rotation)
-            self._anchor[i] = bound.anchor.value
+            self._bounds[name] = frame_bounds
+            self._anchor[i] = -1
+            for k, bound in enumerate(frame_bounds):
+                center, lower, upper = bound.kernel_values(self.config.metric)
+                self._axes[i, k] = 0 if bound.reference_axes == "anchor" else 1
+                self._reference_rotation[i, k] = self._reference_rotation.new_tensor(
+                    bound.reference_rotation
+                )
+                self._tool_rotation[i, k] = self._tool_rotation.new_tensor(bound.tool_rotation)
+                self._center[i, k] = self._center.new_tensor(center)
+                self._lower[i, k] = self._lower.new_tensor(lower)
+                self._upper[i, k] = self._upper.new_tensor(upper)
+                self._use_rotation[i, k] = int(bound.uses_rotation)
+                self._anchor[i, k] = bound.anchor.value
 
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]) -> None:
-        """Take the bounds from ``ToolPoseCriteria.bound`` of the given tool frames."""
-        self.update_tool_pose_bounds({k: v.bound for k, v in tool_pose_criteria.items()})
+        """Take the bounds from ``ToolPoseCriteria.bounds`` of the given tool frames."""
+        self.update_tool_pose_bounds({k: v.bounds for k, v in tool_pose_criteria.items()})
 
     def setup_batch_tensors(self, batch_size: int, horizon: int):
         """Allocate output buffers for a ``(batch_size, horizon)`` trajectory batch."""
@@ -199,13 +216,12 @@ class EEFBoundCost(BaseCost):
             start_quaternion.detach().contiguous(),
             idxs_start_flat,
             self._anchor,
-            self._offset_position,
-            self._offset_quaternion,
-            self._position_lower,
-            self._position_upper,
-            self._rotation_lower,
-            self._rotation_upper,
-            self._max_swing,
+            self._axes,
+            self._reference_rotation,
+            self._tool_rotation,
+            self._center,
+            self._lower,
+            self._upper,
             self._use_rotation,
             self._weight,
             num_goalset,

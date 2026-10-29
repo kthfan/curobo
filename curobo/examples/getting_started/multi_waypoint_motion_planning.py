@@ -60,7 +60,7 @@ Step 3: Understand the pipeline
    frame names to ``ToolPoseCriteria``. Both segments here track position and
    orientation. Use ``ToolPoseCriteria.linear_motion("z")`` for a segment
    that must move in a straight line along the goal z axis, or set
-   ``bound`` on the criteria to keep the tool within limits
+   ``bounds`` on the criteria to keep the tool within limits
    (:ref:`tool_pose_bounds_guide`). An empty dictionary tracks position and
    orientation.
 

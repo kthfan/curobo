@@ -20,7 +20,7 @@ import torch
 import torch.autograd.profiler as profiler
 
 import curobo._src.runtime as curobo_runtime
-from curobo._src.cost.tool_pose_bound import ToolPoseBound
+from curobo._src.cost.tool_pose_bound import ToolPoseBounds, normalize_tool_pose_bounds
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.collision.attachment_manager import AttachmentManager
 from curobo._src.geom.collision.collision_scene import (
@@ -453,20 +453,21 @@ class SolverCore:
             rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
         self.auxiliary_rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
 
-    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
-        """Set or clear (``None``) tool pose bounds in all rollouts.
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, ToolPoseBounds]):
+        """Replace the tool pose bounds of the given tool frames in all rollouts.
 
         Unlike :meth:`update_tool_pose_criteria`, the other tool pose criteria (weights,
         tolerances) are left unchanged.
 
         Args:
-            tool_pose_bounds: Map from tool frame name to its bound.
+            tool_pose_bounds: Map from tool frame name to a bound, a list of bounds, or ``None``
+                to clear.
         """
         unknown = [name for name in tool_pose_bounds if name not in self.kinematics.tool_frames]
         if unknown:
             log_and_raise(f"Unknown tool frames {unknown}; have {self.kinematics.tool_frames}")
         if not self._has_eef_bound_cost and any(
-            bound is not None for bound in tool_pose_bounds.values()
+            normalize_tool_pose_bounds(bounds) for bounds in tool_pose_bounds.values()
         ):
             log_and_raise("Tool pose bounds need an eef_bound cost in the solver configuration")
         rollouts = (

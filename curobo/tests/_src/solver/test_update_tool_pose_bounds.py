@@ -65,9 +65,11 @@ class TestCostManager:
         manager.costs = {"eef_bound": EEFBoundCost(cfg)}
         bound = ToolPoseBound.plane()
         manager.update_params(tool_pose_bounds={"ee": bound})
-        assert manager.costs["eef_bound"].tool_pose_bounds["ee"] is bound
+        assert manager.costs["eef_bound"].tool_pose_bounds["ee"] == [bound]
+        manager.update_params(tool_pose_bounds={"ee": [bound, bound]})
+        assert manager.costs["eef_bound"].tool_pose_bounds["ee"] == [bound, bound]
         manager.update_params(tool_pose_bounds={"ee": None})
-        assert manager.costs["eef_bound"].tool_pose_bounds["ee"] is None
+        assert manager.costs["eef_bound"].tool_pose_bounds["ee"] == []
 
     def test_update_params_without_eef_cost_is_noop(self):
         manager = RobotCostManager.__new__(RobotCostManager)
@@ -91,6 +93,9 @@ class TestSolverCore:
     def test_bound_without_eef_cost_raises(self):
         with pytest.raises(ValueError, match="eef_bound"):
             _stub_core(has_eef_bound=False).update_tool_pose_bounds({"ee": ToolPoseBound.plane()})
+
+    def test_empty_list_without_eef_cost_is_allowed(self):
+        _stub_core(has_eef_bound=False).update_tool_pose_bounds({"ee": []})
 
     def test_clearing_without_eef_cost_is_allowed(self):
         core = _stub_core(has_eef_bound=False)
@@ -135,7 +140,9 @@ class TestMotionPlanner:
         planner.update_tool_pose_bounds({"ee": bound})
         assert planner.ik_solver.bounds == [{"ee": bound}]
         assert planner.trajopt_solver.bounds == [{"ee": bound}]
-        assert planner._tool_pose_bounds == {"ee": bound}
+        assert planner._tool_pose_bounds == {"ee": [bound]}
+        planner.update_tool_pose_bounds({"ee": [bound, bound]})
+        assert planner._tool_pose_bounds == {"ee": [bound, bound]}
         planner.update_tool_pose_bounds({"ee": None})
         assert planner._tool_pose_bounds == {}
 

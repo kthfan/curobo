@@ -66,7 +66,7 @@ class RobotCostManagerCfg:
 
     # Tool pose bounds
     #: Cost keeping tool frames inside their :class:`ToolPoseBound` limits, set at runtime
-    #: through ``ToolPoseCriteria.bound``. None disables.
+    #: through ``ToolPoseCriteria.bounds`` or ``update_tool_pose_bounds``. None disables.
     eef_bound_cfg: Optional[EEFBoundCostCfg] = None
 
     # Robot mesh collision cost configuration.

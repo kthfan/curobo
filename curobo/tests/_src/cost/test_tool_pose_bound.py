@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ToolPoseBound and its PyTorch evaluation helpers."""
+"""Unit tests for ToolPoseBound and its PyTorch reference implementation."""
 
 import math
 
@@ -14,265 +14,325 @@ from curobo._src.cost.tool_pose_bound import (
     ToolPoseBoundAnchor,
     _quat_mul,
     find_tool_pose_bound_violations,
-    swing_twist_components,
+    normalize_tool_pose_bounds,
+    tool_pose_bound_components,
     tool_pose_bound_violation,
 )
-from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 
+IDENTITY = torch.tensor([1.0, 0.0, 0.0, 0.0])
+ORIGIN = torch.zeros(3)
+DEG = math.pi / 180.0
 
-def axis_angle(axis, angle):
+
+def rotation(axis, angle):
     a = torch.tensor(axis, dtype=torch.float32)
     a = a / a.norm()
     return torch.cat([torch.tensor([math.cos(angle / 2)]), a * math.sin(angle / 2)])
 
 
-IDENTITY = axis_angle([1.0, 0.0, 0.0], 0.0)
+def components(bound, position=ORIGIN, quaternion=IDENTITY, anchor_p=ORIGIN, anchor_q=IDENTITY):
+    c, parallel = tool_pose_bound_components(bound, position, quaternion, anchor_p, anchor_q)
+    return c, parallel
 
 
-class TestToolPoseBoundValidation:
+class TestValidation:
     def test_anchor_from_string(self):
-        assert ToolPoseBound(anchor="base").anchor == ToolPoseBoundAnchor.BASE
+        assert ToolPoseBound(anchor="base", z=0.0).anchor == ToolPoseBoundAnchor.BASE
 
-    def test_unknown_anchor_raises(self):
-        with pytest.raises(ValueError):
-            ToolPoseBound(anchor="tool")
+    def test_invalid_anchor_raises(self):
+        with pytest.raises(ValueError, match="anchor"):
+            ToolPoseBound(anchor="world", z=0.0)
 
-    def test_reference_outside_position_interval_raises(self):
-        with pytest.raises(ValueError, match="does not contain the reference"):
-            ToolPoseBound(position_lower=[None, None, 0.01])
+    def test_invalid_reference_axes_raises(self):
+        with pytest.raises(ValueError, match="reference_axes"):
+            ToolPoseBound(reference_axes="world", z=0.0)
 
-    def test_reference_outside_rotation_interval_raises(self):
-        with pytest.raises(ValueError, match="does not contain the reference"):
-            ToolPoseBound(rotation_upper=[None, None, -0.1])
+    def test_no_limits_raises(self):
+        with pytest.raises(ValueError, match="no limits"):
+            ToolPoseBound()
+
+    def test_number_is_equality(self):
+        assert ToolPoseBound(z=0.4).z == (0.4, 0.4)
+
+    def test_open_ends(self):
+        bound = ToolPoseBound(z=(0.0, None), x=(None, None))
+        assert bound.z == (0.0, None)
+        assert bound.x is None
 
     def test_lower_above_upper_raises(self):
+        with pytest.raises(ValueError, match="lower limit"):
+            ToolPoseBound(x=(0.1, -0.1))
+
+    def test_tilt_outside_range_raises(self):
+        with pytest.raises(ValueError, match="tilt"):
+            ToolPoseBound(tilt=(None, 4.0))
+
+    def test_yaw_needs_both_ends(self):
+        with pytest.raises(ValueError, match="both"):
+            ToolPoseBound(tilt=(1.0, 1.2), yaw=(0.0, None))
+
+    def test_yaw_span_at_most_two_pi(self):
+        with pytest.raises(ValueError, match="2\\*pi"):
+            ToolPoseBound(tilt=(1.0, 1.2), roll=(-4.0, 4.0))
+
+    @pytest.mark.parametrize("tilt", [None, (0.0, 1.0), (1.0, 3.1), (0.1, None)])
+    def test_yaw_or_roll_needs_tilt_away_from_parallel(self, tilt):
+        with pytest.raises(ValueError, match="parallel"):
+            ToolPoseBound(tilt=tilt, roll=(-0.1, 0.1))
+
+    def test_negative_tolerance_raises(self):
+        with pytest.raises(ValueError, match="rotation_tolerance"):
+            ToolPoseBound(tilt=(None, 0.1), rotation_tolerance=-0.1)
+
+    def test_rotations_are_normalized(self):
+        bound = ToolPoseBound(z=0.0, reference_rotation=[2.0, 0.0, 0.0, 0.0])
+        assert bound.reference_rotation == [1.0, 0.0, 0.0, 0.0]
+        assert bound.tool_rotation == [1.0, 0.0, 0.0, 0.0]
+
+    def test_normalize_bounds(self):
+        bound = ToolPoseBound(z=0.0)
+        assert normalize_tool_pose_bounds(None) == []
+        assert normalize_tool_pose_bounds(bound) == [bound]
+        assert normalize_tool_pose_bounds((bound, bound)) == [bound, bound]
         with pytest.raises(ValueError):
-            ToolPoseBound(position_lower=[-0.1, None, None], position_upper=[-0.2, None, None])
+            normalize_tool_pose_bounds([bound, "plane"])
 
-    def test_rotation_bound_out_of_range_raises(self):
-        with pytest.raises(ValueError):
-            ToolPoseBound(rotation_upper=[None, None, 4.0])
 
-    def test_unfilled_axes_are_unchecked(self):
-        bound = ToolPoseBound(position_lower=[None, -0.1, None], position_upper=[None, 0.2, None])
-        _, _, lo, hi, rot_lo, rot_hi, max_swing = bound.stacked_values(metric=False)
-        assert lo[0] == -UNBOUNDED and lo[2] == -UNBOUNDED
-        assert hi[0] == UNBOUNDED and hi[2] == UNBOUNDED
-        assert rot_lo == [-UNBOUNDED] * 3 and rot_hi == [UNBOUNDED] * 3
-        assert max_swing == [UNBOUNDED]
-        assert not bound.uses_rotation
+class TestKernelValues:
+    """Cost and feasibility intervals ``(center, lower, upper)`` per component."""
 
-    def test_negative_margin_raises(self):
-        with pytest.raises(ValueError):
-            ToolPoseBound(position_margin=-0.001)
+    def test_unlimited_component(self):
+        center, lower, upper = ToolPoseBound(anchor="base", z=0.0).kernel_values(metric=True)
+        assert (center[0], lower[0], upper[0]) == (0.0, -UNBOUNDED, UNBOUNDED)
 
-    def test_offset_defaults(self):
-        offset_p, offset_q, *_ = ToolPoseBound(offset_position=[None, 0.1, None]).stacked_values(
-            metric=False
+    def test_inequality(self):
+        bound = ToolPoseBound(anchor="base", z=(0.0, 0.1), position_tolerance=0.01)
+        _, lower, upper = bound.kernel_values(metric=False)
+        assert (lower[2], upper[2]) == pytest.approx((0.005, 0.095))
+        _, lower, upper = bound.kernel_values(metric=True)
+        assert (lower[2], upper[2]) == pytest.approx((-METRIC_EPSILON, 0.1 + METRIC_EPSILON))
+
+    def test_equality(self):
+        bound = ToolPoseBound(anchor="base", z=(0.2, 0.205), position_tolerance=0.01)
+        _, lower, upper = bound.kernel_values(metric=False)
+        assert lower[2] == upper[2] == pytest.approx(0.2025)
+        _, lower, upper = bound.kernel_values(metric=True)
+        assert (lower[2], upper[2]) == pytest.approx(
+            (0.19 - METRIC_EPSILON, 0.215 + METRIC_EPSILON)
         )
-        assert offset_p == [0.0, 0.1, 0.0]
-        assert offset_q == [1.0, 0.0, 0.0, 0.0]
-
-    def test_plane_and_line_factories(self):
-        plane = ToolPoseBound.plane("z", tolerance=0.001)
-        assert plane.position_lower == [None, None, 0.0]
-        line = ToolPoseBound.line("z", lower=-0.15, upper=0.0)
-        assert line.position_lower == [0.0, 0.0, -0.15]
-        assert line.position_upper == [0.0, 0.0, 0.0]
-
-    def test_criteria_copy_clears_bound(self, cpu_device_cfg):
-        criteria = ToolPoseCriteria(bound=ToolPoseBound.plane(), device_cfg=cpu_device_cfg)
-        criteria.copy_(ToolPoseCriteria(device_cfg=cpu_device_cfg))
-        assert criteria.bound is None
-        bounded = ToolPoseCriteria(bound=ToolPoseBound.plane(), device_cfg=cpu_device_cfg)
-        assert bounded.clone().bound is not None
-
-
-def _z_intervals(bound: ToolPoseBound):
-    """``(cost lower, cost upper, metric lower, metric upper)`` of the z position component."""
-    _, _, cost_lo, cost_hi, *_ = bound.stacked_values(metric=False)
-    _, _, metric_lo, metric_hi, *_ = bound.stacked_values(metric=True)
-    return cost_lo[2], cost_hi[2], metric_lo[2], metric_hi[2]
-
-
-class TestIntervals:
-    """Cost and feasibility intervals.
-
-    Cost sides shrink by the margin (never past the reference); feasibility keeps the user
-    bounds and adds the tolerance only on sides the cost could not shrink.
-    """
-
-    def _bound(self, lower, upper, **kwargs):
-        kwargs.setdefault("position_margin", 0.001)
-        kwargs.setdefault("position_tolerance", 0.002)
-        return ToolPoseBound(
-            position_lower=[None, None, lower], position_upper=[None, None, upper], **kwargs
-        )
-
-    def test_equality_uses_tolerance(self):
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(0.0, 0.0))
-        assert (cost_lo, cost_hi) == (0.0, 0.0)
-        assert lo == pytest.approx(-0.002 - METRIC_EPSILON)
-        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
-
-    def test_band_is_strict(self):
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.005, 0.005))
-        assert cost_lo == pytest.approx(-0.004) and cost_hi == pytest.approx(0.004)
-        assert lo == pytest.approx(-0.005 - METRIC_EPSILON)
-        assert hi == pytest.approx(0.005 + METRIC_EPSILON)
-
-    def test_narrow_band_behaves_like_equality(self):
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.0005, 0.0005))
-        assert (cost_lo, cost_hi) == (0.0, 0.0)
-        assert lo == pytest.approx(-0.0025 - METRIC_EPSILON)
-        assert hi == pytest.approx(0.0025 + METRIC_EPSILON)
-
-    def test_side_at_reference_is_soft(self):
-        # Approach line: the goal end (0) cannot shrink, the far end can.
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.15, 0.0))
-        assert cost_lo == pytest.approx(-0.149) and cost_hi == 0.0
-        assert lo == pytest.approx(-0.15 - METRIC_EPSILON)
-        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
 
     def test_one_sided(self):
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(-0.05, None))
-        assert cost_lo == pytest.approx(-0.049) and cost_hi == UNBOUNDED
-        assert lo == pytest.approx(-0.05 - METRIC_EPSILON) and hi == UNBOUNDED
+        bound = ToolPoseBound(anchor="base", z=(0.0, None), position_tolerance=0.01)
+        _, lower, upper = bound.kernel_values(metric=False)
+        assert (lower[2], upper[2]) == (pytest.approx(0.005), UNBOUNDED)
 
-    def test_zero_margin_keeps_equality_soft(self):
-        cost_lo, cost_hi, lo, hi = _z_intervals(self._bound(0.0, 0.0, position_margin=0.0))
-        assert (cost_lo, cost_hi) == (0.0, 0.0)
-        assert hi == pytest.approx(0.002 + METRIC_EPSILON)
+    def test_trivial_tilt_sides_are_unlimited(self):
+        bound = ToolPoseBound(tilt=(0.0, math.pi))
+        _, lower, upper = bound.kernel_values(metric=True)
+        assert (lower[3], upper[3]) == (-UNBOUNDED, UNBOUNDED)
 
-    @pytest.mark.parametrize(
-        "max_swing, cost, metric",
-        [(0.1, 0.09, 0.1 + METRIC_EPSILON), (0.0, 0.0, 0.02 + METRIC_EPSILON)],
-    )
-    def test_max_swing(self, max_swing, cost, metric):
-        bound = ToolPoseBound(max_swing=max_swing, rotation_margin=0.01, rotation_tolerance=0.02)
-        assert bound.stacked_values(metric=False)[6][0] == pytest.approx(cost)
-        assert bound.stacked_values(metric=True)[6][0] == pytest.approx(metric)
+    def test_wrapped_interval_is_centered(self):
+        bound = ToolPoseBound(tilt=(1.0, 2.0), roll=(3.0, 3.4), rotation_tolerance=0.0)
+        center, lower, upper = bound.kernel_values(metric=False)
+        assert center[5] == pytest.approx(3.2)
+        assert (lower[5], upper[5]) == pytest.approx((-0.2, 0.2))
+
+    def test_goal_on_edge_keeps_zero_cost(self):
+        bound = ToolPoseBound(anchor="goal", z=(-0.12, 0.0), position_tolerance=0.01)
+        _, lower, upper = bound.kernel_values(metric=False)
+        assert (lower[2], upper[2]) == pytest.approx((-0.115, 0.0))
+
+    def test_base_anchor_shrinks_both_sides(self):
+        bound = ToolPoseBound(anchor="base", z=(-0.12, 0.0), position_tolerance=0.01)
+        _, lower, upper = bound.kernel_values(metric=False)
+        assert (lower[2], upper[2]) == pytest.approx((-0.115, -0.005))
 
 
-class TestSwingTwist:
-    def test_separates_tilt_from_twist(self):
-        # Tilt 10 degrees about x, then twist 170 degrees about the tool z axis.
+class TestAngles:
+    """``R_FU = Rz(yaw) Ry(tilt) Rz(roll)`` on a tool whose z axis is pitched up 20 degrees."""
+
+    def setup_method(self):
+        self.bound = ToolPoseBound(anchor="base", tilt=(0.5, 1.5))
+        # Tool z along base x, then pitched up 20 degrees: R_y(70 deg).
+        self.pitched = rotation([0, 1, 0], 70 * DEG)
+
+    def angles(self, quaternion):
+        c, parallel = components(self.bound, quaternion=quaternion)
+        assert not parallel
+        return [a / DEG for a in c[3:].tolist()]
+
+    def test_pitch(self):
+        assert self.angles(self.pitched) == pytest.approx([70.0, 0.0, 0.0], abs=1e-3)
+
+    def test_yaw_about_reference_axis(self):
+        q = _quat_mul(rotation([0, 0, 1], 30 * DEG), self.pitched)
+        assert self.angles(q) == pytest.approx([70.0, 30.0, 0.0], abs=1e-3)
+
+    def test_roll_about_tool_axis(self):
+        q = _quat_mul(self.pitched, rotation([0, 0, 1], 30 * DEG))
+        assert self.angles(q) == pytest.approx([70.0, 0.0, 30.0], abs=1e-3)
+
+    def test_yaw_and_roll_leave_tilt(self):
         q = _quat_mul(
-            axis_angle([1, 0, 0], math.radians(10)), axis_angle([0, 0, 1], math.radians(170))
+            _quat_mul(rotation([0, 0, 1], 40 * DEG), self.pitched), rotation([0, 0, 1], -45 * DEG)
         )
-        components, angle = swing_twist_components(q)
-        assert components[0].item() == pytest.approx(math.radians(10), abs=1e-5)
-        assert components[1].item() == pytest.approx(0.0, abs=1e-5)
-        assert components[2].item() == pytest.approx(math.radians(170), abs=1e-5)
-        assert angle.item() == pytest.approx(math.radians(10), abs=1e-5)
+        assert self.angles(q) == pytest.approx([70.0, 40.0, -45.0], abs=1e-3)
 
-    def test_sign_invariant(self):
-        q = axis_angle([0.3, -0.2, 0.9], 1.1)
-        a, _ = swing_twist_components(q)
-        b, _ = swing_twist_components(-q)
-        assert torch.allclose(a, b, atol=1e-6)
+    def test_parallel_axes_are_flagged(self):
+        _, parallel = components(self.bound, quaternion=rotation([0, 0, 1], 0.3))
+        assert parallel
 
-    def test_half_turn_swing_has_zero_twist(self):
-        components, angle = swing_twist_components(axis_angle([1, 0, 0], math.pi))
-        assert components[2].item() == 0.0
-        assert angle.item() == pytest.approx(math.pi, abs=1e-5)
+    def test_reference_axes_anchor_vs_base(self):
+        anchor_q = rotation([1, 0, 0], 30 * DEG)
+        follows = ToolPoseBound(anchor="goal", tilt=(None, 0.1))
+        fixed = ToolPoseBound(anchor="goal", reference_axes="base", tilt=(None, 0.1))
+        c, _ = components(follows, quaternion=anchor_q, anchor_q=anchor_q)
+        assert c[3].item() == pytest.approx(0.0, abs=1e-4)
+        c, _ = components(fixed, quaternion=anchor_q, anchor_q=anchor_q)
+        assert c[3].item() == pytest.approx(30 * DEG, abs=1e-4)
 
-
-class TestViolation:
-    def test_plane_violation_with_offset_reference(self):
-        bound = ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, 0.8])
-        position = torch.tensor([[0.3, -0.2, 0.83]])
-        violation = tool_pose_bound_violation(
-            bound,
-            position,
-            IDENTITY.unsqueeze(0),
-            torch.zeros(1, 3),
-            IDENTITY.unsqueeze(0),
-            metric=False,
+    def test_tool_rotation_does_not_move_position(self):
+        bound = ToolPoseBound(
+            anchor="base", x=0.0, tool_rotation=rotation([0, 1, 0], 1.0).tolist()
         )
-        assert violation[0, 2].item() == pytest.approx(0.03, abs=1e-6)
-        assert violation[0, [0, 1, 3, 4, 5, 6]].abs().sum().item() == 0.0
+        c, _ = components(bound, position=torch.tensor([0.1, 0.2, 0.3]))
+        assert c[:3].tolist() == pytest.approx([0.1, 0.2, 0.3])
 
-    def test_reference_rotated_by_anchor(self):
-        # Line along the anchor's x axis, anchor yawed by 90 degrees: world y is the line.
-        bound = ToolPoseBound.line("x", lower=-1.0, upper=1.0)
-        anchor_q = axis_angle([0, 0, 1], math.pi / 2).unsqueeze(0)
-        on_line = tool_pose_bound_violation(
-            bound,
-            torch.tensor([[0.0, 0.5, 0.0]]),
-            IDENTITY.unsqueeze(0),
-            torch.zeros(1, 3),
-            anchor_q,
-            metric=False,
+
+class TestFactories:
+    def test_plane_through_point(self):
+        normal = [0.0, -math.sin(0.5), math.cos(0.5)]
+        bound = ToolPoseBound.plane(normal, point=[0.5, 0.0, 0.4], anchor="base", tolerance=0.002)
+        on_plane = torch.tensor([0.5, 0.0, 0.4]) + 0.3 * torch.tensor([1.0, 0.0, 0.0])
+        off_plane = on_plane + 0.01 * torch.tensor(normal)
+        assert tool_pose_bound_violation(bound, on_plane, IDENTITY, ORIGIN, IDENTITY).max() == 0.0
+        violation = tool_pose_bound_violation(bound, off_plane, IDENTITY, ORIGIN, IDENTITY)
+        assert violation[2].item() == pytest.approx(0.008, abs=1e-4)
+
+    def test_plane_half_space(self):
+        bound = ToolPoseBound.plane(max_distance=None, anchor="base")
+        below = tool_pose_bound_violation(
+            bound, torch.tensor([0.0, 0.0, -0.1]), IDENTITY, ORIGIN, IDENTITY
         )
-        off_line = tool_pose_bound_violation(
-            bound,
-            torch.tensor([[0.5, 0.0, 0.0]]),
-            IDENTITY.unsqueeze(0),
-            torch.zeros(1, 3),
-            anchor_q,
-            metric=False,
+        above = tool_pose_bound_violation(
+            bound, torch.tensor([0.0, 0.0, 0.5]), IDENTITY, ORIGIN, IDENTITY
         )
-        assert on_line.sum().item() == pytest.approx(0.0, abs=1e-6)
-        assert off_line[0, 1].item() == pytest.approx(0.5, abs=1e-6)
+        assert below[2].item() > 0.09 and above.max() == 0.0
 
-    def test_tolerance_accepts_small_violation(self):
-        bound = ToolPoseBound.plane("z", anchor="base", tolerance=0.005)
-        position = torch.tensor([[0.0, 0.0, 0.004]])
-        args = (position, IDENTITY.unsqueeze(0), torch.zeros(1, 3), IDENTITY.unsqueeze(0))
-        assert tool_pose_bound_violation(bound, *args, metric=True).sum().item() == 0.0
-        assert tool_pose_bound_violation(bound, *args, metric=False)[0, 2].item() > 0.0
+    def test_line_segment(self):
+        direction = torch.tensor([0.0, 1.0, 1.0]) / math.sqrt(2.0)
+        point = torch.tensor([0.1, 0.0, 0.2])
+        bound = ToolPoseBound.line(direction.tolist(), point.tolist(), -0.1, 0.1, anchor="base")
+        inside = point + 0.05 * direction
+        beyond = point + 0.2 * direction
+        aside = inside + torch.tensor([0.01, 0.0, 0.0])
+        violation = [
+            tool_pose_bound_violation(bound, p, IDENTITY, ORIGIN, IDENTITY)
+            for p in (inside, beyond, aside)
+        ]
+        assert violation[0].max() == 0.0
+        assert violation[1][2].item() == pytest.approx(0.1, abs=1e-4)
+        assert violation[2][:2].max().item() == pytest.approx(0.008, abs=1e-4)
 
+    def test_axis_tilt_fixed_elevation(self):
+        # Approach axis (tool z) 20 degrees above the horizon, in any heading and roll.
+        bound = ToolPoseBound.axis_tilt(min_angle=70 * DEG, max_angle=70 * DEG, anchor="base")
+        pitched = rotation([0, 1, 0], 70 * DEG)
+        for q in (
+            pitched,
+            _quat_mul(rotation([0, 0, 1], 2.0), pitched),
+            _quat_mul(pitched, rotation([0, 0, 1], -1.0)),
+        ):
+            assert tool_pose_bound_violation(bound, ORIGIN, q, ORIGIN, IDENTITY).max() == 0.0
+        steeper = rotation([0, 1, 0], 60 * DEG)
+        assert tool_pose_bound_violation(bound, ORIGIN, steeper, ORIGIN, IDENTITY)[3] > 0.0
 
-def _poses(start_p, goal_p, goal_q=None):
-    start = ToolPose(
-        tool_frames=["ee"],
-        position=start_p.view(-1, 1, 1, 3),
-        quaternion=IDENTITY.expand(start_p.shape[0], 1, 1, 4).contiguous(),
-    )
-    n, g = goal_p.shape[0], goal_p.shape[1]
-    if goal_q is None:
-        goal_q = IDENTITY.expand(n, 1, 1, g, 4).contiguous()
-    goal = GoalToolPose(tool_frames=["ee"], position=goal_p.view(n, 1, 1, g, 3), quaternion=goal_q)
-    return start, goal
+    def test_axis_tilt_other_tool_axis(self):
+        bound = ToolPoseBound.axis_tilt(
+            (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), max_angle=0.1, anchor="base"
+        )
+        x_up = rotation([0, 1, 0], -90 * DEG)
+        assert tool_pose_bound_violation(bound, ORIGIN, x_up, ORIGIN, IDENTITY).max() == 0.0
+        assert tool_pose_bound_violation(bound, ORIGIN, IDENTITY, ORIGIN, IDENTITY)[3] > 1.0
+
+    @pytest.mark.parametrize("axis, index", [([1, 0, 0], 5), ([0, 1, 0], 3), ([0, 0, 1], 4)])
+    def test_orientation_box_axes(self, axis, index):
+        """Rotations about the goal x, y, z axes map to roll, tilt - 90 deg and yaw."""
+        bound = ToolPoseBound.orientation_box(0.1, 0.2, 0.3)
+        goal = rotation([0.3, -0.2, 0.9], 0.8)
+        q = _quat_mul(goal, rotation(axis, 0.05))
+        c, parallel = components(bound, quaternion=q, anchor_q=goal)
+        expected = [0.0, 0.0, 0.0]
+        expected[{5: 2, 3: 0, 4: 1}[index]] = 0.05
+        assert not parallel
+        assert [c[3].item() - math.pi / 2, c[4].item(), c[5].item()] == pytest.approx(
+            expected, abs=1e-4
+        )
+        assert tool_pose_bound_violation(bound, ORIGIN, q, ORIGIN, goal).max() == 0.0
+
+    def test_orientation_box_limits(self):
+        bound = ToolPoseBound.orientation_box(0.1, 0.2, 0.3, tolerance=0.0)
+        for axis, limit in (([1, 0, 0], 0.1), ([0, 1, 0], 0.2), ([0, 0, 1], 0.3)):
+            inside = rotation(axis, limit - 0.01)
+            outside = rotation(axis, limit + 0.05)
+            assert tool_pose_bound_violation(bound, ORIGIN, inside, ORIGIN, IDENTITY).max() == 0.0
+            assert tool_pose_bound_violation(bound, ORIGIN, outside, ORIGIN, IDENTITY).max() > 0.04
+
+    def test_orientation_box_pitch_limit(self):
+        with pytest.raises(ValueError, match="max_pitch"):
+            ToolPoseBound.orientation_box(max_pitch=1.5)
+        assert ToolPoseBound.orientation_box(max_roll=0.1).tilt == pytest.approx(
+            (10 * DEG, 170 * DEG)
+        )
 
 
 class TestFindViolations:
-    def test_all_satisfied(self):
-        bound = ToolPoseBound.plane("z", anchor="base")
-        start, goal = _poses(torch.tensor([[0.1, 0.0, 0.0]]), torch.tensor([[[0.5, 0.2, 0.0]]]))
-        assert find_tool_pose_bound_violations({"ee": bound}, start, goal) == []
-
-    def test_start_violation_reported_per_problem(self):
-        bound = ToolPoseBound.plane("z", anchor="base", tolerance=0.001)
-        start, goal = _poses(
-            torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.1]]),
-            torch.tensor([[[0.5, 0.0, 0.0]], [[0.5, 0.0, 0.0]]]),
+    def setup_method(self):
+        self.start = ToolPose(
+            tool_frames=["ee"],
+            position=torch.zeros(1, 1, 1, 3),
+            quaternion=IDENTITY.view(1, 1, 1, 4).clone(),
         )
-        messages = find_tool_pose_bound_violations({"ee": bound}, start, goal)
+
+    def goal(self, *zs):
+        position = torch.zeros(1, 1, 1, len(zs), 3)
+        position[..., 2] = torch.tensor(zs)
+        quaternion = IDENTITY.view(1, 1, 1, 1, 4).repeat(1, 1, 1, len(zs), 1)
+        return GoalToolPose(tool_frames=["ee"], position=position, quaternion=quaternion)
+
+    def test_feasible(self):
+        bounds = {
+            "ee": [
+                ToolPoseBound.plane(anchor="base"),
+                ToolPoseBound.axis_tilt(max_angle=0.1, anchor="start"),
+            ]
+        }
+        assert find_tool_pose_bound_violations(bounds, self.start, self.goal(0.0)) == []
+
+    def test_goal_violation_names_bound_and_component(self):
+        bounds = {
+            "ee": [
+                ToolPoseBound.axis_tilt(max_angle=0.1, anchor="base"),
+                ToolPoseBound.plane(anchor="base"),
+            ]
+        }
+        messages = find_tool_pose_bound_violations(bounds, self.start, self.goal(0.05))
         assert len(messages) == 1
-        assert "problem 1" in messages[0] and "start" in messages[0] and "z by" in messages[0]
+        assert "goal violates bound 1: z by" in messages[0]
 
-    def test_goal_violation_against_start_anchor(self):
-        bound = ToolPoseBound.plane("z", anchor="start")
-        start, goal = _poses(torch.tensor([[0.0, 0.0, 0.2]]), torch.tensor([[[0.5, 0.0, 0.0]]]))
-        messages = find_tool_pose_bound_violations({"ee": bound}, start, goal)
-        assert len(messages) == 1 and "goal violates" in messages[0]
+    def test_start_violation(self):
+        bounds = {"ee": ToolPoseBound.plane(point=[0.0, 0.0, 0.1], anchor="base")}
+        messages = find_tool_pose_bound_violations(bounds, self.start, self.goal(0.1))
+        assert len(messages) == 1 and "start violates" in messages[0]
 
-    def test_goalset_needs_one_feasible_goal(self):
-        bound = ToolPoseBound.plane("z", anchor="base")
-        start = torch.tensor([[0.0, 0.0, 0.0]])
-        one_feasible = torch.tensor([[[0.5, 0.0, 0.3], [0.5, 0.0, 0.0]]])
-        none_feasible = torch.tensor([[[0.5, 0.0, 0.3], [0.5, 0.0, 0.1]]])
-        assert find_tool_pose_bound_violations({"ee": bound}, *_poses(start, one_feasible)) == []
-        assert (
-            len(find_tool_pose_bound_violations({"ee": bound}, *_poses(start, none_feasible))) == 1
-        )
+    def test_one_feasible_goal_in_set_is_enough(self):
+        bounds = {"ee": ToolPoseBound.plane(anchor="base")}
+        assert find_tool_pose_bound_violations(bounds, self.start, self.goal(0.3, 0.0)) == []
 
-    def test_goal_anchor_start_feasible_for_any_goal(self):
-        # Line along goal z: start lies on the line of the second goal only.
-        bound = ToolPoseBound.line("z", lower=-0.2, upper=0.0)
-        start = torch.tensor([[1.0, 0.0, -0.1]])
-        goals = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
-        assert find_tool_pose_bound_violations({"ee": bound}, *_poses(start, goals)) == []
+    def test_goal_anchored_start_uses_best_goal(self):
+        # The start lies on the plane of the second goal only.
+        bounds = {"ee": ToolPoseBound.plane()}
+        assert find_tool_pose_bound_violations(bounds, self.start, self.goal(0.3, 0.0)) == []
+        messages = find_tool_pose_bound_violations(bounds, self.start, self.goal(0.3))
+        assert "start violates" in messages[0]

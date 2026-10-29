@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from curobo._src.collision.attachment_manager import AttachmentManager
-from curobo._src.cost.tool_pose_bound import ToolPoseBound, find_tool_pose_bound_violations
+from curobo._src.cost.tool_pose_bound import (
+    ToolPoseBound,
+    ToolPoseBounds,
+    find_tool_pose_bound_violations,
+    normalize_tool_pose_bounds,
+)
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.collision.collision_scene import create_scene_collision
 from curobo._src.geom.types import SceneCfg
@@ -54,7 +59,7 @@ class MotionPlanner:
         self.device_cfg = config.device_cfg
         self.scene_collision_checker = None
         self._destroyed = False
-        self._tool_pose_bounds: Dict[str, ToolPoseBound] = {}
+        self._tool_pose_bounds: Dict[str, List[ToolPoseBound]] = {}
         self._initialize_components()
 
     def _initialize_components(self):
@@ -449,7 +454,7 @@ class MotionPlanner:
         """Plan a grasp motion: goalset -> approach -> grasp -> lift.
 
         Note:
-            Tool pose criteria set before this call, including ``ToolPoseCriteria.bound``, apply
+            Tool pose criteria set before this call, including ``ToolPoseCriteria.bounds``, apply
             to the goalset and approach phases only. The grasp and lift phases use fixed
             linear-motion criteria without bounds, and all tool frames are reset to default
             criteria when the call returns.
@@ -659,28 +664,30 @@ class MotionPlanner:
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.ik_solver.update_tool_pose_criteria(tool_pose_criteria)
         self.trajopt_solver.update_tool_pose_criteria(tool_pose_criteria)
-        self._track_tool_pose_bounds({k: v.bound for k, v in tool_pose_criteria.items()})
+        self._track_tool_pose_bounds({k: v.bounds for k, v in tool_pose_criteria.items()})
 
-    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
-        """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria.
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, ToolPoseBounds]):
+        """Replace the tool pose bounds of the given tool frames, keeping the other criteria.
 
         Bounds are enforced over the whole trajectory, and :meth:`plan_pose` raises if the start
         state or every goal violates them. The graph planner ignores bounds; its seeds are
         corrected by trajectory optimization.
 
         Args:
-            tool_pose_bounds: Map from tool frame name to its bound.
+            tool_pose_bounds: Map from tool frame name to a bound, a list of bounds, or ``None``
+                to clear.
         """
         self.ik_solver.update_tool_pose_bounds(tool_pose_bounds)
         self.trajopt_solver.update_tool_pose_bounds(tool_pose_bounds)
         self._track_tool_pose_bounds(tool_pose_bounds)
 
-    def _track_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
-        for name, bound in tool_pose_bounds.items():
-            if bound is None:
-                self._tool_pose_bounds.pop(name, None)
+    def _track_tool_pose_bounds(self, tool_pose_bounds: Dict[str, ToolPoseBounds]):
+        for name, bounds in tool_pose_bounds.items():
+            bounds = normalize_tool_pose_bounds(bounds)
+            if bounds:
+                self._tool_pose_bounds[name] = bounds
             else:
-                self._tool_pose_bounds[name] = bound
+                self._tool_pose_bounds.pop(name, None)
 
     def _check_tool_pose_bounds(self, goal_tool_poses: GoalToolPose, current_state: JointState):
         """Raise if the start state or every goal violates a tool pose bound."""
