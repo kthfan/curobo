@@ -563,6 +563,17 @@ class TestToolPoseCostRotationGradientScale:
         cost_val, _, _, _ = cost.forward(current, goal, idxs_goal)
         return cost_val.sum().item(), cost._out_rotation_gradient.view(4).cpu().clone()
 
+    def test_axis_angle_rotation_cost_has_half_factor(self, scale_device_cfg):
+        """The rotation distance is 0.5 * w * theta^2, like the position distance."""
+        cfg = ToolPoseCostCfg(
+            weight=[1.0, 2.0], tool_frames=["ee_link"], device_cfg=scale_device_cfg
+        )
+        cost = ToolPoseCost(cfg)
+        cost.setup_batch_tensors(batch_size=1, horizon=1)
+        quaternion = _quat_exp_wxyz(torch.tensor([0.0, 0.0, 0.5]))
+        value, _ = self._evaluate(cost, quaternion, scale_device_cfg)
+        assert value == pytest.approx(0.5 * 2.0 * 0.5**2, rel=1e-4)
+
     @pytest.mark.parametrize("use_lie_group", [False, True])
     @pytest.mark.parametrize(
         "rotation_vector", [[0.3, 0.0, 0.0], [0.5, -0.4, 0.2], [0.0, 2.0, 0.5]]

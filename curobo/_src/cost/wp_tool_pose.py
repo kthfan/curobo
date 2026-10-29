@@ -140,7 +140,8 @@ def compute_rotation_error_axis_angle(
 
     This function computes the relative rotation first, then converts to axis angle representation.
     The axis angle representation is then weighted and converted back to a quaternion rate as the
-    gradient. The distance is the dot product of the weighted axis angle with itself.
+    gradient. The distance is half the squared norm of the weighted axis angle, matching the
+    ``0.5 * w * |delta|^2`` position distance, so the seed IK reads both gradients as residuals.
 
     Args:
         current_quat: The current quaternion. In x, y, z, w format.
@@ -183,7 +184,7 @@ def compute_rotation_error_axis_angle(
     # Compute the angular distance
     # Apply rotation weight
 
-    angular_distance = rotation_weight * wp.dot(omega, omega)
+    angular_distance = 0.5 * rotation_weight * wp.dot(omega, omega)
 
     # Initialize gradient as zero quaternion
     gradient_as_angular_velocity = wp.vec3(0.0, 0.0, 0.0)
@@ -191,8 +192,8 @@ def compute_rotation_error_axis_angle(
     if angular_distance < convergence_tolerance:
         angular_distance = 0.0
     else:
-        # Scale factor for gradient
-        scale_factor = 2.0
+        # d(0.5 * w * |omega|^2) / d omega = w * omega
+        scale_factor = 1.0
 
         if quaternion_delta[3] < 0.0:
             scale_factor = -1.0 * scale_factor
