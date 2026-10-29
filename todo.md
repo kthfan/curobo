@@ -41,15 +41,28 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   most 1–2 cm in measured plans), and a 5 mm plate on the path was already rejected before the
   change. Both checks sample the motion, so thinner obstacles than one step can still be missed;
   see the swept check under "Future work".
-- [ ] **P2 – Graph planner ignores meshes.** Graph seeds can be mesh-infeasible, wasting
-  trajopt attempts. Add an option to run the mesh constraint in the graph planner's edge
-  validation rollout (`graph_planner_rollout`).
+- [ ] **P2 – Graph planner ignores meshes.** Its feasibility rollout (`graph_planner_rollout`,
+  `metrics_base.yml`) never gets the mesh constraint, so node and edge checks are sphere-only.
+  Its paths only seed TrajOpt, which applies the mesh check, so this costs attempts, not
+  correctness. The graph planner needs no gradient, so it should check with the exact geometry,
+  but mesh-only paths may squeeze through gaps the inflated optimizer spheres push away from.
+  **Benchmark first**: add a narrow-passage scene to `benchmark/mesh_collision_benchmark.py`
+  and, for plans that reach the graph attempts, compare graph rollout = spheres / mesh /
+  spheres + mesh on graph query time, `plan_pose` success, total time and the share of graph
+  seeds TrajOpt accepts.
 - [ ] **P3 – Mesh self-collision.** Self-collision is sphere-only. A mesh self-collision
   check needs a per-robot list of link pairs to test (reuse the sphere self-collision
   ignore matrix) and a triangle-triangle kernel between robot links.
-- [ ] **P2 – Verify MPC behaviour.** The constraint is part of the MPC metrics rollout.
-  Check what MPC does with a mesh-infeasible step (does it still execute the action, does it
-  report it) and document or change it.
+- [ ] **P2 – MPC executes infeasible actions.** `MPCSolverResult.success` is the feasibility of
+  the whole horizon (mesh check included), but `optimize_next_action` / `optimize_action_sequence`
+  return the optimized actions regardless. A safe-deceleration fallback for the first
+  `2 * interpolation_steps` steps exists but is disabled (`if ... and False:` in
+  `MPCSolver._solve_impl`, since the initial release), for every constraint, not only meshes.
+  With inflated cost spheres mesh-infeasible steps should be rare (goal pulling into an
+  obstacle, fast dynamic obstacles, coverage gaps), and with exact mesh metrics they are rarely
+  false alarms, so acting on them becomes practical. To decide: split near-term feasibility
+  (act now) from far-horizon feasibility (warning); reaction (decelerate with the existing,
+  untested code / stop / report only); all constraints or scene collision only.
 
 ## 3. Integration
 
@@ -80,6 +93,15 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   only reachable on the internal cost object. Surface the colliding link and time step in
   the solver result or status, so a failed plan says "mesh collision: panda_hand at step 12"
   instead of a generic failure.
+- [ ] **P2 – "Inflated spheres for gradients, exact meshes for checking" mode.** Option to drop
+  the sphere scene-collision constraint from the metrics rollouts when the mesh check is on,
+  so success is decided by the exact geometry, while the optimizers keep sphere costs inflated
+  by `optimizer_collision_activation_distance` (cost-only: `radius + eta`; do not use
+  `collision_sphere_buffer`, which also inflates metrics and self-collision spheres). Needs a
+  coverage guard (every sphere link has mesh slots, ignored links excepted), a positive
+  `mesh_collision_margin` to absorb decimation shrinkage, and self-collision stays sphere-based.
+  Measure success in tight spaces and goal accuracy near obstacles for several activation
+  distances.
 - [ ] **P2 – No gradient in mesh-only collisions.** When the spheres are clear but a mesh
   collides, the optimizer has nothing to follow and only re-seeding helps. Prefer improving
   the spheres (see "Future work") over adding a mesh gradient; at minimum, document the
