@@ -93,6 +93,15 @@ def test_resolve_default_skips_collision_meshes(fake_robot_cfg):
     assert not robot_config.load_collision_meshes
 
 
+def test_resolve_does_not_alias_a_shared_metrics_dict(fake_robot_cfg, metrics_base_dict):
+    """Solvers modify the resolved dict, so a dict shared between solvers must be copied."""
+    reference = load_yaml(join_path(get_task_configs_path(), "metrics_base.yml"))
+    _, _, metrics_dict, _, _ = _resolve(DeviceCfg(), metrics_rollout=metrics_base_dict)
+    assert metrics_dict is not metrics_base_dict
+    metrics_dict["rollout"]["constraint_cfg"] = object()
+    assert metrics_base_dict == reference
+
+
 def test_resolve_mesh_collision_check_loads_meshes(fake_robot_cfg):
     robot_config, _, metrics_dict, _, _ = _resolve(
         DeviceCfg(), mesh_collision_check=True, mesh_collision_margin=0.001
