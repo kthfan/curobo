@@ -10,7 +10,7 @@ Limits are described with {py:class}`~curobo.types.ToolPoseBound` and set per to
 the motion planner, IK, trajectory optimization, or MPC. The cost that enforces them is part of
 the default IK, trajectory optimization, and MPC configurations, so no config change is needed.
 
-## Set a bound
+## Set bounds
 
 ```python
 from curobo import MotionPlanner, MotionPlannerCfg
@@ -19,98 +19,132 @@ from curobo.types import ToolPoseBound
 planner = MotionPlanner(MotionPlannerCfg.create(robot="franka.yml"))
 tool_frame = planner.tool_frames[0]
 
-# Keep the tool on the plane through its start pose, normal to the start tool z axis.
-planner.update_tool_pose_bounds({tool_frame: ToolPoseBound.plane("z", anchor="start")})
+# Keep the tool at its start height and its z axis within 10 degrees of the start z axis.
+planner.update_tool_pose_bounds(
+    {
+        tool_frame: [
+            ToolPoseBound.plane((0.0, 0.0, 1.0), anchor="start", reference_axes="base"),
+            ToolPoseBound.axis_tilt(max_angle=0.17, anchor="start"),
+        ]
+    }
+)
 result = planner.plan_pose(goal_tool_poses, current_state)
 
-# Remove the bound again.
+# Remove the bounds again.
 planner.update_tool_pose_bounds({tool_frame: None})
 ```
 
-`update_tool_pose_bounds` only changes the bound; the other tool pose criteria of the frame are
-kept. The same method exists on {py:class}`~curobo.inverse_kinematics.InverseKinematics`,
+A tool frame takes one bound or a list of bounds, and a pose must satisfy all of them. Up to
+four bounds per tool frame are supported by default (`eef_bound_cfg.max_bounds_per_tool_frame`
+in the task configs).
+
+`update_tool_pose_bounds` replaces the bounds of the given tool frames and keeps their other
+tool pose criteria. The same method exists on
+{py:class}`~curobo.inverse_kinematics.InverseKinematics`,
 {py:class}`~curobo.trajectory_optimizer.TrajectoryOptimizer`, and
 {py:class}`~curobo.model_predictive_control.ModelPredictiveControl`. Bounds can be changed
-between calls without re-creating the solver or recapturing CUDA graphs.
+between calls without re-creating the solver or recapturing CUDA graphs. Bounds can also be
+passed through the `bounds` field of {py:class}`~curobo.types.ToolPoseCriteria` when you set
+the full criteria with `update_tool_pose_criteria`.
 
-A bound can also be passed through the `bound` field of
-{py:class}`~curobo._src.cost.tool_pose_criteria.ToolPoseCriteria` when you set the full
-criteria with `update_tool_pose_criteria`.
+## Use the common shapes
+
+The factory methods take plain vectors and angles:
+
+| Motion | Bound |
+| --- | --- |
+| Slide on the table plane at height 0.4 m | `ToolPoseBound.plane((0, 0, 1), point=(0, 0, 0.4), anchor="base")` |
+| Stay above the table | `ToolPoseBound.plane((0, 0, 1), point=(0, 0, 0.4), max_distance=None, anchor="base")` |
+| Stay within ±3 mm of the start height | `ToolPoseBound.plane((0, 0, 1), min_distance=-0.003, max_distance=0.003, anchor="start", reference_axes="base")` |
+| Slide on a plane through `p0` with normal `n` | `ToolPoseBound.plane(n, point=p0, anchor="base")` |
+| Move along the goal z axis, within 12 cm before the goal | `ToolPoseBound.line((0, 0, 1), min_along=-0.12, max_along=0.0)` |
+| Drop vertically onto the goal | `ToolPoseBound.line((0, 0, 1), min_along=0.0, max_along=0.2, reference_axes="base")` |
+| Keep a cup upright within 10° | `ToolPoseBound.axis_tilt(max_angle=0.17, anchor="base")` |
+| Keep the approach axis (tool z) 20° above the horizon, any heading and roll | `ToolPoseBound.axis_tilt(min_angle=1.22, max_angle=1.22, anchor="base")` |
+| Stay within ±5° roll, pitch and yaw of the goal orientation | `ToolPoseBound.orientation_box(0.087, 0.087, 0.087)` |
+
+Angles are in radians, distances in meters, and vectors and points are expressed in the axes
+selected by `reference_axes` (described below). Combine shapes in a list, for example a plane
+and an `axis_tilt` to slide on a sloped surface while keeping a cup upright.
 
 ## Choose the reference frame
 
-Every bound is expressed in a reference frame
+Every bound measures the tool pose in a reference frame `F`:
 
-```{math}
-T_{ref} = T_{anchor} \cdot T_{offset}
-```
+- **`anchor`** sets the origin of `F` and the axes it starts from:
 
-`anchor` selects {math}`T_{anchor}` and `offset_position` / `offset_quaternion` (wxyz) select
-{math}`T_{offset}`, expressed in the anchor frame.
+  | `anchor` | Origin and axes | Use it for |
+  | --- | --- | --- |
+  | `"goal"` (default) | the goal pose of the tool frame | approach and insertion moves relative to the target |
+  | `"start"` | the tool pose at the start state | keeping the start position or orientation |
+  | `"base"` | the robot base frame | fixed workspace limits such as a table, a wall, or gravity |
 
-| `anchor` | Reference follows | Use it for |
-| --- | --- | --- |
-| `"goal"` (default) | the goal pose of the tool frame | approach and insertion moves relative to the target |
-| `"start"` | the tool pose at the start state | keeping the start position or orientation |
-| `"base"` | the robot base frame | fixed workspace limits such as a table height |
+- **`reference_axes="base"`** keeps the origin at the anchor but takes the axes from the robot
+  base frame, for example a vertical line through the goal.
+- **`reference_rotation`** (wxyz) rotates those axes. The factories set it from the vectors you
+  pass.
 
-Entries of `offset_position` left as `None` are 0, so the reference stays at the anchor along
-that axis. For example, a plane at height 0.4 m in the base frame:
-
-```python
-ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, 0.4])
-```
+All poses are expressed in the robot base frame. If the robot is mounted on a slope, express
+world directions such as "up" in the base frame before passing them.
 
 ```{note}
 In MPC the start state is the current robot state, so a `"start"` reference moves with the
 robot at every step. Use `"goal"` or `"base"` when the reference must stay fixed.
 ```
 
-With a goalset, a `"goal"` bound is satisfied when the pose satisfies the bound of any goal in
-the set.
+With a goalset, `"goal"` bounds are satisfied when the pose satisfies them for any goal in the
+set.
 
-## Describe the limits
+## Write limits directly
 
-Position limits apply to {math}`(x, y, z)` of the tool frame in the reference frame (m). Rotation
-limits apply to the swing-twist decomposition of the tool orientation relative to the reference
-about the reference z axis (rad):
+For limits the factories do not cover, set the components of
+{py:class}`~curobo.types.ToolPoseBound` directly. Each takes `None` (no limit), a number
+(equality), or a `(lower, upper)` pair whose ends may be `None`.
 
-- `swing_x`, `swing_y`: where the tool z axis points (tilt).
-- `twist`: rotation about the tool z axis.
-- `max_swing`: a cone, the largest tilt in any direction.
+- **`x`, `y`, `z`** (m): the tool frame origin relative to the anchor, along the axes of `F`.
+- **`tilt`** (rad, 0 to π): the angle between the tool axis and the reference axis.
+- **`yaw`** (rad): the direction the tool axis tilts toward, measured about the reference axis
+  from the x axis of `F`.
+- **`roll`** (rad): the rotation of the tool about the tool axis.
 
-Each component has an optional `[lower, upper]`; `None` leaves that side unbounded. Every
-interval must contain the reference (value 0). Move the reference with the offset instead of
-using an interval that excludes 0.
+The reference axis is the z axis of `F`. The tool axis is the z axis of the tool frame rotated
+by `tool_rotation` (wxyz); `tool_rotation` does not move the point whose position is limited.
+In other words, the orientation of the tool axis frame relative to `F` is
+`Rz(yaw) · Ry(tilt) · Rz(roll)`.
 
-| Motion | Bound |
-| --- | --- |
-| Slide on a plane | `ToolPoseBound.plane("z")` |
-| Move along the goal z axis, within 12 cm before the goal | `ToolPoseBound.line("z", lower=-0.12, upper=0.0)` |
-| Stay in a height band of ±3 mm | `ToolPoseBound(position_lower=[None, None, -0.003], position_upper=[None, None, 0.003])` |
-| Stay above the reference | `ToolPoseBound(position_lower=[None, None, 0.0])` |
-| Keep upright within 5° and limit twist to ±5° | `ToolPoseBound(max_swing=0.087, rotation_lower=[None, None, -0.087], rotation_upper=[None, None, 0.087])` |
+```python
+import math
 
-Position and rotation limits can be combined in one bound.
+# Approach axis 20 degrees above the horizon, roll fixed, heading free.
+ToolPoseBound(anchor="base", tilt=math.radians(70), roll=0.0)
 
-## Tune margin and tolerance
+# Inside a box around the start position, with the tool z axis within 30 degrees of vertical.
+ToolPoseBound(anchor="start", reference_axes="base",
+              x=(-0.1, 0.1), y=(-0.1, 0.1), z=(0.0, 0.2), tilt=(None, math.radians(30)))
+```
 
-The optimizer and the feasibility check read the limits differently:
+`yaw` and `roll` intervals need both ends and may cross ±π, for example `roll=(3.0, 3.4)`.
+They are undefined when the tool axis is parallel to the reference axis, so they can only be
+limited together with a `tilt` interval at least 10° away from 0 and π. To limit roll, pitch,
+and yaw near a reference orientation, use `orientation_box`, which picks a tool axis
+perpendicular to the reference axis.
 
-- The optimization cost moves each finite side inward by `position_margin` (default 1 mm) or
-  `rotation_margin` (default 0.01 rad), never past the reference. Paths then stay inside your
-  interval instead of settling just outside its edge.
-- The feasibility check uses your interval as given. A side the cost could not move inward by
-  the full margin, such as both sides of a plane or a line, is widened by `position_tolerance`
-  (default 2 mm) or `rotation_tolerance` (default 0.02 rad).
+## Tune the tolerance
+
+Each bound has a `position_tolerance` (default 2 mm) and a `rotation_tolerance` (default
+0.02 rad); the factories take a single `tolerance`. The optimizer and the feasibility check use
+it differently:
+
+- **Inequality limits** (an interval wider than the tolerance, or one-sided): the feasibility
+  check uses your interval as given, and the optimization cost moves each side inward by half
+  the tolerance, so paths stay inside instead of settling on the edge.
+- **Equality limits** (a number, or an interval no wider than the tolerance, such as `plane`,
+  `line`, or a fixed `tilt`): the cost pulls to the center, and the feasibility check accepts
+  errors up to the tolerance. A tolerance of 0 makes an equality infeasible.
 
 Adjust them as follows:
 
-- **Equality limits** (`plane`, `line`, and any side within the margin of the reference) are
-  accepted only within the tolerance. Pass `tolerance=` to `plane` / `line`, or set the
-  tolerance fields.
-  A tolerance of 0 makes an equality infeasible.
-- **Planning fails although the path looks close to the edge**: increase the margin.
+- **Planning fails although the path looks close to the limit**: increase the tolerance.
 - **The path should stay closer to the reference**: increase `eef_bound_cfg.weight` in the IK,
   trajectory optimization, and MPC task configs (default `1e5`). A higher weight competes more
   strongly with the other costs, such as collision avoidance.
@@ -121,17 +155,18 @@ Adjust them as follows:
 between two waypoints separately. A `"goal"` bound refers to the waypoint that ends the segment
 and a `"start"` bound to the waypoint that starts it.
 
-- To bound one segment, set `bound` on that segment's criteria.
+- To bound one segment, set `bounds` on that segment's criteria.
 - To bound every segment, call `update_tool_pose_bounds` on the multi-waypoint planner. The
-  bound applies to each segment whose criteria leave the tool frame unbounded, and stays set
-  until you clear it with `None`.
+  bounds apply to each segment whose criteria leave the tool frame unbounded, and stay set
+  until you clear them with `None`.
 
 ```python
 from curobo.types import ToolPoseBound, ToolPoseCriteria
 
 frame = planner.tool_frames[0]
 insert = ToolPoseCriteria.track_position_and_orientation()
-insert.bound = ToolPoseBound.line("z", lower=-0.12, upper=0.0)  # along the goal z axis onto at_part
+# Along the goal z axis onto at_part.
+insert.bounds = [ToolPoseBound.line((0, 0, 1), min_along=-0.12, max_along=0.0)]
 result = planner.plan_waypoints(
     [above_part, at_part],
     start_state,
@@ -179,16 +214,17 @@ whose non-terminal weights are 0 on the axes of free motion, such as `linear_mot
 distance to the goal, and a trajectory tolerance would reject almost every path.
 
 Bounds and trajectory tolerances can be combined. Prefer bounds for one-sided limits, limits
-relative to the start or the robot base, and limits on the tool's tilt or twist.
+relative to the start or the robot base, and limits on the tool's tilt, yaw, or roll.
 
 ## Handle errors
 
 | Error | Cause | Fix |
 | --- | --- | --- |
-| `interval [...] does not contain the reference pose (0)` | an interval excludes the reference | move the reference with `offset_position` / `offset_quaternion` |
-| `Tool pose bounds are violated: ... start violates ...` | the start state is outside a bound | start inside the bound, or loosen it |
-| `Tool pose bounds are violated: ... goal violates ...` | every goal is outside a bound | change the goal or loosen the bound |
+| `yaw and roll are undefined when the tool axis is parallel ...` | `yaw` or `roll` is limited without a `tilt` interval away from 0 and π | choose `tool_rotation` so the tool axis is perpendicular to the reference axis, or use `orientation_box` |
+| `Tool pose bounds are violated: ... start violates bound i: ...` | the start state is outside bound `i` | start inside the bound, or loosen it |
+| `Tool pose bounds are violated: ... goal violates bound i: ...` | every goal is outside bound `i` | change the goal or loosen the bound |
 | `a goal-anchored bound needs goal poses ...` | a `"goal"` bound on a solve without a tool goal | use `"base"` or `"start"` |
+| `... at most 4 are supported (EEFBoundCostCfg.max_bounds_per_tool_frame)` | too many bounds for one tool frame | combine limits into fewer bounds, or raise the setting |
 
 ## Limitations
 
@@ -197,3 +233,5 @@ relative to the start or the robot base, and limits on the tool's tilt or twist.
 - {py:meth}`~curobo.motion_planner.MotionPlanner.plan_grasp` applies bounds to the goalset and
   approach phases only. The grasp and lift phases use their own linear-motion criteria, and the
   criteria of all tool frames are reset when the call returns.
+- Limits are planes, lines, boxes, and angle ranges. Curved paths, such as an arc around a door
+  hinge, are not covered.
