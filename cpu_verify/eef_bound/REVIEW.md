@@ -130,3 +130,15 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 - 等式軸（`plane`、`line` 的側向）不受 margin 影響（cost 區間固定為 0），只受權重影響；1e4 時 `line` 成功率 75%，1e5 與 1e6 為 100%。
 - 規劃結果中等式軸的最大偏移接近 tolerance（1e5 時 plane 約 1.9 mm / tol 2 mm、line 約 2.5–2.9 mm / tol 3 mm），RMS 則小得多（0.8 mm、1.0 mm）；1e6 時 RMS 降到 0.25 mm、0.38 mm。MPC（每步都評估）在 1e5 時偏移僅 0.3 mm，推測規劃的最大偏移出現在優化取樣點之間（插值後的軌跡），待確認。
 - 每組只有 8 個 goal，相同設定（例如 plane 不同 margin）之間 75% 與 100% 的差異屬雜訊，不宜據此挑選設定。
+
+## GPU 驗證（Kaggle 2×T4，第二版 API，`ea8b66e`）
+
+- 單元測試：cost、multi-waypoint、solver 全部通過；`gpu_check.py` 19/19。
+- 二分定位：平面/帶狀成功率下降（1e5：100% → 62%/50%）來自旋轉梯度修正 `27f548b`，與重新設計
+  及 `dev/main` 的其他 commit 無關。原因是旋轉 cost 為 `w·θ²`（位置為 `0.5·w·|Δp|²`），梯度修正後
+  seed IK（LM，視梯度為 `Jᵀ·殘差`）的旋轉步長加倍。改為 `0.5·w·θ²`（`2dfdd4d`）後恢復：
+  plane/band 在 1e4–1e6 皆 100%（tolerance 1 mm、權重 1e4 的 plane 為 88%）；line 1e5 為 88%、1e6 為 100%；
+  orientation 100%；MPC 100%，max |dz| 0.18–0.32 mm。
+- 另修：`resolve_yaml_configs` 複製 metrics rollout dict（`c870790`），否則 `dev/main` 的
+  `MotionPlanner` 無法建立。
+- 待決：`dev/main` 尚未包含 `c870790`、`2dfdd4d`。
