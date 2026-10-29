@@ -313,8 +313,11 @@ def resolve_yaml_configs(
         Tuple of (robot_config, optimizer_dicts, metrics_rollout_dict,
         transition_model_dict, scene_model_dict).
     """
-    # Resolve metrics rollout first: it decides whether collision meshes are needed.
-    metrics_rollout_dict = resolve_config(join_path(get_task_configs_path(), metrics_rollout))
+    # Resolve metrics rollout first: it decides whether collision meshes are needed. The solver
+    # modifies the returned dict, so copy it: callers may share one dict between solvers.
+    metrics_rollout_dict = deepcopy(
+        resolve_config(join_path(get_task_configs_path(), metrics_rollout))
+    )
     if mesh_collision_check:
         metrics_rollout_dict = enable_mesh_collision(metrics_rollout_dict, mesh_collision_margin)
 
