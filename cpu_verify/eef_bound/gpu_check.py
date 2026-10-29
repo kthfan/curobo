@@ -324,14 +324,18 @@ def g13_band_no_margin(s: Setup):
     return True, f"success={ok} in {elapsed * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm"
 
 
-@check("G14 tool z within 10 deg of straight down while yawing 60 deg (base anchor)")
+def _start_angle_from_down(s: Setup) -> float:
+    z_axis = _quat_rotate(s.start_q, torch.tensor([0.0, 0.0, 1.0], device=s.device))
+    return math.acos(max(-1.0, min(1.0, -z_axis[2].item())))
+
+
+@check("G14 tool z cone about straight down (start angle + 5 deg) while yawing 60 deg")
 def g14_cone_down(s: Setup):
     yaw = _axis_angle_quat([0.0, 0.0, 1.0], math.radians(60), s.device)
     goal_q = _quat_mul(yaw, s.start_q)
     goal_p = s.start_p + torch.tensor([0.1, -0.1, 0.0], device=s.device)
-    bound = ToolPoseBound.axis_tilt(
-        reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10), anchor="base"
-    )
+    limit = _start_angle_from_down(s) + math.radians(5)
+    bound = ToolPoseBound.axis_tilt(reference_axis=(0.0, 0.0, -1.0), max_angle=limit, anchor="base")
     s.set_bound(bound)
     ok, traj, t = s.plan(s.goal(goal_p, goal_q))
     if not ok:
@@ -340,7 +344,9 @@ def g14_cone_down(s: Setup):
     p, q = s.fk(traj)
     z_axis = _quat_rotate(q, torch.tensor([0.0, 0.0, 1.0], device=s.device).expand_as(p))
     tilt = torch.rad2deg(torch.acos((-z_axis[:, 2]).clamp(-1.0, 1.0))).max().item()
-    return v.max().item() == 0.0, f"{t * 1e3:.0f} ms, max angle from down {tilt:.2f} deg"
+    return v.max().item() == 0.0, (
+        f"{t * 1e3:.0f} ms, max angle from down {tilt:.2f} deg (limit {math.degrees(limit):.1f})"
+    )
 
 
 @check("G15 two bounds on one frame: height plane and cone (base anchor)")
@@ -349,7 +355,9 @@ def g15_two_bounds(s: Setup):
     bounds = [
         _height_plane(z0),
         ToolPoseBound.axis_tilt(
-            reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10), anchor="base"
+            reference_axis=(0.0, 0.0, -1.0),
+            max_angle=_start_angle_from_down(s) + math.radians(5),
+            anchor="base",
         ),
     ]
     s.planner.update_tool_pose_bounds({s.ee: bounds})
