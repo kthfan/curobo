@@ -16,8 +16,8 @@ Figures:
   coloured by cost, with the descent direction the kernel reports.
 * ``rotation_gradient.png``: alignment of the orientation gradient with finite differences vs
   goal yaw and vs rotation angle (both should be 1).
-* ``swing_twist.png``: swing/twist components vs rotation-vector components while twisting a
-  fixed 10 degree tilt.
+* ``tilt_yaw_roll.png``: tilt/yaw/roll vs rotation-vector components while a tool pitched up
+  20 degrees yaws about the world z axis and rolls about its own axis.
 * ``kernel_vs_reference.png``: Warp kernel vs PyTorch evaluation on random inputs.
 """
 
@@ -52,7 +52,7 @@ from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     _quat_mul,
     _quat_rotate,
-    swing_twist_components,
+    tool_pose_bound_components,
     tool_pose_bound_cost,
 )
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
@@ -92,7 +92,7 @@ def _style() -> None:
 
 def plot_bound_1d(out_dir: str) -> None:
     lower, upper = -0.3, 0.0
-    cost = make_cost({"ee": ToolPoseBound.line("z", lower=lower, upper=upper)})
+    cost = make_cost({"ee": ToolPoseBound.line(min_along=lower, max_along=upper)})
     goal_q = quat_axis_angle([0.0, 0.0, 1.0], 0.6)
     axes_world = [_quat_rotate(goal_q, torch.eye(3)[k]) for k in range(3)]
 
@@ -132,7 +132,7 @@ def plot_bound_1d(out_dir: str) -> None:
 
 
 def plot_trajectory_plane(out_dir: str) -> None:
-    cost = make_cost({"ee": ToolPoseBound.plane("z", anchor="base", tolerance=0.005)})
+    cost = make_cost({"ee": ToolPoseBound.plane(anchor="base", tolerance=0.005)})
     horizon = 40
     t = torch.linspace(0.0, 1.0, horizon)
     position = torch.zeros(1, horizon, 1, 3)
@@ -204,12 +204,10 @@ def plot_trajectory_plane(out_dir: str) -> None:
 
 
 def plot_rotation_gradient(out_dir: str) -> None:
-    bound = ToolPoseBound(
-        rotation_lower=[-0.02, -0.02, -0.05], rotation_upper=[0.02, 0.02, 0.05], max_swing=0.03
-    )
-    cost = make_cost({"ee": bound})
+    box = make_cost({"ee": ToolPoseBound.orientation_box(0.02, 0.02, 0.05)})
+    cone = make_cost({"ee": ToolPoseBound.axis_tilt(max_angle=0.03)})
 
-    def alignment(goal_q, quaternion):
+    def alignment(goal_q, quaternion, cost=box):
         def fn(p, q):
             return evaluate(cost, p, q, ORIGIN, goal_q)
 
@@ -225,17 +223,17 @@ def plot_rotation_gradient(out_dir: str) -> None:
     angles = torch.linspace(0.1, 2.8, 25)
     goal_q = quat_axis_angle([0.0, 0.0, 1.0], 0.7)
     by_angle = [
-        alignment(goal_q, _quat_mul(goal_q, quat_axis_angle([1.0, 1.0, 0.3], a.item())))
+        alignment(goal_q, _quat_mul(goal_q, quat_axis_angle([1.0, 1.0, 0.3], a.item())), cone)
         for a in angles
     ]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(yaws, by_yaw, color=BLUE)
     axes[0].set_xlabel("goal yaw [rad]")
-    axes[0].set_title("orientation gradient vs goal orientation (D1)", fontsize=10)
+    axes[0].set_title("orientation_box gradient vs goal orientation (D1)", fontsize=10)
     axes[1].plot(angles, by_angle, color=BLUE)
     axes[1].set_xlabel("rotation from goal, off-axis [rad]")
-    axes[1].set_title("orientation gradient vs rotation size (exact)", fontsize=10)
+    axes[1].set_title("axis_tilt gradient vs rotation size (exact)", fontsize=10)
     for ax in axes:
         ax.set_ylim(-1.1, 1.1)
         ax.set_ylabel("cos(kernel gradient, finite diff.)")
@@ -244,28 +242,37 @@ def plot_rotation_gradient(out_dir: str) -> None:
     plt.close(fig)
 
 
-def plot_swing_twist(out_dir: str) -> None:
-    twists = torch.linspace(0.0, math.radians(175), 60)
-    tilt = quat_axis_angle([1.0, 0.0, 0.0], math.radians(10))
+def plot_tilt_yaw_roll(out_dir: str) -> None:
+    bound = ToolPoseBound(anchor="base", tilt=(0.5, 1.5))
+    pitched = quat_axis_angle([0.0, 1.0, 0.0], math.radians(70))  # tool z 20 deg above horizon
+    sweep = torch.linspace(-math.radians(150), math.radians(150), 61)
     quats = torch.stack(
-        [_quat_mul(tilt, quat_axis_angle([0.0, 0.0, 1.0], a.item())) for a in twists]
+        [
+            _quat_mul(
+                _quat_mul(quat_axis_angle([0.0, 0.0, 1.0], a.item()), pitched),
+                quat_axis_angle([0.0, 0.0, 1.0], -0.5 * a.item()),
+            )
+            for a in sweep
+        ]
     )
-    components, _ = swing_twist_components(quats)
+    components, _ = tool_pose_bound_components(
+        bound, torch.zeros(len(sweep), 3), quats, ORIGIN, IDENTITY
+    )
     half = torch.atan2(quats[:, 1:].norm(dim=-1), quats[:, 0])
     rotvec = quats[:, 1:] * (2.0 * half / torch.clamp(torch.sin(half), min=1e-6)).unsqueeze(-1)
 
     deg = torch.rad2deg
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    ax.plot(deg(twists), deg(components[:, 0]), color=BLUE, label="swing_x")
-    ax.plot(deg(twists), deg(components[:, 1]), color=AQUA, label="swing_y")
-    ax.plot(deg(twists), deg(rotvec[:, 0]), color=ORANGE, linestyle="--", label="rotvec x")
-    ax.plot(deg(twists), deg(rotvec[:, 1]), color=YELLOW, linestyle="--", label="rotvec y")
-    ax.set_xlabel("twist about the tool axis [deg]")
+    ax.plot(deg(sweep), deg(components[:, 3]), color=BLUE, label="tilt")
+    ax.plot(deg(sweep), deg(components[:, 4]), color=AQUA, label="yaw")
+    ax.plot(deg(sweep), deg(components[:, 5]), color=ORANGE, label="roll")
+    ax.plot(deg(sweep), deg(rotvec[:, 1]), color=YELLOW, linestyle="--", label="rotvec y")
+    ax.set_xlabel("yaw about world z [deg] (roll about the tool axis = -yaw / 2)")
     ax.set_ylabel("component [deg]")
-    ax.set_title("Fixed 10° tilt about x: swing stays (10, 0); rotvec x/y drift", fontsize=10)
+    ax.set_title("Tool pitched up 20°: tilt stays 70°, yaw and roll separate", fontsize=10)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "swing_twist.png"), dpi=130)
+    fig.savefig(os.path.join(out_dir, "tilt_yaw_roll.png"), dpi=130)
     plt.close(fig)
 
 
@@ -273,12 +280,14 @@ def plot_kernel_vs_reference(out_dir: str) -> None:
     gen = torch.Generator().manual_seed(0)
     bound = ToolPoseBound(
         anchor="goal",
-        offset_position=[0.05, None, 0.1],
-        position_lower=[-0.02, None, -0.3],
-        position_upper=[0.03, 0.01, None],
-        rotation_lower=[-0.1, -0.05, -0.3],
-        rotation_upper=[0.05, 0.1, 0.2],
-        max_swing=0.15,
+        reference_rotation=[0.8, 0.2, 0.4, 0.4],
+        tool_rotation=[0.9, 0.3, -0.2, 0.25],
+        x=(-0.02, 0.03),
+        y=(None, 0.01),
+        z=(-0.3, None),
+        tilt=(0.5, 1.4),
+        yaw=(-0.3, 0.4),
+        roll=(2.8, 3.6),
     )
     cost = make_cost({"ee": bound})
     batch, horizon = 16, 8
@@ -324,7 +333,7 @@ def main() -> None:
     plot_bound_1d(args.out)
     plot_trajectory_plane(args.out)
     plot_rotation_gradient(args.out)
-    plot_swing_twist(args.out)
+    plot_tilt_yaw_roll(args.out)
     plot_kernel_vs_reference(args.out)
     print(f"wrote figures to {args.out}")
 

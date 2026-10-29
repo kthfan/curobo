@@ -13,11 +13,11 @@ Run from the repository root::
     python cpu_verify/eef_bound/gpu_weight_sweep.py
     python cpu_verify/eef_bound/gpu_weight_sweep.py --weights 0 1e3 1e4 1e5 --goals 16
     python cpu_verify/eef_bound/gpu_weight_sweep.py --mpc   # also sweep the MPC weight
-    python cpu_verify/eef_bound/gpu_weight_sweep.py --weights 1e5 --margins 0 0.0005 0.001 0.002
+    python cpu_verify/eef_bound/gpu_weight_sweep.py --weights 1e5 --tolerances 0.001 0.002 0.004
 
 Writes ``sweep_raw.csv``, ``sweep_summary.csv`` and ``sweep.png`` to ``--out`` and prints the
-best weight and margin per scenario: highest success rate, then lowest median planning time.
-Violations are measured against the user's bounds (no margin, no tolerance).
+best weight and tolerance per scenario: highest success rate, then lowest median planning time.
+Violations are measured against the user's bounds (no tolerance).
 """
 
 from __future__ import annotations
@@ -126,11 +126,9 @@ class Sweep:
         traj = active_positions(result.get_interpolated_plan(), self.planner.joint_names)
         p, q = self.fk(traj)
         anchor_p, anchor_q = self.anchor(bound, goal_p, goal_q)
-        # Violation of the user's bounds themselves (no margin, no tolerance).
+        # Violation of the user's bounds themselves (no tolerance).
         raw = dataclasses.replace(
             bound,
-            position_margin=0.0,
-            rotation_margin=0.0,
             position_tolerance=0.0,
             rotation_tolerance=0.0,
         )
@@ -166,21 +164,16 @@ def plane_scenario(s: Sweep, gen: torch.Generator):
     """Stay on the horizontal plane through the start; goal elsewhere on that plane."""
     z0 = s.start_p[2].item()
     bound = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
+        (0.0, 0.0, 1.0), point=(0.0, 0.0, z0), anchor="base", tolerance=0.002
     )
     offset = torch.cat([s.uniform(gen, -0.25, 0.25, 2), torch.zeros(1, device=s.device)])
     return bound, s.start_p + offset, s.start_q
 
 
 def band_scenario(s: Sweep, gen: torch.Generator):
-    """Stay within ±3 mm of the start height (an inequality, so the margin applies)."""
+    """Stay within ±3 mm of the start height (an inequality: the cost keeps tolerance/2 inside)."""
     z0 = s.start_p[2].item()
-    bound = ToolPoseBound(
-        anchor="base",
-        offset_position=[None, None, z0],
-        position_lower=[None, None, -0.003],
-        position_upper=[None, None, 0.003],
-    )
+    bound = ToolPoseBound(anchor="base", z=(z0 - 0.003, z0 + 0.003))
     offset = torch.cat([s.uniform(gen, -0.25, 0.25, 2), torch.zeros(1, device=s.device)])
     return bound, s.start_p + offset, s.start_q
 
@@ -189,19 +182,16 @@ def line_scenario(s: Sweep, gen: torch.Generator):
     """Approach the goal along its tool z axis from the start."""
     d = s.uniform(gen, 0.05, 0.15).item()
     goal_p = s.start_p + _quat_rotate(s.start_q, torch.tensor([0.0, 0.0, d], device=s.device))
-    bound = ToolPoseBound.line("z", lower=-(d + 0.02), upper=0.0, tolerance=0.003)
+    bound = ToolPoseBound.line(
+        (0.0, 0.0, 1.0), min_along=-(d + 0.02), max_along=0.0, tolerance=0.003
+    )
     return bound, goal_p, s.start_q
 
 
 def orientation_scenario(s: Sweep, gen: torch.Generator):
-    """Translate while keeping the tool axis within 5 degrees and the twist within 5 degrees."""
+    """Translate while keeping roll, pitch and yaw within 5 degrees of the goal orientation."""
     lim = math.radians(5)
-    bound = ToolPoseBound(
-        max_swing=lim,
-        rotation_lower=[None, None, -lim],
-        rotation_upper=[None, None, lim],
-        rotation_tolerance=math.radians(1),
-    )
+    bound = ToolPoseBound.orientation_box(lim, lim, lim, tolerance=math.radians(1))
     return bound, s.start_p + s.uniform(gen, -0.15, 0.15, 3), s.start_q
 
 
@@ -215,12 +205,12 @@ SCENARIOS: Dict[str, Scenario] = {
 
 def summarize(rows: List[Dict]) -> List[Dict]:
     summary = []
-    keys = sorted({(r["scenario"], r["margin"], r["weight"]) for r in rows})
+    keys = sorted({(r["scenario"], r["tolerance"], r["weight"]) for r in rows})
     for scenario, margin, weight in keys:
         group = [
             r
             for r in rows
-            if r["scenario"] == scenario and r["margin"] == margin and r["weight"] == weight
+            if r["scenario"] == scenario and r["tolerance"] == margin and r["weight"] == weight
         ]
         ok = [r for r in group if r["success"] == 1.0]
 
@@ -231,7 +221,7 @@ def summarize(rows: List[Dict]) -> List[Dict]:
         summary.append(
             {
                 "scenario": scenario,
-                "margin": margin,
+                "tolerance": margin,
                 "weight": weight,
                 "success_rate": len(ok) / len(group),
                 "errors": sum(1 for r in group if r["error"]),
@@ -281,14 +271,14 @@ def plot(summary: List[Dict], path: str) -> None:
     ]
     fig, axes = plt.subplots(1, len(panels), figsize=(18, 4))
     scenarios = sorted({r["scenario"] for r in summary})
-    margins = sorted({r["margin"] for r in summary})
+    margins = sorted({r["tolerance"] for r in summary})
     for ax, (key, label) in zip(axes, panels):
         for (color, scenario), (style, margin) in (
             (c, m) for c in zip(colors, scenarios) for m in zip(styles, margins)
         ):
-            rows = [r for r in summary if r["scenario"] == scenario and r["margin"] == margin]
+            rows = [r for r in summary if r["scenario"] == scenario and r["tolerance"] == margin]
             x = [max(r["weight"], 1e-1) for r in rows]  # weight 0 drawn at 0.1 on the log axis
-            name = scenario if len(margins) == 1 else f"{scenario} m={margin * 1e3:g}mm"
+            name = scenario if len(margins) == 1 else f"{scenario} tol={margin * 1e3:g}mm"
             ax.plot(x, [r[key] for r in rows], style, color=color, label=name)
         ax.set_xscale("log")
         ax.set_xlabel("eef_bound weight (0 shown at 0.1)")
@@ -330,7 +320,7 @@ def sweep_mpc(args, weights: List[float]) -> List[Dict]:
     start_q = start_q.quaternion[0, 0, 0]
     costs = optimizer_bound_costs(mpc) + optimizer_bound_costs(mpc.ik_solver)
     bound = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, start_p[2].item()], tolerance=0.002
+        (0.0, 0.0, 1.0), point=(0.0, 0.0, start_p[2].item()), anchor="base", tolerance=0.002
     )
     mpc.update_tool_pose_bounds({ee: bound})
     goal_p = start_p + torch.tensor([0.0, 0.2, 0.0], device=start_p.device)
@@ -382,11 +372,14 @@ def main() -> int:
     parser.add_argument("--weights", nargs="+", type=float, default=[0, 1e2, 1e3, 1e4, 1e5, 1e6])
     parser.add_argument("--goals", type=int, default=8, help="random goals per scenario")
     parser.add_argument(
-        "--margins",
+        "--tolerances",
         nargs="+",
         type=float,
-        default=[0.001],
-        help="position margins (m) to sweep; the rotation margin is 10x the value in rad",
+        default=[0.002],
+        help=(
+            "position tolerances (m) to sweep, overriding each scenario's; "
+            "the rotation tolerance is 10x the value in rad"
+        ),
     )
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=list(SCENARIOS))
     parser.add_argument("--target", default="both", choices=["both", "ik", "trajopt"])
@@ -409,20 +402,20 @@ def main() -> int:
     for name in args.scenarios:
         gen = torch.Generator().manual_seed(args.seed)
         problems = [SCENARIOS[name](sweep, gen) for _ in range(args.goals)]
-        for margin in args.margins:
+        for margin in args.tolerances:
             for weight in args.weights:
                 set_weight(sweep.costs, weight)
                 done = []
                 for i, (bound, goal_p, goal_q) in enumerate(problems):
                     bound = dataclasses.replace(
-                        bound, position_margin=margin, rotation_margin=10.0 * margin
+                        bound, position_tolerance=margin, rotation_tolerance=10.0 * margin
                     )
-                    row = {"scenario": name, "margin": margin, "weight": weight, "goal": i}
+                    row = {"scenario": name, "tolerance": margin, "weight": weight, "goal": i}
                     row.update(sweep.plan(bound, goal_p, goal_q))
                     rows.append(row)
                     done.append(row)
                 rate = sum(r["success"] for r in done) / len(done)
-                print(f"{name:12s} margin={margin:<8g} weight={weight:<10g} success={rate:.0%}")
+                print(f"{name:12s} tolerance={margin:<8g} weight={weight:<10g} success={rate:.0%}")
     sweep.planner.update_tool_pose_bounds({sweep.ee: None})
 
     summary = summarize(rows)
@@ -430,19 +423,19 @@ def main() -> int:
     write_csv(os.path.join(args.out, "sweep_summary.csv"), summary)
     plot(summary, os.path.join(args.out, "sweep.png"))
     print(
-        "\nscenario     margin[mm]  weight      success  time[ms]  pos viol[mm]  rms pos[mm]"
+        "\nscenario     tol[mm]    weight      success  time[ms]  pos viol[mm]  rms pos[mm]"
         "  rot viol[deg]"
     )
     for r in summary:
         print(
-            f"{r['scenario']:12s} {r['margin'] * 1e3:10g}  {r['weight']:<10g}  "
+            f"{r['scenario']:12s} {r['tolerance'] * 1e3:10g}  {r['weight']:<10g}  "
             f"{r['success_rate']:6.0%}  "
             f"{r['median_time_ms']:8.0f}  {r['max_pos_violation_mm']:12.2f}  "
             f"{r['median_rms_pos_violation_mm']:11.2f}  {r['max_rot_violation_deg']:13.2f}"
         )
     print("\nbest setting per scenario (success rate, then planning time):")
     for scenario, r in best_weights(summary).items():
-        print(f"  {scenario:12s} weight {r['weight']:g}, margin {r['margin'] * 1e3:g} mm")
+        print(f"  {scenario:12s} weight {r['weight']:g}, tolerance {r['tolerance'] * 1e3:g} mm")
 
     if args.mpc:
         del sweep

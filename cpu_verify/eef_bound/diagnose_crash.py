@@ -53,11 +53,11 @@ STEPS = [
         """,
     ),
     (
-        "swing_twist_components (TestSwingTwist)",
+        "tilt/yaw/roll angles (TestAngles)",
         """
         import torch
-        from curobo._src.cost.tool_pose_bound import swing_twist_components
-        print(swing_twist_components(torch.tensor([0.9, 0.1, 0.2, 0.3])))
+        from curobo._src.cost.tool_pose_bound import _zyz
+        print(_zyz(torch.tensor([0.9, 0.1, 0.2, 0.3])))
         """,
     ),
     (
@@ -66,7 +66,7 @@ STEPS = [
         import torch
         from curobo._src.cost.tool_pose_bound import ToolPoseBound, tool_pose_bound_violation
         q = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        print(tool_pose_bound_violation(ToolPoseBound.plane("z", anchor="base"),
+        print(tool_pose_bound_violation(ToolPoseBound.plane(anchor="base"),
               torch.tensor([[0.3, -0.2, 0.03]]), q, torch.zeros(1, 3), q))
         """,
     ),
@@ -121,7 +121,7 @@ STEPS = [
         cfg = EEFBoundCostCfg(weight=1.0, tool_frames=["ee"],
                               device_cfg=DeviceCfg(device=torch.device("cpu")))
         cost = EEFBoundCost(cfg)
-        cost.update_tool_pose_bounds({"ee": ToolPoseBound.plane("z", anchor="base")})
+        cost.update_tool_pose_bounds({"ee": ToolPoseBound.plane(anchor="base")})
         q = torch.zeros(1, 2, 1, 4); q[..., 0] = 1.0
         print(cost.forward(ToolPose(["ee"], torch.full((1, 2, 1, 3), 0.1), q)).view(-1))
         """,
@@ -142,7 +142,7 @@ STEPS = [
         dev = torch.device("cuda:0")
         cfg = EEFBoundCostCfg(weight=1.0, tool_frames=["ee"], device_cfg=DeviceCfg(device=dev))
         cost = EEFBoundCost(cfg)
-        cost.update_tool_pose_bounds({"ee": ToolPoseBound.plane("z", anchor="base")})
+        cost.update_tool_pose_bounds({"ee": ToolPoseBound.plane(anchor="base")})
         q = torch.zeros(1, 2, 1, 4, device=dev); q[..., 0] = 1.0
         out = cost.forward(ToolPose(["ee"], torch.full((1, 2, 1, 3), 0.1, device=dev), q))
         torch.cuda.synchronize(); print(out.view(-1))

@@ -44,7 +44,7 @@ def _warp_cpu():
 @pytest.mark.parametrize("goal_yaw", [0.0, 0.5, 1.2, 2.5])
 def test_d1_rotation_gradient_world_frame_rotated_goal(goal_yaw: float):
     """D1: the orientation gradient is in the base frame for any goal orientation."""
-    bound = ToolPoseBound(rotation_lower=[-0.02, -0.02, -0.02], rotation_upper=[0.02, 0.02, 0.02])
+    bound = ToolPoseBound.orientation_box(0.02, 0.02, 0.02)
     cost = make_cost({"ee": bound})
     goal_q = quat_axis_angle([0.0, 0.0, 1.0], goal_yaw)
     quaternion = _quat_mul(goal_q, quat_axis_angle([1.0, 0.4, 0.2], 0.6))
@@ -59,10 +59,8 @@ def test_d1_rotation_gradient_world_frame_rotated_goal(goal_yaw: float):
 
 
 def test_d1_large_rotation_gradient_is_exact():
-    """The old rotvec corridor ignored the log-map Jacobian; swing/twist gradients are exact."""
-    bound = ToolPoseBound(
-        max_swing=0.1, rotation_lower=[None, None, -0.1], rotation_upper=[None, None, 0.1]
-    )
+    """The old rotvec corridor ignored the log-map Jacobian; the tilt gradient is exact."""
+    bound = ToolPoseBound.axis_tilt(max_angle=0.1)
     cost = make_cost({"ee": bound})
     goal_q = quat_axis_angle([0.0, 0.0, 1.0], 0.7)
     quaternion = _quat_mul(goal_q, quat_axis_angle([1.0, 1.0, 0.3], 2.6))
@@ -79,7 +77,7 @@ def test_d1_large_rotation_gradient_is_exact():
 def test_d4_goal_batch_smaller_than_rollout_batch():
     """D4: rollout rows look up their goal through idxs_goal (num_seeds > 1)."""
     gen = torch.Generator().manual_seed(2)
-    cost = make_cost({"ee": ToolPoseBound.line("z", lower=-0.3, upper=0.0)})
+    cost = make_cost({"ee": ToolPoseBound.line(min_along=-0.3, max_along=0.0)})
     batch, horizon = 4, 5
     position = torch.randn(batch, horizon, 1, 3, generator=gen) * 0.3
     quaternion = random_quat(batch * horizon, gen).view(batch, horizon, 1, 4)
@@ -103,16 +101,16 @@ def test_d4_goal_batch_smaller_than_rollout_batch():
 
 def test_plane_allows_motion_in_plane_only():
     """A plane bound (one constrained axis) leaves in-plane motion free."""
-    cost = make_cost({"ee": ToolPoseBound.plane("z")})
+    cost = make_cost({"ee": ToolPoseBound.plane()})
     in_plane = evaluate(cost, torch.tensor([0.4, -0.3, 0.0]), IDENTITY, ORIGIN, IDENTITY)
     lifted = evaluate(cost, torch.tensor([0.4, -0.3, 0.03]), IDENTITY, ORIGIN, IDENTITY)
     assert in_plane == 0.0
     assert lifted == pytest.approx(0.5 * 0.03**2, rel=1e-4)
 
 
-def test_swing_twist_bounds_are_independent():
-    """Twisting about the tool axis never costs swing, even with a tight cone."""
-    cost = make_cost({"ee": ToolPoseBound(max_swing=math.radians(2))})
+def test_tilt_ignores_rotation_about_the_tool_axis():
+    """Rotating about the tool axis never costs tilt, even with a tight cone."""
+    cost = make_cost({"ee": ToolPoseBound.axis_tilt(max_angle=math.radians(2))})
     twisted = quat_axis_angle([0.0, 0.0, 1.0], math.radians(170))
     tilted = quat_axis_angle([1.0, 0.0, 0.0], math.radians(5))
     assert evaluate(cost, ORIGIN, twisted, ORIGIN, IDENTITY) == 0.0

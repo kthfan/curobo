@@ -22,6 +22,23 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 | R5 | 保留「取違反最小的 goal」的語意（使用者決定） |
 | R7 | 已清理（重寫的檔案沒有 BOM） |
 
+### 第二版 API（`dev/eef_cost` @ `fdf80a3`）
+
+- 參考框：原點取錨點（goal、start、base），軸取錨點或 base（`reference_axes`），再乘
+  `reference_rotation`；位置 offset 改為直接平移上下限。
+- 工具軸：`tool_rotation` 指定工具上的哪個軸；不移動被限制位置的點。
+- 分量：`x, y, z` 與 `tilt, yaw, roll`（`R_FU = Rz(yaw) Ry(tilt) Rz(roll)`），各接受 `None`、數字
+  （等式）或 `(下限, 上限)`；`yaw`、`roll` 會環繞，且需要 `tilt` 區間離 0 與 π 至少 10°。
+- 容許誤差：只剩 `position_tolerance`、`rotation_tolerance`；不等式在 cost 端往內縮 tolerance/2，
+  可行性嚴格；等式在可行性放寬 ±tolerance。
+- 每個 tool frame 可放多個 bound（預設 4 個槽位），`ToolPoseCriteria.bound` 改為 `bounds`。
+- 工廠：`plane`、`line`、`axis_tilt`、`orientation_box`。
+- CPU 驗證：函式庫測試 157 passed；與 `dev/main` 比較，CPU 測試的失敗集合完全相同（皆為需要
+  CUDA 的測試）；`yaw`、`roll` 梯度在奇異點附近刻意截斷（sin² ≥ sin²5°），其餘與有限差分一致。
+- GPU 待驗：`gpu_check.py`（G1–G15、M1–M4，新增 G14 world 朝下錐形 + yaw、G15 同一 frame 兩個
+  bound）、`gpu_weight_sweep.py`（`--margins` 改為 `--tolerances`）、
+  `pytest curobo/tests/_src/cost curobo/tests/_src/motion/test_multi_waypoint_planner.py`。
+
 以下為原始的檢視紀錄。
 
 檢視對象：`origin/dev/eef_cost` @ `dac5bd7`

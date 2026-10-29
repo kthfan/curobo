@@ -25,7 +25,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from curobo._src.cost.tool_pose_bound import _quat_rotate, tool_pose_bound_violation
+from curobo._src.cost.tool_pose_bound import (
+    _quat_mul,
+    _quat_rotate,
+    tool_pose_bound_violation,
+)
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import GoalToolPose, JointState, ToolPoseBound
 
@@ -102,7 +106,7 @@ class Setup:
         anchor_p: torch.Tensor,
         anchor_q: torch.Tensor,
     ) -> torch.Tensor:
-        """Largest per-component violation (with tolerance) over a trajectory, shape ``(7,)``."""
+        """Largest per-component violation (with tolerance) over a trajectory, shape ``(6,)``."""
         p, q = self.fk(positions)
         violation = tool_pose_bound_violation(
             bound, p, q, anchor_p.expand_as(p), anchor_q.expand_as(q), metric=True
@@ -128,8 +132,22 @@ def check(name: str) -> Callable:
     return register
 
 
+def _axis_angle_quat(axis: List[float], angle: float, device) -> torch.Tensor:
+    a = torch.tensor(axis, device=device)
+    a = a / a.norm()
+    half = torch.tensor([math.cos(angle / 2)], device=device)
+    return torch.cat([half, math.sin(angle / 2) * a])
+
+
 def _identity(device) -> torch.Tensor:
     return torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
+
+
+def _height_plane(z: float, tolerance: Optional[float] = 0.002) -> ToolPoseBound:
+    """Horizontal plane at base height ``z``."""
+    return ToolPoseBound.plane(
+        (0.0, 0.0, 1.0), point=(0.0, 0.0, z), anchor="base", tolerance=tolerance
+    )
 
 
 def _plane_goal(s: Setup) -> GoalToolPose:
@@ -148,9 +166,7 @@ def g1_baseline(s: Setup):
 @check("G2 plane bound (base anchor) keeps the start height")
 def g2_plane(s: Setup):
     z0 = s.start_p[2].item()
-    bound = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
-    )
+    bound = _height_plane(z0)
     s.set_bound(bound)
     ok, traj, t = s.plan(_plane_goal(s))
     if not ok:
@@ -163,7 +179,9 @@ def g2_plane(s: Setup):
 @check("G3 line bound along the goal z axis (approach)")
 def g3_line(s: Setup):
     goal_p = s.start_p + _quat_rotate(s.start_q, torch.tensor([0.0, 0.0, 0.1], device=s.device))
-    bound = ToolPoseBound.line("z", lower=-0.12, upper=0.0, tolerance=0.003)
+    bound = ToolPoseBound.line(
+        (0.0, 0.0, 1.0), min_along=-0.12, max_along=0.0, tolerance=0.003
+    )
     s.set_bound(bound)
     ok, traj, t = s.plan(s.goal(goal_p, s.start_q))
     if not ok:
@@ -172,30 +190,26 @@ def g3_line(s: Setup):
     return v.max().item() == 0.0, f"{t * 1e3:.0f} ms, max violation {v.max().item() * 1e3:.2f} mm"
 
 
-@check("G4 orientation cone and twist limit (goal anchor)")
+@check("G4 orientation box of 5 deg roll/pitch/yaw (goal anchor)")
 def g4_orientation(s: Setup):
     goal_p = s.start_p + torch.tensor([0.15, 0.15, -0.1], device=s.device)
     lim = math.radians(5)
-    bound = ToolPoseBound(
-        max_swing=lim,
-        rotation_lower=[None, None, -lim],
-        rotation_upper=[None, None, lim],
-        rotation_tolerance=math.radians(1),
-    )
+    bound = ToolPoseBound.orientation_box(lim, lim, lim, tolerance=math.radians(1))
     s.set_bound(bound)
     ok, traj, t = s.plan(s.goal(goal_p, s.start_q))
     if not ok:
         return False, "planning failed with the orientation bound"
     v = s.max_violation(traj, bound, goal_p, s.start_q)
     return v.max().item() == 0.0, (
-        f"{t * 1e3:.0f} ms, max swing/twist violation {math.degrees(v[3:].max().item()):.2f} deg"
+        f"{t * 1e3:.0f} ms, max tilt/yaw/roll violation "
+        f"{math.degrees(v[3:].max().item()):.2f} deg"
     )
 
 
 @check("G5 start off the plane raises")
 def g5_start_violation(s: Setup):
     z = s.start_p[2].item() + 0.05
-    s.set_bound(ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z]))
+    s.set_bound(_height_plane(z, tolerance=None))
     try:
         s.plan(_plane_goal(s))
     except ValueError as e:
@@ -206,7 +220,7 @@ def g5_start_violation(s: Setup):
 @check("G6 goal off the plane raises")
 def g6_goal_violation(s: Setup):
     z0 = s.start_p[2].item()
-    s.set_bound(ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0]))
+    s.set_bound(_height_plane(z0, tolerance=None))
     goal = s.goal(s.start_p + torch.tensor([0.0, 0.2, 0.1], device=s.device), s.start_q)
     try:
         s.plan(goal)
@@ -218,7 +232,7 @@ def g6_goal_violation(s: Setup):
 @check("G7 start anchor after CUDA graph capture")
 def g7_start_anchor(s: Setup):
     # Graphs were captured with no bounds; switch to a start-anchored plane now.
-    bound = ToolPoseBound.plane("z", anchor="start", tolerance=0.002)
+    bound = ToolPoseBound.plane(anchor="start", tolerance=0.002)
     s.set_bound(bound)
     # Goal on the plane through the start, normal to the start tool z axis.
     in_plane = _quat_rotate(s.start_q, torch.tensor([0.0, 0.2, 0.0], device=s.device))
@@ -231,7 +245,7 @@ def g7_start_anchor(s: Setup):
 
 @check("G8 clearing the bound restores the baseline")
 def g8_clear(s: Setup):
-    s.set_bound(ToolPoseBound.plane("z", anchor="start"))
+    s.set_bound(ToolPoseBound.plane(anchor="start"))
     s.set_bound(None)
     goal = s.goal(s.start_p + torch.tensor([0.0, 0.2, 0.1], device=s.device), s.start_q)
     ok, traj, t = s.plan(goal)
@@ -241,9 +255,7 @@ def g8_clear(s: Setup):
 @check("G9 IK respects a plane bound")
 def g9_ik(s: Setup):
     z0 = s.start_p[2].item()
-    bound = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
-    )
+    bound = _height_plane(z0)
     s.set_bound(bound)
     result = s.planner.ik_solver.solve_pose(_plane_goal(s), current_state=s.start.clone())
     if not bool(result.success.any()):
@@ -262,9 +274,7 @@ def g10_timing(s: Setup):
     z0 = s.start_p[2].item()
     # With zero tolerance an equality bound is never feasible, so every attempt fails and the
     # planner retries; use a realistic tolerance here.
-    plane = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
-    )
+    plane = _height_plane(z0)
     times: Dict[str, List[float]] = {"none": [], "plane": []}
     successes: Dict[str, int] = {"none": 0, "plane": 0}
     for _ in range(5):
@@ -283,41 +293,73 @@ def g10_timing(s: Setup):
 @check("G11 equality bound with zero tolerance (informational)")
 def g11_zero_tolerance(s: Setup):
     z0 = s.start_p[2].item()
-    s.set_bound(
-        ToolPoseBound.plane("z", anchor="base", offset_position=[None, None, z0], tolerance=0.0)
-    )
+    s.set_bound(_height_plane(z0, tolerance=0.0))
     ok, _, elapsed = s.plan(_plane_goal(s))
     return True, f"success={ok} in {elapsed * 1e3:.0f} ms (expected to fail: no slack)"
 
 
-def _band(z0: float, half_width: float, margin: float) -> ToolPoseBound:
+def _band(z0: float, half_width: float, tolerance: float) -> ToolPoseBound:
     return ToolPoseBound(
-        anchor="base",
-        offset_position=[None, None, z0],
-        position_lower=[None, None, -half_width],
-        position_upper=[None, None, half_width],
-        position_margin=margin,
+        anchor="base", z=(z0 - half_width, z0 + half_width), position_tolerance=tolerance
     )
 
 
-@check("G12 band bound is met strictly thanks to the margin")
+@check("G12 band bound is met strictly (cost kept tolerance/2 = 1 mm inside)")
 def g12_band(s: Setup):
     z0 = s.start_p[2].item()
-    s.set_bound(_band(z0, 0.003, margin=0.001))
+    s.set_bound(_band(z0, 0.003, tolerance=0.002))
     ok, traj, elapsed = s.plan(_plane_goal(s))
     if not ok:
-        return False, "planning failed with a ±3 mm band and 1 mm margin"
+        return False, "planning failed with a ±3 mm band and 2 mm tolerance"
     dz = (s.fk(traj)[0][:, 2] - z0).abs().max().item()
     return dz <= 0.003 + 1e-5, f"{elapsed * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm (band 3 mm)"
 
 
-@check("G13 band bound without margin (informational)")
+@check("G13 band bound with zero tolerance (informational)")
 def g13_band_no_margin(s: Setup):
     z0 = s.start_p[2].item()
-    s.set_bound(_band(z0, 0.003, margin=0.0))
+    s.set_bound(_band(z0, 0.003, tolerance=0.0))
     ok, traj, elapsed = s.plan(_plane_goal(s))
     dz = math.nan if traj is None else (s.fk(traj)[0][:, 2] - z0).abs().max().item()
     return True, f"success={ok} in {elapsed * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm"
+
+
+@check("G14 tool z within 10 deg of straight down while yawing 60 deg (base anchor)")
+def g14_cone_down(s: Setup):
+    yaw = _axis_angle_quat([0.0, 0.0, 1.0], math.radians(60), s.device)
+    goal_q = _quat_mul(yaw, s.start_q)
+    goal_p = s.start_p + torch.tensor([0.1, -0.1, 0.0], device=s.device)
+    bound = ToolPoseBound.axis_tilt(
+        reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10), anchor="base"
+    )
+    s.set_bound(bound)
+    ok, traj, t = s.plan(s.goal(goal_p, goal_q))
+    if not ok:
+        return False, "planning failed with the cone bound"
+    v = s.max_violation(traj, bound, torch.zeros(3, device=s.device), _identity(s.device))
+    p, q = s.fk(traj)
+    z_axis = _quat_rotate(q, torch.tensor([0.0, 0.0, 1.0], device=s.device).expand_as(p))
+    tilt = torch.rad2deg(torch.acos((-z_axis[:, 2]).clamp(-1.0, 1.0))).max().item()
+    return v.max().item() == 0.0, f"{t * 1e3:.0f} ms, max angle from down {tilt:.2f} deg"
+
+
+@check("G15 two bounds on one frame: height plane and cone (base anchor)")
+def g15_two_bounds(s: Setup):
+    z0 = s.start_p[2].item()
+    bounds = [
+        _height_plane(z0),
+        ToolPoseBound.axis_tilt(
+            reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10), anchor="base"
+        ),
+    ]
+    s.planner.update_tool_pose_bounds({s.ee: bounds})
+    ok, traj, t = s.plan(_plane_goal(s))
+    if not ok:
+        return False, "planning failed with plane + cone"
+    zero, ident = torch.zeros(3, device=s.device), _identity(s.device)
+    v = torch.stack([s.max_violation(traj, b, zero, ident) for b in bounds])
+    dz = (s.fk(traj)[0][:, 2] - z0).abs().max().item()
+    return v.max().item() == 0.0, f"{t * 1e3:.0f} ms, max |dz| {dz * 1e3:.2f} mm"
 
 
 CHECKS = [
@@ -334,6 +376,8 @@ CHECKS = [
     g11_zero_tolerance,
     g12_band,
     g13_band_no_margin,
+    g14_cone_down,
+    g15_two_bounds,
 ]
 
 
@@ -437,9 +481,7 @@ def m1_baseline(s: MPCSetup):
 @check("M2 MPC plane bound set after graph capture")
 def m2_plane(s: MPCSetup):
     z0 = s.start_p[2].item()
-    bound = ToolPoseBound.plane(
-        "z", anchor="base", offset_position=[None, None, z0], tolerance=0.002
-    )
+    bound = _height_plane(z0)
     s.set_bound(bound)
     goal_p = s.start_p + torch.tensor([0.0, 0.2, 0.0], device=s.device)
     r = s.run(goal_p, s.start_q)
@@ -454,7 +496,7 @@ def m2_plane(s: MPCSetup):
 @check("M3 MPC orientation cone (goal anchor)")
 def m3_orientation(s: MPCSetup):
     lim = math.radians(5)
-    bound = ToolPoseBound(max_swing=lim, rotation_tolerance=math.radians(1))
+    bound = ToolPoseBound.axis_tilt(max_angle=lim, tolerance=math.radians(1))
     s.set_bound(bound)
     goal_p = s.start_p + torch.tensor([0.1, 0.1, -0.05], device=s.device)
     r = s.run(goal_p, s.start_q)
@@ -462,7 +504,7 @@ def m3_orientation(s: MPCSetup):
     v = tool_pose_bound_violation(bound, p, q, goal_p.expand_as(p), s.start_q.expand_as(q))
     ok = v.max().item() == 0.0 and r["final_error"] < 0.02
     return ok, (
-        f"max swing violation {math.degrees(v[:, 6].max().item()):.2f} deg, "
+        f"max tilt violation {math.degrees(v[:, 3].max().item()):.2f} deg, "
         f"final error {r['final_error'] * 1e3:.1f} mm, success {r['success_rate']:.0%}, "
         f"{r['goal_mode']}"
     )
@@ -472,7 +514,7 @@ def m3_orientation(s: MPCSetup):
 def m4_start_anchor(s: MPCSetup):
     # The start pose is refreshed from the current state every step, so the plane moves
     # with the robot; this reports how far the height drifts over the run.
-    s.set_bound(ToolPoseBound.plane("z", anchor="start", tolerance=0.002))
+    s.set_bound(ToolPoseBound.plane(anchor="start", tolerance=0.002))
     in_plane = _quat_rotate(s.start_q, torch.tensor([0.0, 0.2, 0.0], device=s.device))
     r = s.run(s.start_p + in_plane, s.start_q)
     p = s.fk(r["positions"])[0]
