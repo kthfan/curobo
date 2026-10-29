@@ -45,11 +45,12 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   `metrics_base.yml`) never gets the mesh constraint, so node and edge checks are sphere-only.
   Its paths only seed TrajOpt, which applies the mesh check, so this costs attempts, not
   correctness. The graph planner needs no gradient, so it should check with the exact geometry,
-  but mesh-only paths may squeeze through gaps the inflated optimizer spheres push away from.
-  **Benchmark first**: add a narrow-passage scene to `benchmark/mesh_collision_benchmark.py`
-  and, for plans that reach the graph attempts, compare graph rollout = spheres / mesh /
-  spheres + mesh on graph query time, `plan_pose` success, total time and the share of graph
-  seeds TrajOpt accepts.
+  but mesh-only paths may squeeze through gaps the inflated optimizer spheres push away from;
+  that push-away problem is left to the gradient mesh check (Future work).
+  **Benchmark first**, scheduled after the "inflated spheres + exact meshes" decision below:
+  add a narrow-passage scene to `benchmark/mesh_collision_benchmark.py` and, for plans that
+  reach the graph attempts, compare graph rollout = spheres / mesh / spheres + mesh on graph
+  query time, `plan_pose` success, total time and the share of graph seeds TrajOpt accepts.
 - [ ] **P3 – Mesh self-collision.** Self-collision is sphere-only. A mesh self-collision
   check needs a per-robot list of link pairs to test (reuse the sphere self-collision
   ignore matrix) and a triangle-triangle kernel between robot links.
@@ -63,6 +64,7 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   false alarms, so acting on them becomes practical. To decide: split near-term feasibility
   (act now) from far-horizon feasibility (warning); reaction (decelerate with the existing,
   untested code / stop / report only); all constraints or scene collision only.
+  **Handled on another branch**; recorded here for reference only.
 
 ## 3. Integration
 
@@ -98,10 +100,13 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   so success is decided by the exact geometry, while the optimizers keep sphere costs inflated
   by `optimizer_collision_activation_distance` (cost-only: `radius + eta`; do not use
   `collision_sphere_buffer`, which also inflates metrics and self-collision spheres). Needs a
-  coverage guard (every sphere link has mesh slots, ignored links excepted), a positive
-  `mesh_collision_margin` to absorb decimation shrinkage, and self-collision stays sphere-based.
-  Measure success in tight spaces and goal accuracy near obstacles for several activation
-  distances.
+  positive `mesh_collision_margin` to absorb decimation shrinkage. Measure success in tight
+  spaces and goal accuracy near obstacles for several activation distances.
+  **Decide whether to add it only after evaluating the gradient mesh check** (Future work).
+  - Coverage: links with spheres but no mesh (no collision geometry, reserved slots missing,
+    `mesh_collision_ignored_link_names`) would go unchecked. Warn about them when the mode is
+    turned on; if a warning turns out hard to implement, document the limitation instead.
+  - Self-collision keeps the sphere check until mesh self-collision exists.
 - [ ] **P2 – No gradient in mesh-only collisions.** When the spheres are clear but a mesh
   collides, the optimizer has nothing to follow and only re-seeding helps. Prefer improving
   the spheres (see "Future work") over adding a mesh gradient; at minimum, document the
@@ -158,8 +163,13 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   cause of mesh-only collisions and keeps the optimizer gradient-based.
 - **Distance output.** Return a signed clearance per configuration (not just a flag), for
   diagnostics and as an optional soft metric.
+- **Mesh check with gradient.** A differentiable mesh distance cost for the optimizers, so
+  trajectories follow the exact geometry instead of inflated spheres. It is meant to solve the
+  inflated spheres pushing TrajOpt away from narrow passages that graph or mesh-only metrics
+  would allow; evaluate it before deciding on the "inflated spheres + exact meshes" mode.
 - **Swept / continuous collision checking** between trajectory steps: test the volume a
   triangle sweeps between two samples (continuous triangle collision, or conservative
   advancement with the link bounding spheres used by the culling) so that no obstacle is
   missed between samples.
-- **Mesh self-collision** (see Coverage).
+- **Mesh self-collision** (see Coverage). Until it exists, self-collision stays sphere-based,
+  also in the "inflated spheres + exact meshes" mode.
