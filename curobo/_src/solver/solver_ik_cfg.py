@@ -139,6 +139,8 @@ class IKSolverCfg:
         scene_model: Optional[Union[str, Dict[str, Any]]] = None,
         collision_cache: Optional[Dict[str, int]] = None,
         self_collision_check: bool = True,
+        mesh_collision_check: bool = False,
+        mesh_collision_margin: float = 0.0,
         device_cfg: DeviceCfg = DeviceCfg(),
         num_seeds: int = 32,
         position_tolerance: float = 0.005,
@@ -183,6 +185,11 @@ class IKSolverCfg:
             scene_model: Optional scene model config - path or dict.
             collision_cache: Cache configuration for collision checking.
             self_collision_check: Whether to check self-collision.
+            mesh_collision_check: Also validate solutions against the robot's exact collision
+                meshes instead of only its collision spheres. Adds a pass/fail constraint to
+                the metrics rollout and loads the URDF collision meshes. Needs a scene.
+            mesh_collision_margin: Clearance in meters the collision meshes must keep from
+                obstacles when ``mesh_collision_check`` is True.
             device_cfg: Device configuration.
             num_seeds: Number of IK seeds evaluated per problem. A value of
                 16 is good for most single-tool IK problems; the default of
@@ -241,6 +248,8 @@ class IKSolverCfg:
                 scene_model,
                 device_cfg,
                 load_collision_spheres=load_collision_spheres,
+                mesh_collision_check=mesh_collision_check,
+                mesh_collision_margin=mesh_collision_margin,
                 num_envs=num_envs,
             )
         )

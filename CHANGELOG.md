@@ -71,8 +71,33 @@
   and Hugging Face CLI setup plus sequence-only download commands.
 - Add `live_volumetric_mapping_mpc.py`, a live RGB-D TSDF/ESDF mapping
   reference example with Franka MPC using a RealSense backend.
+- Add exact robot-mesh collision checking. `mesh_collision_check=True` on
+  `MotionPlannerCfg.create`, `InverseKinematicsCfg.create`,
+  `TrajectoryOptimizerCfg.create`, and `ModelPredictiveControlCfg.create`
+  loads the URDF collision meshes and rejects solutions whose meshes touch
+  the scene; `mesh_collision_margin` sets the clearance. The optimizers still
+  avoid obstacles with the collision spheres. Robot YAMLs can set
+  `max_triangles_per_link`, `mesh_collision_ignored_link_names`, and
+  `extra_collision_meshes`, and `RobotCollisionCheckerCfg.load_from_config`
+  accepts `use_mesh_constraint`.
+- Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
+  plans one trajectory through an ordered list of Cartesian waypoints with
+  per-segment tool pose criteria.
+- Add tool pose bounds. `ToolPoseBound` limits a tool frame's position and
+  orientation over the whole trajectory relative to the goal, the start, or
+  the robot base, and is set with `update_tool_pose_bounds` on the motion
+  planner, IK, trajectory optimization, MPC, and the multi-waypoint planner.
+  The default IK, trajectory optimization, and MPC task configs include the
+  `eef_bound_cfg` cost, which has no effect until a bound is set.
+- Add `position_tolerance_traj` and `orientation_tolerance_traj` to
+  `TrajectoryOptimizerCfg.create` and `MotionPlannerCfg.create` to check the
+  steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- Fix the scale of the `ToolPoseCost` rotation gradient for the default
+  axis-angle rotation error, which reached the joints at half its value. The
+  rotation gradient is now twice as large as before; the Lie group rotation
+  methods are unchanged.
 - Reduce GPU memory consumption for batched motion planning by 3x with
   batch-aware IK and TrajOpt seed defaults and a smaller interpolation buffer.
 - Fix `MotionPlanner` and `BatchMotionPlanner` attachment-manager access so

@@ -11,6 +11,7 @@ from curobo._src.geom.collision.collision_scene import SceneCollisionCfg
 from curobo._src.geom.types import SceneCfg
 from curobo._src.graph_planner.graph_planner_prm import PRMGraphPlannerCfg
 from curobo._src.rollout.cost_manager.cost_manager_robot_cfg import RobotCostManagerCfg
+from curobo._src.solver.solver_core_cfg import resolve_robot_config, uses_mesh_collision
 from curobo._src.solver.solver_ik_cfg import IKSolverCfg
 from curobo._src.solver.solver_trajopt_cfg import TrajOptSolverCfg
 from curobo._src.transition.robot_state_transition_cfg import (
@@ -19,8 +20,7 @@ from curobo._src.transition.robot_state_transition_cfg import (
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
 from curobo._src.util.config_io import join_path, resolve_config
-from curobo._src.util.logging import log_and_raise
-from curobo.content import get_robot_configs_path, get_scene_configs_path
+from curobo.content import get_scene_configs_path, get_task_configs_path
 
 
 @dataclass
@@ -52,11 +52,15 @@ class MotionPlannerCfg:
         scene_model: Optional[Union[str, Dict[str, Any]]] = None,
         collision_cache: Optional[Dict[str, int]] = None,
         self_collision_check: bool = True,
+        mesh_collision_check: bool = False,
+        mesh_collision_margin: float = 0.0,
         device_cfg: DeviceCfg = DeviceCfg(),
         num_ik_seeds: Optional[int] = None,
         num_trajopt_seeds: Optional[int] = None,
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
+        position_tolerance_traj: float = 0.0,
+        orientation_tolerance_traj: float = 0.0,
         use_cuda_graph: bool = True,
         random_seed: int = 123,
         optimizer_collision_activation_distance: float = 0.01,
@@ -111,6 +115,13 @@ class MotionPlannerCfg:
                 ``update_world`` calls.
             self_collision_check: Enable robot self-collision costs/checks in
                 IK, TrajOpt, and graph planner validation.
+            mesh_collision_check: Also validate IK and TrajOpt solutions against the
+                robot's exact collision meshes instead of only its collision spheres. Loads
+                the URDF collision meshes and adds a pass/fail constraint to the metrics
+                rollout; the optimizers still avoid obstacles with the spheres. Graph
+                planner validation stays sphere-based. Needs a scene or collision cache.
+            mesh_collision_margin: Clearance in meters the collision meshes must keep from
+                obstacles when ``mesh_collision_check`` is True.
             device_cfg: Tensor device and dtype configuration.
             num_ik_seeds: Number of IK seeds evaluated per problem. ``None``
                 uses 32 when ``max_batch_size`` is 1 and 16 for larger batch
@@ -122,6 +133,12 @@ class MotionPlannerCfg:
                 for IK and TrajOpt success.
             orientation_tolerance: Cartesian orientation tolerance in radians
                 used for IK and TrajOpt success.
+            position_tolerance_traj: Position tolerance in meters for every TrajOpt step
+                before the last one, measured on the axes constrained by the non-terminal
+                tool pose criteria (for example ``ToolPoseCriteria.linear_motion``). 0
+                disables the check.
+            orientation_tolerance_traj: Orientation tolerance in radians for the same steps
+                and axes. 0 disables the check.
             use_cuda_graph: Enable CUDA graph capture for solver rollouts
                 and optimizers. Defaults to True and should be left enabled
                 for normal integration/runtime code. The value is forwarded
@@ -175,14 +192,15 @@ class MotionPlannerCfg:
 
         num_envs = max_batch_size if multi_env else 1
 
-        # Resolve robot config
-        robot_resolved = resolve_config(join_path(get_robot_configs_path(), robot))
-        if isinstance(robot_resolved, dict):
-            robot_config = RobotCfg.create(robot_resolved, device_cfg, num_envs=num_envs)
-        elif isinstance(robot_resolved, RobotCfg):
-            robot_config = robot_resolved
-        else:
-            log_and_raise("robot must be a path, dict, or RobotCfg object")
+        # Resolve the shared metrics rollout first: it decides whether the robot's collision
+        # meshes are loaded.
+        metrics_rollout = resolve_config(join_path(get_task_configs_path(), metrics_rollout))
+        robot_config = resolve_robot_config(
+            robot,
+            device_cfg,
+            num_envs=num_envs,
+            load_collision_meshes=mesh_collision_check or uses_mesh_collision(metrics_rollout),
+        )
 
         # Resolve scene model
         scene_collision_cfg = None
@@ -224,6 +242,8 @@ class MotionPlannerCfg:
             store_debug=store_debug,
             num_seeds=num_ik_seeds,
             self_collision_check=self_collision_check,
+            mesh_collision_check=mesh_collision_check,
+            mesh_collision_margin=mesh_collision_margin,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,
@@ -238,6 +258,8 @@ class MotionPlannerCfg:
             metrics_rollout=metrics_rollout,
             device_cfg=device_cfg,
             num_seeds=num_trajopt_seeds,
+            position_tolerance_traj=position_tolerance_traj,
+            orientation_tolerance_traj=orientation_tolerance_traj,
             interpolation_dt=interpolation_dt,
             interpolation_buffer_size=interpolation_buffer_size,
             position_tolerance=position_tolerance,
@@ -247,6 +269,8 @@ class MotionPlannerCfg:
             optimizer_collision_activation_distance=optimizer_collision_activation_distance,
             store_debug=store_debug,
             self_collision_check=self_collision_check,
+            mesh_collision_check=mesh_collision_check,
+            mesh_collision_margin=mesh_collision_margin,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,

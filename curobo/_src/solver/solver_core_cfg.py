@@ -13,6 +13,7 @@ TrajOptSolverCfg.create(), and MPCSolverCfg.create().
 from __future__ import annotations
 
 # Standard Library
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -195,6 +196,86 @@ def create_scene_collision_cfg(
 # ---------------------------------------------------------------------------
 
 
+#: Weight of the exact mesh collision constraint added by :func:`enable_mesh_collision`. It
+#: matches the weight of the other feasibility constraints in ``metrics_base.yml``.
+MESH_COLLISION_CONSTRAINT_WEIGHT = 5000.0
+
+
+def uses_mesh_collision(metrics_rollout_dict: Dict) -> bool:
+    """True if a resolved metrics rollout dict declares the exact mesh collision constraint."""
+    constraint_cfg = metrics_rollout_dict.get("rollout", {}).get("constraint_cfg") or {}
+    return constraint_cfg.get("mesh_collision_cfg") is not None
+
+
+def enable_mesh_collision(metrics_rollout_dict: Dict, margin: float = 0.0) -> Dict:
+    """Return a copy of a metrics rollout dict with the exact mesh collision constraint enabled.
+
+    An existing ``mesh_collision_cfg`` entry is kept and only its ``margin`` is replaced, so
+    the other settings of a hand-written task config survive.
+
+    Args:
+        metrics_rollout_dict: Resolved metrics rollout YAML dict. Not modified.
+        margin: Clearance in meters the robot's collision meshes must keep from obstacles.
+
+    Returns:
+        New metrics rollout dict.
+    """
+    if margin < 0.0:
+        log_and_raise(f"mesh_collision_margin must be non-negative, got {margin}")
+    metrics_rollout_dict = deepcopy(metrics_rollout_dict)
+    rollout = metrics_rollout_dict.setdefault("rollout", {})
+    constraint_cfg = rollout.get("constraint_cfg") or {}
+    rollout["constraint_cfg"] = constraint_cfg
+    mesh_cfg = constraint_cfg.get("mesh_collision_cfg") or {
+        "weight": MESH_COLLISION_CONSTRAINT_WEIGHT
+    }
+    mesh_cfg["margin"] = margin
+    constraint_cfg["mesh_collision_cfg"] = mesh_cfg
+    return metrics_rollout_dict
+
+
+def resolve_robot_config(
+    robot: Union[str, Dict[str, Any], RobotCfg],
+    device_cfg: DeviceCfg,
+    load_collision_spheres: bool = True,
+    num_envs: int = 1,
+    load_collision_meshes: bool = False,
+) -> RobotCfg:
+    """Resolve a robot YAML path or dict to a RobotCfg.
+
+    Args:
+        robot: Robot config - YAML path (relative to robot configs), dict, or RobotCfg.
+        device_cfg: Device configuration.
+        load_collision_spheres: Whether to load collision spheres from robot config.
+        num_envs: Number of environments (for multi-env collision checking).
+        load_collision_meshes: Load the URDF collision meshes needed by the exact mesh
+            collision check. A RobotCfg passed in must already hold them.
+
+    Returns:
+        Resolved robot configuration.
+    """
+    robot_resolved = resolve_config(join_path(get_robot_configs_path(), robot))
+    if isinstance(robot_resolved, dict):
+        return RobotCfg.create(
+            robot_resolved,
+            device_cfg,
+            load_collision_spheres=load_collision_spheres,
+            num_envs=num_envs,
+            load_collision_meshes=load_collision_meshes,
+        )
+    if not isinstance(robot_resolved, RobotCfg):
+        log_and_raise("robot must be a path, dict, or RobotCfg object")
+    if (
+        load_collision_meshes
+        and robot_resolved.kinematics.kinematics_config.link_collision_meshes is None
+    ):
+        log_and_raise(
+            "mesh collision checking needs the robot's collision meshes: create the RobotCfg "
+            "with load_collision_meshes=True, or pass the robot as a path or dict"
+        )
+    return robot_resolved
+
+
 def resolve_yaml_configs(
     robot: Union[str, Dict[str, Any], RobotCfg],
     optimizer_configs: List[Union[str, Dict[str, Any]]],
@@ -204,6 +285,8 @@ def resolve_yaml_configs(
     device_cfg: DeviceCfg,
     load_collision_spheres: bool = True,
     num_envs: int = 1,
+    mesh_collision_check: bool = False,
+    mesh_collision_margin: float = 0.0,
 ) -> Tuple[RobotCfg, List[Dict], Dict, Dict, Optional[Dict]]:
     """Resolve YAML file paths to configuration dicts/objects.
 
@@ -222,22 +305,26 @@ def resolve_yaml_configs(
         device_cfg: Device configuration.
         load_collision_spheres: Whether to load collision spheres from robot config.
         num_envs: Number of environments (for multi-env collision checking).
+        mesh_collision_check: Add the exact mesh collision constraint to the metrics rollout.
+            The robot's collision meshes are loaded whenever the metrics rollout uses it.
+        mesh_collision_margin: Clearance in meters for the exact mesh collision constraint.
 
     Returns:
         Tuple of (robot_config, optimizer_dicts, metrics_rollout_dict,
         transition_model_dict, scene_model_dict).
     """
-    # Resolve robot config
-    robot_resolved = resolve_config(join_path(get_robot_configs_path(), robot))
-    if isinstance(robot_resolved, dict):
-        robot_config = RobotCfg.create(
-            robot_resolved,
-            device_cfg,
-            load_collision_spheres=load_collision_spheres,
-            num_envs=num_envs,
-        )
-    else:
-        robot_config = robot_resolved
+    # Resolve metrics rollout first: it decides whether collision meshes are needed.
+    metrics_rollout_dict = resolve_config(join_path(get_task_configs_path(), metrics_rollout))
+    if mesh_collision_check:
+        metrics_rollout_dict = enable_mesh_collision(metrics_rollout_dict, mesh_collision_margin)
+
+    robot_config = resolve_robot_config(
+        robot,
+        device_cfg,
+        load_collision_spheres=load_collision_spheres,
+        num_envs=num_envs,
+        load_collision_meshes=uses_mesh_collision(metrics_rollout_dict),
+    )
 
     # Resolve scene model
     scene_model_dict = None
@@ -249,8 +336,6 @@ def resolve_yaml_configs(
         resolve_config(join_path(get_task_configs_path(), cfg)) for cfg in optimizer_configs
     ]
 
-    # Resolve metrics rollout and transition model
-    metrics_rollout_dict = resolve_config(join_path(get_task_configs_path(), metrics_rollout))
     transition_model_dict = resolve_config(join_path(get_task_configs_path(), transition_model))
 
     return robot_config, optimizer_dicts, metrics_rollout_dict, transition_model_dict, scene_model_dict

@@ -18,7 +18,7 @@ import torch.autograd.profiler as profiler
 
 # CuRobo
 import curobo._src.runtime as curobo_runtime
-from curobo._src.cost.tool_pose_bound import ToolPoseBound
+from curobo._src.cost.tool_pose_bound import ToolPoseBounds
 from curobo._src.geom.collision.collision_scene import SceneCollision
 from curobo._src.rollout.goal_registry import GoalRegistry
 from curobo._src.rollout.metrics import RolloutMetrics
@@ -178,8 +178,8 @@ class TrajOptSolver:
     def update_tool_pose_criteria(self, tool_pose_criteria):
         return self.core.update_tool_pose_criteria(tool_pose_criteria)
 
-    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, Optional[ToolPoseBound]]):
-        """Set or clear (``None``) tool pose bounds, keeping the other tool pose criteria."""
+    def update_tool_pose_bounds(self, tool_pose_bounds: Dict[str, ToolPoseBounds]):
+        """Replace the tool pose bounds of the given tool frames, keeping the other criteria."""
         return self.core.update_tool_pose_bounds(tool_pose_bounds)
 
     def update_link_inertial(self, link_name, mass=None, com=None, inertia=None):
@@ -550,6 +550,8 @@ class TrajOptSolver:
             rotation_error=None,
             position_tolerance=self.config.position_tolerance,
             orientation_tolerance=self.config.orientation_tolerance,
+            position_tolerance_traj=self.config.position_tolerance_traj,
+            orientation_tolerance_traj=self.config.orientation_tolerance_traj,
             goalset_index=None,
             solve_time=0.0,
             debug_info={"solver": self.optimizer.get_recorded_trace()},

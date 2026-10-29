@@ -9,7 +9,12 @@ import torch
 
 from curobo._src.cost.cost_eef_bound import EEFBoundCost
 from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
-from curobo._src.cost.tool_pose_bound import ToolPoseBound, _quat_mul, tool_pose_bound_cost
+from curobo._src.cost.tool_pose_bound import (
+    ToolPoseBound,
+    _quat_mul,
+    tool_pose_bound_components,
+    tool_pose_bound_cost,
+)
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
@@ -50,32 +55,43 @@ def make_cost(device_cfg, bounds, weight=1.0, tool_frames=("ee",), **cfg_kwargs)
 
 
 BOUNDS = {
-    "goal_position_offset": dict(
-        anchor="goal",
-        offset_position=[0.05, None, 0.1],
-        offset_quaternion=[0.8, 0.2, 0.4, 0.4],
-        position_lower=[-0.02, None, -0.3],
-        position_upper=[0.03, 0.01, None],
-    ),
-    "goal_swing_twist": dict(
-        anchor="goal", rotation_lower=[-0.1, -0.05, -0.3], rotation_upper=[0.05, 0.1, 0.2]
-    ),
-    "base_cone": dict(
-        anchor="base",
-        offset_quaternion=[0.98, 0.0, 0.2, 0.0],
-        max_swing=0.2,
-        rotation_lower=[None, None, -0.5],
-        rotation_upper=[None, None, 0.4],
-        position_lower=[None, None, -0.1],
-    ),
-    "start_all": dict(
-        anchor="start",
-        position_lower=[-0.05] * 3,
-        position_upper=[0.05] * 3,
-        rotation_lower=[-0.1] * 3,
-        rotation_upper=[0.1] * 3,
-        max_swing=0.12,
-    ),
+    "goal_position": lambda: [
+        ToolPoseBound(
+            anchor="goal",
+            reference_rotation=[0.8, 0.2, 0.4, 0.4],
+            x=(-0.02, 0.03),
+            y=(None, 0.01),
+            z=(-0.3, None),
+        )
+    ],
+    "goal_tilt_yaw_roll": lambda: [
+        ToolPoseBound(
+            anchor="goal",
+            tool_rotation=[0.9, 0.3, -0.2, 0.25],
+            tilt=(0.5, 1.4),
+            yaw=(-0.3, 0.4),
+            roll=(2.8, 3.6),
+        )
+    ],
+    "base_cone": lambda: [
+        ToolPoseBound(anchor="base", reference_rotation=[0.98, 0.0, 0.2, 0.0], tilt=(None, 0.4)),
+        ToolPoseBound.plane((0.0, 0.0, 1.0), max_distance=None, anchor="base"),
+    ],
+    "start_box": lambda: [
+        ToolPoseBound(anchor="start", x=(-0.05, 0.05), y=(-0.05, 0.05), z=(-0.05, 0.05)),
+        ToolPoseBound.orientation_box(0.1, 0.2, 0.15, anchor="start"),
+    ],
+    "goal_base_axes_mixed": lambda: [
+        ToolPoseBound(
+            anchor="goal",
+            reference_axes="base",
+            reference_rotation=[0.7, 0.0, 0.7, 0.1],
+            y=(-0.02, 0.02),
+            tilt=(0.3, 1.0),
+        ),
+        ToolPoseBound.axis_tilt((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), 1.2, 1.6, anchor="base"),
+        ToolPoseBound.line((0.0, 1.0, 1.0), min_along=-0.1, max_along=0.1, anchor="start"),
+    ],
 }
 
 
@@ -104,11 +120,8 @@ class Problem:
         tool_poses = ToolPose(tool_frames=["ee"], position=position, quaternion=quaternion)
         return cost.forward(tool_poses, self.goal, self.idxs, self.start, self.idxs)
 
-    def reference(self, bound):
-        return self.reference_per_anchor(bound).min(dim=-1).values
-
-    def reference_per_anchor(self, bound):
-        """PyTorch cost against every anchor candidate, ``(B, H, A)``."""
+    def anchors(self, bound):
+        """Anchor candidates ``(B, 1, A, 3/4)`` of ``bound``; A is the goalset size for goals."""
         idx = self.idxs.long()
         if bound.anchor.name == "GOAL":
             anchor_p = self.goal.position[idx, 0, 0]
@@ -120,14 +133,48 @@ class Problem:
             anchor_p = torch.zeros_like(self.position[:, 0])
             anchor_q = torch.zeros_like(self.quaternion[:, 0])
             anchor_q[..., 0] = 1.0
-        cost = tool_pose_bound_cost(
-            bound,
-            self.position[:, :, 0].unsqueeze(2),
-            self.quaternion[:, :, 0].unsqueeze(2),
-            anchor_p.unsqueeze(1),
-            anchor_q.unsqueeze(1),
+        return anchor_p.unsqueeze(1), anchor_q.unsqueeze(1)
+
+    def pose(self):
+        return self.position[:, :, 0].unsqueeze(2), self.quaternion[:, :, 0].unsqueeze(2)
+
+    def reference_per_goal(self, bounds):
+        """PyTorch cost ``(B, H, G)``: every goal of the set as the anchor of goal bounds."""
+        position, quaternion = self.pose()
+        total = torch.zeros(position.shape[:2] + (1,), device=position.device)
+        goal_total = torch.zeros(
+            position.shape[:2] + (self.goal.num_goalset,), device=position.device
         )
-        return cost
+        for bound in bounds:
+            cost = tool_pose_bound_cost(bound, position, quaternion, *self.anchors(bound))
+            if bound.anchor.name == "GOAL":
+                goal_total = goal_total + cost
+            else:
+                total = total + cost
+        return total + goal_total
+
+    def reference(self, bounds):
+        return self.reference_per_goal(bounds).min(dim=-1).values
+
+    def well_conditioned(self, bounds, angle_margin=0.15):
+        """Samples away from the parallel-axes singularity and the ±π kink of wrapped angles."""
+        position, quaternion = self.pose()
+        ok = torch.ones(position.shape[:2], dtype=torch.bool, device=position.device)
+        for bound in bounds:
+            if bound.yaw is None and bound.roll is None:
+                continue
+            components, _ = tool_pose_bound_components(
+                bound, position, quaternion, *self.anchors(bound)
+            )
+            ok &= (torch.sin(components[..., 3]) > angle_margin).all(dim=-1)
+            for k, name in ((4, "yaw"), (5, "roll")):
+                limit = getattr(bound, name)
+                if limit is None:
+                    continue
+                d = components[..., k] - 0.5 * (limit[0] + limit[1])
+                d = torch.remainder(d + math.pi, 2.0 * math.pi) - math.pi
+                ok &= (d.abs() < math.pi - angle_margin).all(dim=-1)
+        return ok
 
 
 def world_omega(quaternion, quaternion_grad):
@@ -146,20 +193,20 @@ def world_omega(quaternion, quaternion_grad):
 
 @pytest.mark.parametrize("name", list(BOUNDS))
 def test_forward_matches_reference(device_cfg, name):
-    bound = ToolPoseBound(**BOUNDS[name])
+    bounds = BOUNDS[name]()
     problem = Problem(device_cfg.device)
-    cost = make_cost(device_cfg, {"ee": bound})
+    cost = make_cost(device_cfg, {"ee": bounds})
     out = problem.evaluate(cost)[..., 0]
     assert (out > 0).any()
-    assert torch.allclose(out, problem.reference(bound), atol=1e-5, rtol=1e-4)
+    assert torch.allclose(out, problem.reference(bounds), atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("name", list(BOUNDS))
 def test_gradient_matches_finite_difference(device_cfg, name):
     """Gradients equal world-frame finite differences, in the frame kinematics consumes."""
-    bound = ToolPoseBound(**BOUNDS[name])
-    problem = Problem(device_cfg.device, seed=1)
-    cost = make_cost(device_cfg, {"ee": bound}, use_grad_input=True)
+    bounds = BOUNDS[name]()
+    problem = Problem(device_cfg.device, seed=1, batch=3, horizon=16)
+    cost = make_cost(device_cfg, {"ee": bounds}, use_grad_input=True)
     position = problem.position.clone().requires_grad_(True)
     quaternion = problem.quaternion.clone().requires_grad_(True)
     problem.evaluate(cost, position, quaternion).sum().backward()
@@ -183,15 +230,14 @@ def test_gradient_matches_finite_difference(device_cfg, name):
         minus = problem.evaluate(cost, quaternion=q_minus).clone()
         fd_rotation[..., k] = (plus - minus)[..., 0] / (2 * eps)
 
-    # Skip samples where two goalset candidates have nearly equal cost: the minimum switches
-    # goals there, so the cost is not differentiable and finite differences straddle the switch.
-    per_anchor = problem.reference_per_anchor(bound)
-    if per_anchor.shape[-1] > 1:
-        best_two = per_anchor.topk(2, dim=-1, largest=False).values
-        clear = (best_two[..., 1] - best_two[..., 0]) > 1e-2
-    else:
-        clear = torch.ones(per_anchor.shape[:2], dtype=torch.bool, device=per_anchor.device)
-    assert clear.sum() >= clear.numel() // 2
+    # Skip samples where two goalset candidates have nearly equal cost (the minimum switches
+    # goals, so the cost is not differentiable there), and samples near the singularity, where
+    # the yaw and roll gradients are deliberately clamped.
+    clear = problem.well_conditioned(bounds)
+    if any(b.anchor.name == "GOAL" for b in bounds):
+        best_two = problem.reference_per_goal(bounds).topk(2, dim=-1, largest=False).values
+        clear &= (best_two[..., 1] - best_two[..., 0]) > 1e-2
+    assert clear.sum() >= clear.numel() // 3
     assert torch.allclose(position_grad[clear], fd_position[clear], atol=2e-3, rtol=1e-2)
     assert torch.allclose(omega[clear], fd_rotation[clear], atol=5e-3, rtol=1e-2)
 
@@ -205,11 +251,22 @@ def test_no_bound_is_zero(device_cfg):
 def test_criteria_update_sets_and_clears(device_cfg):
     problem = Problem(device_cfg.device)
     cost = make_cost(device_cfg, {})
-    bound = ToolPoseBound(**BOUNDS["start_all"])
-    cost.update_tool_pose_criteria({"ee": ToolPoseCriteria(bound=bound, device_cfg=device_cfg)})
+    bounds = BOUNDS["start_box"]()
+    cost.update_tool_pose_criteria({"ee": ToolPoseCriteria(bounds=bounds, device_cfg=device_cfg)})
     assert problem.evaluate(cost).sum().item() > 0.0
+    assert cost.tool_pose_bounds["ee"] == bounds
     cost.update_tool_pose_criteria({"ee": ToolPoseCriteria(device_cfg=device_cfg)})
     assert problem.evaluate(cost).sum().item() == 0.0
+    assert cost.tool_pose_bounds["ee"] == []
+
+
+def test_replacing_bounds_clears_old_slots(device_cfg):
+    problem = Problem(device_cfg.device)
+    two = BOUNDS["start_box"]()
+    cost = make_cost(device_cfg, {"ee": two})
+    cost.update_tool_pose_bounds({"ee": two[0]})
+    single = make_cost(device_cfg, {"ee": two[0]})
+    assert torch.allclose(problem.evaluate(cost), problem.evaluate(single))
 
 
 def test_unknown_tool_frame_raises(device_cfg):
@@ -218,9 +275,15 @@ def test_unknown_tool_frame_raises(device_cfg):
         cost.update_tool_pose_bounds({"other": ToolPoseBound.plane()})
 
 
+def test_too_many_bounds_raises(device_cfg):
+    cost = make_cost(device_cfg, {}, max_bounds_per_tool_frame=2)
+    with pytest.raises(ValueError, match="max_bounds_per_tool_frame"):
+        cost.update_tool_pose_bounds({"ee": [ToolPoseBound.plane()] * 3})
+
+
 def test_start_anchor_without_start_raises(device_cfg):
     problem = Problem(device_cfg.device)
-    cost = make_cost(device_cfg, {"ee": ToolPoseBound(**BOUNDS["start_all"])})
+    cost = make_cost(device_cfg, {"ee": BOUNDS["start_box"]()})
     tool_poses = ToolPose(
         tool_frames=["ee"], position=problem.position, quaternion=problem.quaternion
     )
@@ -228,14 +291,18 @@ def test_start_anchor_without_start_raises(device_cfg):
         cost.forward(tool_poses, problem.goal, problem.idxs)
 
 
-def test_tolerance_and_binary(device_cfg):
-    device = device_cfg.device
-    bound = ToolPoseBound.plane("z", anchor="base", tolerance=0.01)
-    position = torch.zeros(1, 3, 1, 3, device=device)
-    position[0, :, 0, 2] = torch.tensor([0.0, 0.005, 0.02], device=device)
-    quaternion = torch.zeros(1, 3, 1, 4, device=device)
+def _poses_along_z(values, device):
+    position = torch.zeros(1, len(values), 1, 3, device=device)
+    position[0, :, 0, 2] = torch.tensor(values, device=device)
+    quaternion = torch.zeros(1, len(values), 1, 4, device=device)
     quaternion[..., 0] = 1.0
-    tool_poses = ToolPose(tool_frames=["ee"], position=position, quaternion=quaternion)
+    return ToolPose(tool_frames=["ee"], position=position, quaternion=quaternion)
+
+
+def test_equality_tolerance_and_binary(device_cfg):
+    device = device_cfg.device
+    bound = ToolPoseBound.plane(anchor="base", tolerance=0.01)
+    tool_poses = _poses_along_z([0.0, 0.005, 0.02], device)
 
     optim = make_cost(device_cfg, {"ee": bound})
     expected = 0.5 * torch.tensor([0.0, 0.005, 0.02], device=device) ** 2
@@ -249,9 +316,59 @@ def test_tolerance_and_binary(device_cfg):
     assert feasible[2].item() > 1.0
 
 
+def test_inequality_shrinks_cost_and_keeps_metric_strict(device_cfg):
+    device = device_cfg.device
+    bound = ToolPoseBound(anchor="base", z=(0.0, 0.1), position_tolerance=0.01)
+    tool_poses = _poses_along_z([0.002, 0.05, -0.001], device)
+
+    optim = make_cost(device_cfg, {"ee": bound}).forward(tool_poses)[0, :, 0]
+    # The cost interval is [0.005, 0.095].
+    assert optim[0].item() == pytest.approx(0.5 * 0.003**2, rel=1e-3)
+    assert optim[1].item() == 0.0
+
+    metrics = make_cost(device_cfg, {"ee": bound}, metric=True).forward(tool_poses)[0, :, 0]
+    assert metrics[0].item() == 0.0 and metrics[1].item() == 0.0
+    assert metrics[2].item() > 0.0
+
+
+def test_cost_does_not_shrink_past_goal(device_cfg):
+    """A goal on the edge of an interval keeps zero cost, so it does not fight the pose cost."""
+    device = device_cfg.device
+    bound = ToolPoseBound.line(min_along=-0.12, max_along=0.0, tolerance=0.01)
+    goal = GoalToolPose(
+        tool_frames=["ee"],
+        position=torch.zeros(1, 1, 1, 1, 3, device=device),
+        quaternion=torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).view(1, 1, 1, 1, 4),
+    )
+    tool_poses = _poses_along_z([0.0, -0.002], device)
+    idxs = torch.zeros(1, dtype=torch.int32, device=device)
+    out = make_cost(device_cfg, {"ee": bound}).forward(tool_poses, goal, idxs)
+    assert out.abs().sum().item() == 0.0
+
+
+def test_wrapped_roll_interval(device_cfg):
+    """A roll interval crossing ±π accepts angles on both sides of π."""
+    device = device_cfg.device
+    bound = ToolPoseBound(
+        anchor="base",
+        tool_rotation=axis_angle([0, 1, 0], math.pi / 2, "cpu").tolist(),
+        tilt=(1.4, 1.75),
+        roll=(3.0, 3.4),
+        rotation_tolerance=0.0,
+    )
+    rolls = [3.1, -3.1, 0.0]
+    quaternion = torch.stack([axis_angle([1, 0, 0], r, device) for r in rolls]).view(1, 3, 1, 4)
+    tool_poses = ToolPose(
+        tool_frames=["ee"], position=torch.zeros(1, 3, 1, 3, device=device), quaternion=quaternion
+    )
+    out = make_cost(device_cfg, {"ee": bound}).forward(tool_poses)[0, :, 0]
+    assert out[0].item() == 0.0 and out[1].item() == 0.0
+    assert out[2].item() > 1.0
+
+
 def test_per_link_weight(device_cfg):
     device = device_cfg.device
-    bound = ToolPoseBound.plane("z", anchor="base")
+    bound = ToolPoseBound.plane(anchor="base")
     cost = make_cost(
         device_cfg, {"a": bound, "b": bound}, weight=[1.0, 3.0], tool_frames=("a", "b")
     )
@@ -272,7 +389,7 @@ def test_per_link_weight(device_cfg):
 def test_out_of_range_anchor_index_is_ignored(device_cfg):
     """The kernel guards anchor indices instead of reading past the anchor arrays."""
     problem = Problem(device_cfg.device)
-    cost = make_cost(device_cfg, {"ee": ToolPoseBound(**BOUNDS["start_all"])})
+    cost = make_cost(device_cfg, {"ee": BOUNDS["start_box"]()})
     tool_poses = ToolPose(
         tool_frames=["ee"], position=problem.position, quaternion=problem.quaternion
     )
@@ -283,7 +400,7 @@ def test_out_of_range_anchor_index_is_ignored(device_cfg):
 
 def test_unused_goal_with_horizon_is_ignored(device_cfg):
     problem = Problem(device_cfg.device)
-    cost = make_cost(device_cfg, {"ee": ToolPoseBound(**BOUNDS["base_cone"])})
+    cost = make_cost(device_cfg, {"ee": BOUNDS["base_cone"]()})
     goal = GoalToolPose(
         tool_frames=["ee"],
         position=problem.goal.position.expand(2, 3, 1, 2, 3).contiguous(),

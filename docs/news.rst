@@ -1,6 +1,9 @@
 
 Updates
 =======
+- October 27, 2026: Add exact robot-mesh collision checking, a multi-waypoint motion planner,
+  and tool pose bounds that keep a tool frame within position and orientation limits during
+  motion.
 - July 9, 2026: Add visibility-tested textured mapper outputs, independent RGB and
   neural-feature resolutions, and faster TSDF mesh extraction for real-time visualization.
 - June 15, 2026: Add LiDAR TSDF, RGB, and feature fusion, compact mapper block

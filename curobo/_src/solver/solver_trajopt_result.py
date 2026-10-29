@@ -206,7 +206,7 @@ class TrajOptSolverResult(BaseSolverResult):
                     # All non-terminal steps and links must pass
                     converged_traj_all = torch.all(
                         converged_traj.view(batch_size * num_seeds, -1), dim=-1
-                    ).unsqueeze(-1)  # Shape: (batch*num_seeds, 1)
+                    ).view(-1, 1, 1)  # Shape: (batch*num_seeds, 1, 1), like converged_goal
                     converge_list.append(converged_traj_all)
 
             elif "orientation_tolerance" in metric_name:
@@ -225,7 +225,7 @@ class TrajOptSolverResult(BaseSolverResult):
                         converged_traj = converged_traj | ~traj_mask.view(1, -1, 1)
                     converged_traj_all = torch.all(
                         converged_traj.view(batch_size * num_seeds, -1), dim=-1
-                    ).unsqueeze(-1)
+                    ).view(-1, 1, 1)
                     converge_list.append(converged_traj_all)
 
             elif "goalset_index" in metric_name:

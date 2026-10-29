@@ -16,9 +16,9 @@ from curobo._src.util.logging import log_and_raise
 class EEFBoundCostCfg(BaseCostCfg):
     """Configuration for the tool-frame bound cost.
 
-    The bounds themselves are runtime data: set them per link through
-    :attr:`ToolPoseCriteria.bound <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bound>`.
-    ``weight`` is a scalar or one value per tool frame.
+    The bounds themselves are runtime data: set them per tool frame through
+    :attr:`ToolPoseCriteria.bounds <curobo._src.cost.tool_pose_criteria.ToolPoseCriteria.bounds>`
+    or ``update_tool_pose_bounds``. ``weight`` is a scalar or one value per tool frame.
     """
 
     class_type: Type[EEFBoundCost] = EEFBoundCost
@@ -27,10 +27,14 @@ class EEFBoundCostCfg(BaseCostCfg):
     #: tool frames.
     tool_frames: Optional[List[str]] = None
 
-    #: ``False`` (optimization cost): each interval side is shrunk inward by the bound margin so
-    #: paths stay inside the user's bounds. ``True`` (metrics constraint deciding feasibility):
-    #: the user's bounds, with the tolerance only on sides the cost could not shrink.
+    #: ``False`` (optimization cost): inequality limits are moved inward by half the tolerance
+    #: so paths stay inside them. ``True`` (metrics constraint deciding feasibility): the given
+    #: limits, with equality limits widened by the tolerance.
     metric: bool = False
+
+    #: Number of bounds each tool frame can hold. Fixed at creation so that bound updates keep
+    #: the kernel launch unchanged (CUDA graph safe).
+    max_bounds_per_tool_frame: int = 4
 
     def set_tool_frames(self, tool_frames: List[str]) -> None:
         """Set the tool frames the cost applies to.

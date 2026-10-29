@@ -4,13 +4,13 @@ from __future__ import annotations
 
 # Standard Library
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 # Third Party
 import torch
 
 # CuRobo
-from curobo._src.cost.tool_pose_bound import ToolPoseBound
+from curobo._src.cost.tool_pose_bound import ToolPoseBound, normalize_tool_pose_bounds
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise
 
@@ -43,12 +43,14 @@ class ToolPoseCriteria:
     project_distance_to_goal: Union[torch.Tensor, bool] = False
 
     #: Bounds on this tool frame over the whole trajectory, enforced by the ``eef_bound`` cost
-    #: and checked for feasibility. ``None`` leaves the tool frame unbounded.
-    bound: Optional[ToolPoseBound] = None
+    #: and checked for feasibility; a pose must satisfy all of them. A single bound or ``None``
+    #: is accepted and stored as a list.
+    bounds: Optional[Union[ToolPoseBound, Sequence[ToolPoseBound]]] = None
 
     device_cfg: DeviceCfg = DeviceCfg()
 
     def __post_init__(self):
+        self.bounds = normalize_tool_pose_bounds(self.bounds)
         if self.terminal_pose_axes_weight_factor is None:
             self.terminal_pose_axes_weight_factor = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         elif len(self.terminal_pose_axes_weight_factor) != 6:
@@ -113,7 +115,7 @@ class ToolPoseCriteria:
             terminal_pose_convergence_tolerance=self.terminal_pose_convergence_tolerance.clone(),
             non_terminal_pose_convergence_tolerance=self.non_terminal_pose_convergence_tolerance.clone(),
             project_distance_to_goal=self.project_distance_to_goal.clone(),
-            bound=self.bound,
+            bounds=list(self.bounds),
             device_cfg=self.device_cfg,
         )
 
@@ -135,8 +137,8 @@ class ToolPoseCriteria:
             )
         if other.project_distance_to_goal is not None:
             self.project_distance_to_goal[:] = other.project_distance_to_goal
-        # ``None`` clears the bound, so it is always copied.
-        self.bound = other.bound
+        # An empty list clears the bounds, so they are always copied.
+        self.bounds = list(other.bounds)
 
     @staticmethod
     def track_position(xyz: List[float] = [1.0, 1.0, 1.0]):

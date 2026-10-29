@@ -134,6 +134,8 @@ class TrajOptSolverCfg:
         scene_model: Optional[Union[str, Dict[str, Any]]] = None,
         collision_cache: Optional[Dict[str, int]] = None,
         self_collision_check: bool = True,
+        mesh_collision_check: bool = False,
+        mesh_collision_margin: float = 0.0,
         device_cfg: DeviceCfg = DeviceCfg(),
         num_seeds: int = 4,
         position_tolerance: float = 0.005,
@@ -170,12 +172,20 @@ class TrajOptSolverCfg:
             scene_model: Optional scene model config - path or dict.
             collision_cache: Cache configuration for collision checking.
             self_collision_check: Whether to check self-collision.
+            mesh_collision_check: Also validate solutions against the robot's exact collision
+                meshes instead of only its collision spheres. Adds a pass/fail constraint to
+                the metrics rollout and loads the URDF collision meshes. Needs a scene.
+            mesh_collision_margin: Clearance in meters the collision meshes must keep from
+                obstacles when ``mesh_collision_check`` is True.
             device_cfg: Device configuration.
             num_seeds: Number of optimization seeds.
             position_tolerance: Position tolerance for success.
             orientation_tolerance: Orientation tolerance for success.
-            position_tolerance_traj: Position tolerance for non-terminal trajectory steps.
-            orientation_tolerance_traj: Orientation tolerance for non-terminal trajectory steps.
+            position_tolerance_traj: Position tolerance in meters for every step before the
+                last one, measured on the axes constrained by the non-terminal tool pose
+                criteria (for example ``ToolPoseCriteria.linear_motion``). 0 disables the check.
+            orientation_tolerance_traj: Orientation tolerance in radians for the same steps and
+                axes. 0 disables the check.
             use_cuda_graph: Enable CUDA graph capture for solver rollouts
                 and optimizers. Defaults to True and should be left enabled
                 for normal integration/runtime code. cuRobo manages graph
@@ -224,6 +234,8 @@ class TrajOptSolverCfg:
                 scene_model,
                 device_cfg,
                 load_collision_spheres=load_collision_spheres,
+                mesh_collision_check=mesh_collision_check,
+                mesh_collision_margin=mesh_collision_margin,
                 num_envs=num_envs,
             )
         )

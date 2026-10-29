@@ -343,3 +343,39 @@ class TestMotionPlannerCfgConfigContents:
     def test_config_without_scene_has_none_scene_collision_cfg(self, motion_planner_config):
         """Test config without scene model has None scene_collision_cfg."""
         assert motion_planner_config.scene_collision_cfg is None
+
+    def test_default_mesh_collision_check_parameter(self):
+        """Test mesh collision checking is off by default."""
+        import inspect
+        sig = inspect.signature(MotionPlannerCfg.create)
+        assert sig.parameters["mesh_collision_check"].default is False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_default_config_has_no_mesh_collision(self, motion_planner_config):
+        """Test the default metrics rollouts have no mesh collision constraint."""
+        for solver_config in (
+            motion_planner_config.ik_solver_config,
+            motion_planner_config.trajopt_solver_config,
+        ):
+            constraint_cfg = solver_config.metrics_rollout_config.constraint_cfg
+            assert constraint_cfg.mesh_collision_cfg is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mesh_collision_check_enables_constraint(self, cuda_device_cfg):
+        """Test mesh_collision_check adds the constraint to IK and TrajOpt metrics."""
+        config = MotionPlannerCfg.create(
+            robot="franka.yml",
+            scene_model="collision_table.yml",
+            device_cfg=cuda_device_cfg,
+            num_ik_seeds=16,
+            num_trajopt_seeds=2,
+            use_cuda_graph=False,
+            mesh_collision_check=True,
+            mesh_collision_margin=0.002,
+        )
+        robot_kinematics = config.trajopt_solver_config.robot_config.kinematics
+        assert robot_kinematics.kinematics_config.link_collision_meshes is not None
+        for solver_config in (config.ik_solver_config, config.trajopt_solver_config):
+            mesh_cfg = solver_config.metrics_rollout_config.constraint_cfg.mesh_collision_cfg
+            assert mesh_cfg is not None
+            assert mesh_cfg.margin == pytest.approx(0.002)

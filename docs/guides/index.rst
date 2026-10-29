@@ -22,3 +22,4 @@ Motion Planning
    :maxdepth: 1
 
    tool_pose_bounds
+   mesh_collision

@@ -513,3 +513,90 @@ class TestToolPoseCostGradients:
         assert current_position.grad.shape == current_position.shape
         assert current_quaternion.grad.shape == current_quaternion.shape
 
+
+def _quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def _quat_exp_wxyz(rotation_vector: torch.Tensor) -> torch.Tensor:
+    angle = rotation_vector.norm()
+    axis = rotation_vector / angle
+    return torch.cat([torch.cos(angle / 2).view(1), torch.sin(angle / 2) * axis])
+
+
+class TestToolPoseCostRotationGradientScale:
+    """The angular gradient kinematics receives must match finite differences of the cost."""
+
+    @pytest.fixture(params=["cpu", "cuda:0"])
+    def scale_device_cfg(self, request):
+        if request.param.startswith("cuda") and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        return DeviceCfg(device=torch.device(request.param))
+
+    @staticmethod
+    def _evaluate(cost, quaternion, device_cfg):
+        """Return the cost and the quaternion gradient ``(w, x, y, z)`` for one tool pose."""
+        kwargs = device_cfg.as_torch_dict()
+        current = ToolPose(
+            tool_frames=["ee_link"],
+            position=torch.zeros((1, 1, 1, 3), **kwargs),
+            quaternion=quaternion.view(1, 1, 1, 4).to(**kwargs),
+        )
+        goal_quaternion = torch.zeros((1, 1, 1, 1, 4), **kwargs)
+        goal_quaternion[..., 0] = 1.0
+        goal = GoalToolPose(
+            tool_frames=["ee_link"],
+            position=torch.zeros((1, 1, 1, 1, 3), **kwargs),
+            quaternion=goal_quaternion,
+        )
+        idxs_goal = torch.zeros((1, 1), device=device_cfg.device, dtype=torch.int32)
+        cost_val, _, _, _ = cost.forward(current, goal, idxs_goal)
+        return cost_val.sum().item(), cost._out_rotation_gradient.view(4).cpu().clone()
+
+    @pytest.mark.parametrize("use_lie_group", [False, True])
+    @pytest.mark.parametrize(
+        "rotation_vector", [[0.3, 0.0, 0.0], [0.5, -0.4, 0.2], [0.0, 2.0, 0.5]]
+    )
+    def test_received_gradient_matches_finite_difference(
+        self, scale_device_cfg, use_lie_group, rotation_vector
+    ):
+        cfg = ToolPoseCostCfg(
+            weight=[1.0, 1.0],
+            tool_frames=["ee_link"],
+            use_lie_group=use_lie_group,
+            device_cfg=scale_device_cfg,
+        )
+        cost = ToolPoseCost(cfg)
+        cost.setup_batch_tensors(batch_size=1, horizon=1)
+        quaternion = _quat_exp_wxyz(torch.tensor(rotation_vector))
+
+        _, quaternion_gradient = self._evaluate(cost, quaternion, scale_device_cfg)
+        # Kinematics backward reads the angular gradient as 0.5 * vec(q^-1 (x) dq).
+        conjugate = quaternion * torch.tensor([1.0, -1.0, -1.0, -1.0])
+        received = 0.5 * _quat_mul_wxyz(conjugate, quaternion_gradient)[1:]
+
+        eps = 1.0e-3
+        finite_difference = torch.zeros(3)
+        for i in range(3):
+            step = torch.zeros(3)
+            step[i] = eps
+            plus, _ = self._evaluate(
+                cost, _quat_mul_wxyz(_quat_exp_wxyz(step), quaternion), scale_device_cfg
+            )
+            minus, _ = self._evaluate(
+                cost, _quat_mul_wxyz(_quat_exp_wxyz(-step), quaternion), scale_device_cfg
+            )
+            finite_difference[i] = (plus - minus) / (2.0 * eps)
+
+        assert torch.allclose(received, finite_difference, atol=2.0e-3, rtol=1.0e-2)
+

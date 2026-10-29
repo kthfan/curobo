@@ -107,22 +107,24 @@ def compute_position_error(
 
 @wp.func
 def convert_angular_velocity_to_quaternion_rate(angular_velocity: wp.vec3, current_quat: wp.quat):
-    """Convert angular velocity to quaternion rate.
+    """Encode an angular gradient as the quaternion gradient read by kinematics backward.
 
-    This function converts angular velocity to quaternion rate using the quaternion multiplication.
-    The quaternion rate is then scaled by 0.5.
+    Kinematics backward recovers the angular gradient as ``0.5 * vec(q⁻¹ ⊗ dq)``, so the
+    gradient ``g`` is encoded as ``dq = q ⊗ (0, 2g)``.
 
     Args:
-        angular_velocity: The angular velocity. In x, y, z format.
+        angular_velocity: Gradient of the cost with respect to a rotation vector perturbation of
+            the tool frame. In x, y, z format.
         current_quat: The current quaternion. In x, y, z, w format.
 
     Returns:
-        quat_rate: The quaternion rate. In x, y, z, w format.
+        quat_rate: The quaternion gradient. In x, y, z, w format.
     """
-    omega_quat = wp.quat(angular_velocity[0], angular_velocity[1], angular_velocity[2], 0.0)
+    omega_quat = wp.quat(
+        2.0 * angular_velocity[0], 2.0 * angular_velocity[1], 2.0 * angular_velocity[2], 0.0
+    )
 
     quat_rate = wp.mul(current_quat, omega_quat)
-    # quat_rate = 0.5 * quat_rate
     return quat_rate
 
 
@@ -288,9 +290,9 @@ def compute_rotation_error_lie_group(
         # The gradient in the tangent space is simply the weighted tangent vector
         # scaled by the derivative of the cost function
 
-        # Apply the chain rule: gradient w.r.t. current quaternion
-        # The gradient of the logarithmic map provides the proper manifold-aware derivative
-        gradient_as_angular_velocity = 2.0 * rotation_weight * weighted_tangent_vector
+        # d(distance)/d(tangent) = 2 * w * tangent, and the tangent vector is half the rotation
+        # vector, so the gradient with respect to the rotation vector is w * tangent.
+        gradient_as_angular_velocity = rotation_weight * weighted_tangent_vector
 
     return angular_distance, gradient_as_angular_velocity, angle
 
@@ -378,9 +380,9 @@ def compute_rotation_error_lie_group_advanced(
     if angular_distance < convergence_tolerance:
         angular_distance = 0.0
     else:
-        # Proper manifold-aware gradient computation
-        # The gradient includes the Jacobian of the logarithmic map
-        gradient_as_angular_velocity = 2.0 * rotation_weight * weighted_tangent_vector
+        # d(distance)/d(tangent) = 2 * w * tangent, and the tangent vector is half the rotation
+        # vector, so the gradient with respect to the rotation vector is w * tangent.
+        gradient_as_angular_velocity = rotation_weight * weighted_tangent_vector
 
     return angular_distance, gradient_as_angular_velocity, angle
 
