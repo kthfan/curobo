@@ -256,13 +256,13 @@ def _folded_and_default(device_cfg, kinematics) -> torch.Tensor:
 
 def test_checker_rejects_mesh_self_collision(cuda_device_cfg):
     """The folded configuration passes the sphere checks and fails the mesh self-check."""
-    from curobo._src.collision.collision_robot_scene import RobotCollisionChecker
-    from curobo._src.collision.collision_robot_scene_cfg import RobotCollisionCheckerCfg
+    from curobo._src.collision.collision_robot_scene import RobotSceneCollision
+    from curobo._src.collision.collision_robot_scene_cfg import RobotSceneCollisionCfg
 
     valid = {}
     for use_mesh in (False, True):
-        checker = RobotCollisionChecker(
-            RobotCollisionCheckerCfg.load_from_config(
+        checker = RobotSceneCollision(
+            RobotSceneCollisionCfg.load_from_config(
                 robot_config="franka.yml",
                 device_cfg=cuda_device_cfg,
                 use_mesh_self_collision_constraint=use_mesh,
@@ -275,12 +275,12 @@ def test_checker_rejects_mesh_self_collision(cuda_device_cfg):
 
 def test_checker_validates_with_the_scene_mesh_constraint(cuda_device_cfg):
     """The checker combines the scene mesh constraint with the other terms in validate."""
-    from curobo._src.collision.collision_robot_scene import RobotCollisionChecker
-    from curobo._src.collision.collision_robot_scene_cfg import RobotCollisionCheckerCfg
+    from curobo._src.collision.collision_robot_scene import RobotSceneCollision
+    from curobo._src.collision.collision_robot_scene_cfg import RobotSceneCollisionCfg
     from curobo._src.geom.types import Cuboid, SceneCfg
 
-    checker = RobotCollisionChecker(
-        RobotCollisionCheckerCfg.load_from_config(
+    checker = RobotSceneCollision(
+        RobotSceneCollisionCfg.load_from_config(
             robot_config="franka.yml",
             scene_model=SceneCfg(
                 cuboid=[Cuboid(name="far", pose=[3, 0, 0, 1, 0, 0, 0], dims=[0.1, 0.1, 0.1])]
@@ -409,8 +409,8 @@ def test_replay_follows_link_mesh_updates():
     steps = [
         lambda: None,
         lambda: robot.update_link_mesh("obj", rod),
-        lambda: robot.disable_link_mesh("b"),
-        lambda: robot.enable_link_mesh("b"),
+        lambda: robot.disable_link_mesh("a"),
+        lambda: robot.enable_link_mesh("a"),
         lambda: robot.clear_link_mesh("obj"),
     ]
     results = []
@@ -420,4 +420,5 @@ def test_replay_follows_link_mesh_updates():
         eager = check_robot_mesh_self_collision(robot, tf)
         assert torch.equal(replayed[0], eager[0]) and torch.equal(replayed[1], eager[1])
         results.append(eager[0].tolist())
-    assert results == [[1, 0], [1, 1], [0, 1], [1, 1], [1, 0]]
+    # Without a, only b and the rod overlap, in the first configuration.
+    assert results == [[1, 0], [1, 1], [1, 0], [1, 1], [1, 0]]
