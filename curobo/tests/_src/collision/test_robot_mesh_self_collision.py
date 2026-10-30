@@ -237,8 +237,8 @@ def test_franka_skips_adjacent_links(franka_mesh_data):
 # =============================================================================
 
 #: Franka configuration in which the hand mesh folds into link5. link5-hand is a pair the
-#: sphere check ignores, and no pair it checks collides here. Found by sampling with
-#: cpu_verify/verify_franka_self_collision.py; it holds under +-0.05 rad joint perturbations.
+#: sphere check ignores, and no pair it checks collides here. Found by sampling random
+#: configurations; it holds under +-0.05 rad joint perturbations.
 Q_FOLDED = [-0.731, 0.449, -0.621, -1.891, 0.02, 0.228, -0.034]
 
 
