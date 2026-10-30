@@ -47,11 +47,12 @@ Steps:
   triangle-triangle test, `triangles_within` for the margin). Links with runtime geometry
   (`extra_collision_meshes`) go on the A side. Pair-level culling with the link bounding
   spheres. Disabled / cleared links skip their pairs.
-- [ ] Constraint `mesh_self_collision` in the metrics rollouts (IK, TrajOpt optimized and
+- [x] Constraint `mesh_self_collision` in the metrics rollouts (IK, TrajOpt optimized and
   interpolated steps, MPC), wiring in `solver_core_cfg` like `mesh_collision_cfg`, and
   `RobotCollisionChecker` support.
-- [ ] Report the colliding pair (extend `get_mesh_collision_links` or a sibling method).
-- [ ] `RobotBuilder.compute_mesh_collision_matrix` and saving it.
+- [x] Report the colliding pair: `get_mesh_self_collision_pairs` on the solvers and planners.
+- [x] `RobotBuilder.compute_mesh_collision_matrix` (default-configuration and nearly-always
+  colliding pairs, plus a custom list; never-colliding pairs stay checked) and saving it.
 - [ ] Tests: CPU kernel tests (intersection, margin, culling equivalence, ignore list,
   disabled link, runtime geometry), config wiring, an end-to-end IK case with link5–link7 in
   collision, CUDA graph replay.
