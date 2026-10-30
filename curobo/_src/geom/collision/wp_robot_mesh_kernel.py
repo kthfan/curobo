@@ -113,6 +113,10 @@ def tri_aabb_hi(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, margin: wp.float32) -> wp
 #: Absolute slack added to every culling threshold, covering float round-off.
 LINK_CULL_EPS = wp.constant(1.0e-4)
 
+#: Cap on barycentric subdivisions per robot triangle in the voxel kernel. It bounds the work
+#: per thread; a triangle that needs more is sampled coarser with a widened threshold.
+MAX_VOXEL_SAMPLES_PER_EDGE = wp.constant(16)
+
 
 @wp.func
 def link_clear_of_obstacle(
@@ -158,13 +162,15 @@ def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
     radius: wp.float32,
     margin: wp.float32,
 ) -> wp.bool:
-    """Whether no sample inside the sphere can read an ESDF value ``<= margin``.
+    """Whether no sample inside the sphere can read an ESDF value at or below its threshold.
 
     Assumes the ESDF holds distances, as the sphere collision cost does. Trilinear
     interpolation stays within ``sqrt(3) * voxel_size`` of the stored distance, once at the
-    centre and once at a sample, hence the ``2 sqrt(3) voxel_size`` slack. Outside the grid
-    the ESDF reads as free, so a centre outside the grid only proves clearance when the whole
-    sphere is outside it.
+    centre and once at a sample, hence the ``2 sqrt(3) voxel_size`` slack. The voxel kernel
+    widens its threshold beyond ``margin`` when the sampling cap applies, by less than
+    ``longest_edge / (MAX_VOXEL_SAMPLES_PER_EDGE * sqrt(3))``, and no triangle edge inside the
+    sphere is longer than its diameter. Outside the grid the ESDF reads as free, so a centre
+    outside the grid only proves clearance when the whole sphere is outside it.
     """
     flat = env_idx * obs.max_n + o
     voxel_size = obs.params[flat, 3]
@@ -182,7 +188,8 @@ def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
     distance_to_grid = wp.length(outside)
     if distance_to_grid > 0.0:
         return distance_to_grid > radius + LINK_CULL_EPS
-    slack = radius + margin + 3.4641016 * voxel_size + LINK_CULL_EPS
+    widening = 2.0 * radius / (wp.float32(MAX_VOXEL_SAMPLES_PER_EDGE) * 1.7320508)
+    slack = radius + margin + widening + 3.4641016 * voxel_size + LINK_CULL_EPS
     return compute_local_sdf(obs, env_idx, o, local) > slack
 
 
@@ -663,13 +670,16 @@ def robot_voxel_collision_kernel(
     horizon: wp.int32,
     margin: wp.float32,
     use_multi_env: wp.uint8,
-    max_samples_per_edge: wp.int32,
 ):
     """Sampled robot-triangle vs voxel ESDF collision.
 
     The triangle is sampled on a barycentric lattice fine enough that adjacent samples are
     at most half a voxel apart, then each sample is tested against the ESDF. This is
     **not exact**: geometry thinner than the voxel size can slip between samples.
+
+    A triangle that needs more than ``MAX_VOXEL_SAMPLES_PER_EDGE`` subdivisions is sampled
+    coarser, and its threshold is widened so that it catches everything a half-voxel lattice
+    would: it may report collisions slightly farther than ``margin`` instead of missing any.
 
     Args:
         robot: Robot collision triangles and per-link transforms.
@@ -683,8 +693,6 @@ def robot_voxel_collision_kernel(
         horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; a sample collides when its ESDF value is <= margin.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
-        max_samples_per_edge: Upper bound on lattice subdivisions, capping per-thread cost
-            for large triangles or fine grids.
     """
     tid = wp.tid()
 
@@ -726,8 +734,14 @@ def robot_voxel_collision_kernel(
 
         # Choose a subdivision count so adjacent samples are at most voxel_size/2 apart.
         longest = wp.max(wp.length(a1 - a0), wp.max(wp.length(a2 - a1), wp.length(a0 - a2)))
-        steps = wp.int32(wp.ceil(longest / wp.max(voxel_size * 0.5, 1.0e-6)))
-        steps = wp.clamp(steps, 1, max_samples_per_edge)
+        half_voxel = voxel_size * 0.5
+        steps = wp.int32(wp.ceil(longest / wp.max(half_voxel, 1.0e-6)))
+        steps = wp.clamp(steps, 1, MAX_VOXEL_SAMPLES_PER_EDGE)
+        # Every point of the triangle lies within spacing / sqrt(3) of a lattice sample, and
+        # the ESDF changes by at most the distance moved. Where the cap makes the spacing
+        # coarser than half a voxel, widen the threshold by the extra reach.
+        spacing = longest / wp.float32(steps)
+        threshold = margin + wp.max(spacing - half_voxel, 0.0) / 1.7320508
 
         inv_steps = 1.0 / wp.float32(steps)
         for i in range(steps + 1):
@@ -735,6 +749,6 @@ def robot_voxel_collision_kernel(
             for j in range(steps + 1 - i):
                 v = wp.float32(j) * inv_steps
                 p = a0 + (a1 - a0) * u + (a2 - a0) * v
-                if compute_local_sdf(obs, env_idx, o, p) <= margin:
+                if compute_local_sdf(obs, env_idx, o, p) <= threshold:
                     report_collision(in_collision, contact_link, cfg_idx, link_idx)
                     return

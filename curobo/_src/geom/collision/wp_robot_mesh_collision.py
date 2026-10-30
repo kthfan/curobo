@@ -30,9 +30,6 @@ if TYPE_CHECKING:
     from curobo._src.geom.data.data_robot_mesh import RobotMeshData
     from curobo._src.geom.data.data_scene import SceneData
 
-#: Cap on barycentric subdivisions per robot triangle in the voxel kernel.
-MAX_VOXEL_SAMPLES_PER_EDGE = 16
-
 
 def check_robot_mesh_collision(
     robot_mesh: "RobotMeshData",
@@ -178,7 +175,6 @@ def check_robot_mesh_collision(
                 horizon,
                 margin_wp,
                 use_multi_env_wp,
-                MAX_VOXEL_SAMPLES_PER_EDGE,
             ],
             stream=stream,
             device=wp_device,

@@ -19,11 +19,17 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 - [x] **P1 – Fix the docs that rely on the margin.** With the fix above the guide and the
   `mesh_collision_margin` docstrings are correct as written; the concept page now states the
   margin per obstacle type.
-- [ ] **P2 – Voxel sampling cap.** `MAX_VOXEL_SAMPLES_PER_EDGE = 16`
-  (`wp_robot_mesh_collision.py:33`) caps the lattice, so a large triangle on a fine grid is
-  sampled coarser than voxel/2 (e.g. a 10 cm edge on a 1 cm grid gives ~6 mm spacing).
-  Options: subdivide large robot triangles at load time so no edge exceeds a target length,
-  or make the cap depend on the triangle size and voxel size, with a warning when clamped.
+- [x] **P2 – Voxel sampling cap.** Franka's decimated links have triangles with 18–29 cm
+  edges, so on a 1 cm grid nearly every large triangle hits the cap of 16. Measured on a T4
+  (4096 configs, table + box ESDF vs the exact cuboid check): misses were identical for caps
+  16 / 32 / 64 / 128 and came from the table extending past the grid and from contacts within
+  one voxel (gone with margin + 2 cm), while a cap of 64 cost 2.5–4x on a 1 cm grid. Decision:
+  keep the cap (now `wp.constant` in the kernel module) and, where it applies, widen the
+  threshold by `(spacing - voxel/2) / sqrt(3)`, the extra reach of the coarse lattice; the
+  voxel culling threshold adds the matching bound `2 r / (16 sqrt(3))`. Capped triangles now
+  catch what half-voxel sampling would, at the price of collisions up to a few mm beyond the
+  margin (7.5 mm for a 29 cm edge on 1 cm). Test:
+  `test_voxel_capped_sampling_still_catches_small_obstacles` (fails without the widening).
 - [x] **P2 – Containment depends on the obstacle SDF sign.** Verified on the CPU with
   `cpu_verify/verify_open_mesh_sign.py`. The sign comes from Warp's `mesh_query_point`: rays
   along +x, +y, +z, inside if at least two first hit a back face. The sphere collision cost uses

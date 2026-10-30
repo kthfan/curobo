@@ -193,7 +193,8 @@ is_valid = checker.validate(joint_positions)
 - The graph planner that seeds trajectory optimization uses the spheres only; the trajectory
   optimization that follows the seed applies the mesh check.
 - Voxel (ESDF) obstacles are checked by sampling, so features thinner than the voxel size can
-  be missed. Cuboid and mesh obstacles are checked exactly.
+  be missed, and nothing outside the voxel grid is seen. Large robot triangles on fine grids
+  are checked slightly conservatively. Cuboid and mesh obstacles are checked exactly.
 - An obstacle small enough to sit entirely inside a link, touching none of its triangles, is
   not detected.
 - Mesh obstacles should be closed. For open meshes, such as a bin without wall thickness or a

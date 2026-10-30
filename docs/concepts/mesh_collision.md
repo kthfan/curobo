@@ -62,6 +62,13 @@ mesh obstacles it is the exact triangle-to-triangle distance, for voxels it is c
 sampled distance field, and for cuboids it enlarges the box by the margin on every side, which
 is slightly more conservative near the box corners.
 
+To bound the work per triangle, a triangle is split into at most 16 steps per edge. A large
+triangle on a fine grid, such as a 25 cm triangle on a 1 cm grid, is therefore sampled more
+coarsely than half a voxel. For such a triangle the check compares the samples with a larger
+distance than the margin, enough to catch everything that half-voxel sampling would catch. It
+may then report a collision up to a few millimeters beyond the margin, but it does not miss
+more. Space outside the voxel grid reads as free, so obstacles beyond the grid are not seen.
+
 One case is missed for every obstacle type: an obstacle small enough to lie entirely inside a
 link, crossing none of its triangles. Detecting it would need a point-in-robot test, which is
 expensive because the robot geometry moves with every configuration.

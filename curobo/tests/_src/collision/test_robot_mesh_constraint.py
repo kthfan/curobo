@@ -62,9 +62,7 @@ def _link_transforms(x_positions) -> torch.Tensor:
 def _check(robot_mesh, scene, tf, env_query_idx=None, **kwargs):
     use_multi_env = env_query_idx is not None
     if env_query_idx is None:
-        env_query_idx = torch.zeros(
-            tf.shape[0], dtype=torch.int32, device=DEVICE_CFG.device
-        )
+        env_query_idx = torch.zeros(tf.shape[0], dtype=torch.int32, device=DEVICE_CFG.device)
     return check_robot_mesh_collision(
         robot_mesh=robot_mesh,
         link_transforms=tf,
@@ -296,6 +294,57 @@ def test_voxel_boundary_within_resolution(robot_mesh):
 
     coll, _ = _check(robot_mesh, scene, _link_transforms([0.25 + 3 * voxel_size]))
     assert coll.tolist() == [0]
+
+
+def _large_triangle_robot() -> RobotMeshData:
+    """One triangle with 0.64 m legs along x and y in the plane z = 0.
+
+    On a 1 cm grid it needs 91 subdivisions, so the cap of 16 applies: samples are 4 cm apart
+    along the legs, at x, y = -0.18 + 0.04 k, and the origin is the centre of a lattice cell.
+    """
+    corner = -0.18
+    vertices = np.array(
+        [[corner, corner, 0.0], [corner + 0.64, corner, 0.0], [corner, corner + 0.64, 0.0]]
+    )
+    return RobotMeshData.from_link_meshes(
+        link_meshes={
+            "l0": Mesh(
+                name="l0",
+                vertices=vertices,
+                faces=np.array([[0, 1, 2]]),
+                pose=[0, 0, 0, 1, 0, 0, 0],
+            )
+        },
+        link_name_to_idx_map={"l0": 0},
+        num_links=1,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+    )
+
+
+def _translation(z: float) -> torch.Tensor:
+    tf = torch.zeros(1, 1, 1, 3, 4, device=DEVICE_CFG.device, dtype=torch.float32)
+    tf[..., 0, 0] = tf[..., 1, 1] = tf[..., 2, 2] = 1.0
+    tf[..., 2, 3] = z
+    return tf
+
+
+def test_voxel_capped_sampling_still_catches_small_obstacles():
+    """A 2 cm cube between the samples of a large triangle is still caught.
+
+    The triangle cuts through the cube, but the nearest samples are 1.4 cm from it. The
+    threshold widened for the coarse lattice covers that gap.
+    """
+    scene = SceneData.from_scene_cfg(
+        SceneCfg(
+            voxel=[_box_esdf(voxel_size=0.01, grid_dims=(0.2, 0.2, 0.2), box_half=(0.01,) * 3)]
+        ),
+        device_cfg=DEVICE_CFG,
+    )
+    robot = _large_triangle_robot()
+    assert _check(robot, scene, _translation(0.0))[0].tolist() == [1]
+    # The widening is bounded: with the cube 5 cm above the triangle, it is clear.
+    assert _check(robot, scene, _translation(-0.06))[0].tolist() == [0]
 
 
 # =============================================================================
@@ -563,17 +612,24 @@ def test_ignored_link_reports_no_collision():
 # =============================================================================
 
 
-def _random_link_transforms(generator: torch.Generator, batch: int, num_links: int,
-                            low: float, high: float) -> torch.Tensor:
+def _random_link_transforms(
+    generator: torch.Generator, batch: int, num_links: int, low: float, high: float
+) -> torch.Tensor:
     """Random rigid transforms ``[batch, 1, num_links, 3, 4]`` with positions in a cube."""
     q = torch.randn(batch * num_links, 4, generator=generator)
     q = q / q.norm(dim=-1, keepdim=True)
     w, x, y, z = q.unbind(-1)
     rot = torch.stack(
         [
-            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
-            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
-            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x * x + y * y),
         ],
         dim=-1,
     ).view(-1, 3, 3)
