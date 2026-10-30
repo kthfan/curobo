@@ -30,6 +30,9 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   catch what half-voxel sampling would, at the price of collisions up to a few mm beyond the
   margin (7.5 mm for a 29 cm edge on 1 cm). Test:
   `test_voxel_capped_sampling_still_catches_small_obstacles` (fails without the widening).
+  Re-measured on the same benchmark: time unchanged; on the 1 cm grid misses drop from 9 to 8
+  (margin 0, random) and from 18 to 11 (margin 1 cm, sphere-free), with 5–7 extra collisions
+  per 4096 random configs; on the 2 cm grid almost no change. GPU tests pass (71).
 - [x] **P2 – Containment depends on the obstacle SDF sign.** Verified on the CPU with
   `cpu_verify/verify_open_mesh_sign.py`. The sign comes from Warp's `mesh_query_point`: rays
   along +x, +y, +z, inside if at least two first hit a back face. The sphere collision cost uses
