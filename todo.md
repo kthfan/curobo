@@ -149,10 +149,15 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   (`curobo/tests/_src/solver/test_solver_core_cfg_mesh_collision.py`,
   `curobo/tests/_src/motion/test_motion_planner_cfg.py`). Passing on a GPU after fixing the
   shared metrics rollout dict in `resolve_yaml_configs`.
-- [ ] **P2 – CUDA graph test.** Capture a graph with the mesh constraint, then
-  `update_world` (move / replace obstacles) and `update_link_mesh`, and check the replayed
-  results match eager execution. The benchmark ran IK, `plan_pose` and MPC with CUDA graphs and
-  the mesh check without errors, but did not compare against eager results.
+- [x] **P2 – CUDA graph test.** `test_robot_mesh_constraint_cuda_graph.py` captures the check
+  once, then applies 14 in-place updates (cuboid move / add / disable, mesh load / replace /
+  move, voxel load / replace, with mesh and voxel empty at capture; link mesh write / disable /
+  enable / clear; new link transforms) and compares every replay with an eager call, for
+  margin 0 and 2 cm. `cpu_verify/verify_cuda_graph_steps.py` checks that every step changes
+  the result. The IK solver and `plan_pose` also run with CUDA graphs through `update_world`
+  and attach / detach (`test_mesh_collision_end_to_end.py`). Passing on a GPU; a probe that
+  reallocates the cuboid poses instead of writing in place makes the test fail. No code fix
+  was needed.
 - [x] **P2 – Mesh margin test** (see Correctness). Passing on a GPU.
 
 ## Future work

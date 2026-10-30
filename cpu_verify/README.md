@@ -42,3 +42,12 @@ cpu_verify/.venv/bin/pip install warp-lang numpy trimesh scipy pytest pyyaml imp
   ```bash
   PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_mesh_collision_scene.py
   ```
+
+- `verify_cuda_graph_steps.py`: runs the update steps of
+  `curobo/tests/_src/collision/test_robot_mesh_constraint_cuda_graph.py` eagerly and reports
+  the steps that do not change the result (a stale CUDA graph can only be caught at a step
+  that changes it):
+
+  ```bash
+  PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_cuda_graph_steps.py
+  ```
