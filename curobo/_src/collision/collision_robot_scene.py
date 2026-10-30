@@ -68,6 +68,8 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
             self.collision_constraint.setup_batch_tensors(batch_size, horizon)
         if self.mesh_constraint is not None:
             self.mesh_constraint.setup_batch_tensors(batch_size, horizon)
+        if self.mesh_self_collision_constraint is not None:
+            self.mesh_self_collision_constraint.setup_batch_tensors(batch_size, horizon)
 
     def get_kinematics(self, joint_position: torch.Tensor) -> KinematicsState:
         """Compute forward kinematics for joint positions.
@@ -198,6 +200,25 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
             link_transforms.shape[0], link_transforms.shape[1]
         )
         return self.mesh_constraint.forward(state, idxs_env_query=env_query_idx)
+
+    def get_mesh_self_collision_constraint(self, state: KinematicsState) -> torch.Tensor:
+        """Get the exact self-collision constraint between the robot's link meshes.
+
+        Args:
+            state: Kinematics state carrying ``link_transforms``.
+
+        Returns:
+            Constraint tensor [batch, horizon, 1]. Non-zero where two tested links collide.
+            All zeros when the constraint is disabled.
+        """
+        link_transforms = state.link_transforms
+        if self.mesh_self_collision_constraint is None:
+            return torch.zeros(
+                (*link_transforms.shape[:2], 1),
+                device=link_transforms.device,
+                dtype=link_transforms.dtype,
+            )
+        return self.mesh_self_collision_constraint.forward(state)
 
     def get_self_collision_distance(self, x_sph: torch.Tensor) -> torch.Tensor:
         """Get self-collision distance for robot spheres.
@@ -399,7 +420,10 @@ class RobotSceneCollision(RobotSceneCollisionCfg):
             sum_list.append(d_world.sum(dim=-1, keepdim=True))
         if self.mesh_constraint is not None:
             d_mesh = self.get_mesh_collision_constraint(kin_state, env_query_idx)
-            sum_list.append(d_mesh.unsqueeze(-1))
+            sum_list.append(d_mesh.view(b, h, 1))
+        if self.mesh_self_collision_constraint is not None:
+            d_mesh_self = self.get_mesh_self_collision_constraint(kin_state)
+            sum_list.append(d_mesh_self.view(b, h, 1))
         d_mask = torch.sum(torch.cat(sum_list, dim=-1), dim=-1) == 0.0
         return d_mask
 

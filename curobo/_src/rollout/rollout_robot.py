@@ -82,7 +82,10 @@ class RobotRollout:
         self.transition_model = self.config.transition_model_cfg.class_type(
             self.config.transition_model_cfg, 
         )
-        compute_link_transforms = self.config.constraint_cfg.mesh_collision_cfg is not None
+        compute_link_transforms = (
+            self.config.constraint_cfg.mesh_collision_cfg is not None
+            or self.config.constraint_cfg.mesh_self_collision_cfg is not None
+        )
         self.metrics_transition_model = self.config.transition_model_cfg.class_type(
             self.config.transition_model_cfg, compute_link_transforms=compute_link_transforms ,
         )

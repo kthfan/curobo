@@ -13,7 +13,7 @@ collision worlds), graph seeding is skipped.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -634,6 +634,24 @@ class BatchMotionPlanner:
             of a colliding link, or ``None`` where the meshes are clear of the scene.
         """
         return self.trajopt_solver.get_mesh_collision_links(joint_state, env_query_idx)
+
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Use it to see why a solution failed the mesh self-collision check, as
+        :meth:`get_mesh_collision_links` does for the scene. Requires
+        ``mesh_self_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        return self.trajopt_solver.get_mesh_self_collision_pairs(joint_state)
 
     def update_world(self, scene_cfg: SceneCfg):
         self.scene_collision_checker.load_collision_model(scene_cfg)

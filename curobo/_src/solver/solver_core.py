@@ -13,7 +13,7 @@ owns a ``SolverCore`` instance via composition::
 from __future__ import annotations
 
 # Standard Library
-from typing import Dict, List, Optional, TypeVar, Union
+from typing import Dict, List, Optional, Tuple, TypeVar, Union
 
 # Third Party
 import torch
@@ -579,35 +579,58 @@ class SolverCore:
             Nested lists with the leading shape of ``joint_state.position``, holding the name
             of a colliding link, or ``None`` where the meshes are clear of the scene.
         """
+        mesh_constraint = self._auxiliary_mesh_constraint("mesh_collision", "mesh_collision_check")
+        state, leading_shape = self._auxiliary_kinematics(joint_state)
+        mesh_constraint.forward(state, idxs_env_query=env_query_idx)
+        names = [n for row in mesh_constraint.get_contact_link_names() for n in row]
+        return _nest(names, leading_shape)
+
+    @profiler.record_function("solver_core/get_mesh_self_collision_pairs")
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Runs the mesh self-collision check of the metrics rollout again, on the auxiliary
+        rollout, so the buffers of captured CUDA graphs are left untouched.
+
+        Args:
+            joint_state: Configurations with any leading shape, as for
+                :meth:`get_mesh_collision_links`.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        constraint = self._auxiliary_mesh_constraint(
+            "mesh_self_collision", "mesh_self_collision_check"
+        )
+        state, leading_shape = self._auxiliary_kinematics(joint_state)
+        constraint.forward(state)
+        pairs = [p for row in constraint.get_contact_pair_names() for p in row]
+        return _nest(pairs, leading_shape)
+
+    def _auxiliary_mesh_constraint(self, cost_name: str, option: str):
+        """The auxiliary rollout's mesh constraint ``cost_name``; raise if it is off."""
         manager = self.auxiliary_rollout.metrics_constraint_manager
-        mesh_constraint = manager.get_cost("mesh_collision") if manager is not None else None
-        if mesh_constraint is None:
-            log_and_raise(
-                "The mesh collision check is off; create the solver with mesh_collision_check=True"
-            )
+        constraint = manager.get_cost(cost_name) if manager is not None else None
+        if constraint is None:
+            log_and_raise(f"This check is off; create the solver with {option}=True")
+        return constraint
+
+    def _auxiliary_kinematics(self, joint_state: JointState) -> Tuple[KinematicsState, tuple]:
+        """Kinematics of configurations with any leading shape, as ``[first, -1]`` batches."""
         if joint_state.joint_names is not None and joint_state.joint_names != self.joint_names:
             joint_state = self.get_active_js(joint_state)
-
         position = joint_state.position
-        leading_shape = position.shape[:-1]
+        leading_shape = tuple(position.shape[:-1])
         first = leading_shape[0] if len(leading_shape) > 0 else 1
         configs = position.reshape(first, -1, position.shape[-1])
         kinematics = self.auxiliary_rollout.metrics_transition_model.robot_model
         state = kinematics.compute_kinematics(
             JointState.from_position(configs, joint_names=self.joint_names)
         )
-        mesh_constraint.forward(state, idxs_env_query=env_query_idx)
-        names = [n for row in mesh_constraint.get_contact_link_names() for n in row]
-
-        def nest(flat: list, shape: tuple) -> list:
-            if len(shape) <= 1:
-                return flat
-            step = len(flat) // shape[0]
-            return [nest(flat[i * step : (i + 1) * step], shape[1:]) for i in range(shape[0])]
-
-        if len(leading_shape) == 0:
-            return names[0]
-        return nest(names, tuple(leading_shape))
+        return state, leading_shape
 
     def update_link_inertial(
         self,
@@ -635,3 +658,13 @@ class SolverCore:
             return
         if self.config.use_cuda_graph:
             self.optimizer.optimizers[-1].debug_dump(file_path)
+
+
+def _nest(flat: list, shape: tuple):
+    """Arrange a flat list in nested lists of ``shape``; a scalar shape gives the one item."""
+    if len(shape) == 0:
+        return flat[0]
+    if len(shape) == 1:
+        return flat
+    step = len(flat) // shape[0]
+    return [_nest(flat[i * step : (i + 1) * step], shape[1:]) for i in range(shape[0])]

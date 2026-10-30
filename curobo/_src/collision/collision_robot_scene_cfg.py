@@ -15,6 +15,10 @@ from curobo._src.cost.cost_cspace_position import PositionCSpaceCost
 from curobo._src.cost.cost_cspace_type import CSpaceCostType
 from curobo._src.cost.cost_robot_mesh_constraint import RobotMeshConstraint
 from curobo._src.cost.cost_robot_mesh_constraint_cfg import RobotMeshConstraintCfg
+from curobo._src.cost.cost_robot_mesh_self_collision import RobotMeshSelfCollisionConstraint
+from curobo._src.cost.cost_robot_mesh_self_collision_cfg import (
+    RobotMeshSelfCollisionConstraintCfg,
+)
 from curobo._src.cost.cost_scene_collision import SceneCollisionCost
 from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
@@ -56,6 +60,8 @@ class RobotSceneCollisionCfg:
         collision_cost: Cost function for scene collision.
         collision_constraint: Constraint function for scene collision.
         mesh_constraint: Exact triangle-geometry collision constraint. None when disabled.
+        mesh_self_collision_constraint: Exact self-collision constraint between link meshes.
+            None when disabled.
         scene_model: Scene collision checker.
         rejection_ratio: Ratio of samples to generate for rejection sampling.
         device_cfg: Tensor device configuration.
@@ -70,6 +76,7 @@ class RobotSceneCollisionCfg:
     collision_cost: Optional[SceneCollisionCost] = None
     collision_constraint: Optional[SceneCollisionCost] = None
     mesh_constraint: Optional[RobotMeshConstraint] = None
+    mesh_self_collision_constraint: Optional[RobotMeshSelfCollisionConstraint] = None
     scene_model: Optional[SceneCollision] = None
     rejection_ratio: int = 10
     device_cfg: DeviceCfg = DeviceCfg()
@@ -93,6 +100,8 @@ class RobotSceneCollisionCfg:
         mesh_constraint_check_containment: bool = True,
         max_triangles_per_link: Union[None, int, Dict[str, int]] = None,
         mesh_constraint_ignored_links: Optional[List[str]] = None,
+        use_mesh_self_collision_constraint: bool = False,
+        mesh_self_collision_margin: float = 0.0,
     ) -> "RobotSceneCollisionCfg":
         """Load configuration from robot and scene config files.
 
@@ -115,6 +124,9 @@ class RobotSceneCollisionCfg:
             max_triangles_per_link: Per-link triangle budget for the exact geometry.
             mesh_constraint_ignored_links: Names of links excluded from mesh collision
                 checking entirely, such as a base link bolted to its mounting plate.
+            use_mesh_self_collision_constraint: Also check the robot's link meshes against
+                each other, for the pairs set by ``mesh_self_collision_ignore``.
+            mesh_self_collision_margin: Clearance the link meshes must keep from each other.
 
         Returns:
             Configured RobotSceneCollisionCfg instance.
@@ -122,6 +134,8 @@ class RobotSceneCollisionCfg:
         init_warp(device_cfg=device_cfg)
         scene_collision_cost = self_collision_cost = scene_collision_constraint = None
         mesh_constraint = None
+        mesh_self_collision_constraint = None
+        use_link_meshes = use_mesh_constraint or use_mesh_self_collision_constraint
 
         if isinstance(robot_config, str):
             robot_config = load_yaml(join_path(get_robot_configs_path(), robot_config))[
@@ -130,13 +144,13 @@ class RobotSceneCollisionCfg:
         if isinstance(robot_config, Dict):
             if "robot_cfg" in robot_config:
                 robot_config = robot_config["robot_cfg"]
-            if use_mesh_constraint:
-                # The exact constraint needs the URDF <collision> meshes, which are not
+            if use_link_meshes:
+                # The exact constraints need the URDF <collision> meshes, which are not
                 # loaded by default.
                 robot_config["kinematics"]["load_collision_meshes"] = True
             robot_config = RobotCfg.create(robot_config, device_cfg)
         kinematics = Kinematics(
-            robot_config.kinematics, compute_link_transforms=use_mesh_constraint
+            robot_config.kinematics, compute_link_transforms=use_link_meshes
         )
 
         if isinstance(scene_model, str):
@@ -208,6 +222,15 @@ class RobotSceneCollisionCfg:
                     )
                 )
 
+        if use_mesh_self_collision_constraint:
+            self_mesh_cfg = RobotMeshSelfCollisionConstraintCfg(
+                weight=device_cfg.to_device([1.0]),
+                device_cfg=device_cfg,
+                margin=mesh_self_collision_margin,
+            )
+            self_mesh_cfg.initialize_from_kinematics(kinematics)
+            mesh_self_collision_constraint = RobotMeshSelfCollisionConstraint(self_mesh_cfg)
+
         self_collision_config = SelfCollisionCostCfg(
             weight=device_cfg.to_device([1.0]),
             device_cfg=device_cfg,
@@ -257,6 +280,7 @@ class RobotSceneCollisionCfg:
             collision_cost=scene_collision_cost,
             collision_constraint=scene_collision_constraint,
             mesh_constraint=mesh_constraint,
+            mesh_self_collision_constraint=mesh_self_collision_constraint,
             scene_model=scene_collision_checker,
             device_cfg=device_cfg,
             contact_distance=dist_threshold,

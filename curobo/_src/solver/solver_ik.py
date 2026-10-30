@@ -10,7 +10,7 @@ collision checking.
 from __future__ import annotations
 
 # Standard Library
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -263,6 +263,24 @@ class IKSolver:
             of a colliding link, or ``None`` where the meshes are clear of the scene.
         """
         return self.core.get_mesh_collision_links(joint_state, env_query_idx)
+
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Use it to see why a solution failed the mesh self-collision check, as
+        :meth:`get_mesh_collision_links` does for the scene. Requires
+        ``mesh_self_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        return self.core.get_mesh_self_collision_pairs(joint_state)
 
     def sample_configs(self, num_samples: int, rejection_ratio: int = 10) -> torch.Tensor:
         return self.core.sample_configs(

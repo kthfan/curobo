@@ -450,6 +450,24 @@ class RobotMeshData:
         self.self_work_tri = torch.tensor(work_tri, dtype=torch.int32, device=device)
         self.self_work_pair = torch.tensor(work_pair, dtype=torch.int32, device=device)
 
+    def self_collision_pair_names(
+        self, contact_pair: torch.Tensor
+    ) -> List[Optional[Tuple[str, str]]]:
+        """Resolve reported self-collision pair indices to link names.
+
+        Args:
+            contact_pair: Pair indices into :attr:`self_collision_pairs`, as returned by the
+                self-collision query, where -1 marks a configuration without self-collision.
+
+        Returns:
+            One ``(link_a, link_b)`` tuple per entry, flattened, with ``None`` where there was
+            no self-collision.
+        """
+        lookup = self.body_idx_to_link_name
+        pairs = [] if self.self_collision_pairs is None else self.self_collision_pairs.tolist()
+        names = [(lookup[a], lookup[b]) for a, b in pairs]
+        return [names[i] if i >= 0 else None for i in contact_pair.flatten().tolist()]
+
     def _refit_link_bvh(self, link_name: str) -> None:
         """Refit a link's self-collision BVH after its vertices changed in place."""
         bvh = getattr(self, "_link_bvh", {}).get(link_name)

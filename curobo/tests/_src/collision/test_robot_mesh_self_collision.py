@@ -230,3 +230,194 @@ def test_franka_skips_adjacent_links(franka_mesh_data):
         ("attached_object", "panda_leftfinger"),
     ]:
         assert pair not in pairs
+
+
+# =============================================================================
+# Constraint, collision checker and solvers on Franka
+# =============================================================================
+
+#: Franka configuration in which the hand mesh folds into link5. link5-hand is a pair the
+#: sphere check ignores, and no pair it checks collides here. Found by sampling with
+#: cpu_verify/verify_franka_self_collision.py; it holds under +-0.05 rad joint perturbations.
+Q_FOLDED = [-0.731, 0.449, -0.621, -1.891, 0.02, 0.228, -0.034]
+
+
+@pytest.fixture(scope="module")
+def cuda_device_cfg():
+    if torch.cuda.is_available():
+        return DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    pytest.skip("CUDA not available")
+
+
+def _folded_and_default(device_cfg, kinematics) -> torch.Tensor:
+    default = kinematics.default_joint_position.view(-1)[:7].tolist()
+    return torch.tensor([[default], [Q_FOLDED]], **device_cfg.as_torch_dict())
+
+
+def test_checker_rejects_mesh_self_collision(cuda_device_cfg):
+    """The folded configuration passes the sphere checks and fails the mesh self-check."""
+    from curobo._src.collision.collision_robot_scene import RobotCollisionChecker
+    from curobo._src.collision.collision_robot_scene_cfg import RobotCollisionCheckerCfg
+
+    valid = {}
+    for use_mesh in (False, True):
+        checker = RobotCollisionChecker(
+            RobotCollisionCheckerCfg.load_from_config(
+                robot_config="franka.yml",
+                device_cfg=cuda_device_cfg,
+                use_mesh_self_collision_constraint=use_mesh,
+            )
+        )
+        q = _folded_and_default(cuda_device_cfg, checker.kinematics)
+        valid[use_mesh] = checker.validate(q).view(-1).tolist()
+    assert valid == {False: [True, True], True: [True, False]}
+
+
+def test_checker_validates_with_the_scene_mesh_constraint(cuda_device_cfg):
+    """The checker combines the scene mesh constraint with the other terms in validate."""
+    from curobo._src.collision.collision_robot_scene import RobotCollisionChecker
+    from curobo._src.collision.collision_robot_scene_cfg import RobotCollisionCheckerCfg
+    from curobo._src.geom.types import Cuboid, SceneCfg
+
+    checker = RobotCollisionChecker(
+        RobotCollisionCheckerCfg.load_from_config(
+            robot_config="franka.yml",
+            scene_model=SceneCfg(
+                cuboid=[Cuboid(name="far", pose=[3, 0, 0, 1, 0, 0, 0], dims=[0.1, 0.1, 0.1])]
+            ),
+            device_cfg=cuda_device_cfg,
+            use_mesh_constraint=True,
+            mesh_constraint_ignored_links=["panda_link0"],
+            use_mesh_self_collision_constraint=True,
+        )
+    )
+    q = _folded_and_default(cuda_device_cfg, checker.kinematics)
+    assert checker.validate(q).view(-1).tolist() == [True, False]
+
+
+def test_default_configuration_collision_is_reported(cuda_device_cfg, caplog):
+    """A robot whose default configuration self-collides gets a warning naming a pair."""
+    from curobo._src.cost.cost_robot_mesh_self_collision_cfg import (
+        RobotMeshSelfCollisionConstraintCfg,
+    )
+    from curobo._src.robot.kinematics.kinematics import Kinematics
+
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    kinematics_dict = robot["robot_cfg"]["kinematics"]
+    kinematics_dict["load_collision_meshes"] = True
+    kinematics_dict["cspace"]["default_joint_position"] = Q_FOLDED + [0.04, 0.04]
+    kinematics = Kinematics(
+        KinematicsCfg.from_robot_yaml_file(robot, device_cfg=cuda_device_cfg),
+        compute_link_transforms=True,
+    )
+    cfg = RobotMeshSelfCollisionConstraintCfg(
+        weight=cuda_device_cfg.to_device([1.0]), device_cfg=cuda_device_cfg
+    )
+    with caplog.at_level("WARNING"):
+        cfg.initialize_from_kinematics(kinematics)
+    assert "panda_hand" in caplog.text and "panda_link5" in caplog.text
+
+
+def _ik_solver(device_cfg, mesh_self_collision_check: bool, use_cuda_graph: bool = False):
+    from curobo._src.solver.solver_ik import IKSolver
+    from curobo._src.solver.solver_ik_cfg import IKSolverCfg
+
+    return IKSolver(
+        IKSolverCfg.create(
+            robot="franka.yml",
+            mesh_self_collision_check=mesh_self_collision_check,
+            device_cfg=device_cfg,
+            num_seeds=16,
+            use_cuda_graph=use_cuda_graph,
+        )
+    )
+
+
+def test_solver_names_the_colliding_pair(cuda_device_cfg):
+    from curobo._src.state.state_joint import JointState
+
+    solver = _ik_solver(cuda_device_cfg, mesh_self_collision_check=True)
+    rollout = solver.metrics_rollout
+    assert rollout.metrics_constraint_manager.get_cost("mesh_self_collision").enabled
+    q = _folded_and_default(cuda_device_cfg, solver.kinematics).view(2, 7)
+    pairs = solver.get_mesh_self_collision_pairs(JointState.from_position(q))
+    assert pairs[0] is None
+    assert set(pairs[1]) == {"panda_hand", "panda_link5"}
+
+
+def test_solver_needs_the_option_to_name_pairs(cuda_device_cfg):
+    from curobo._src.state.state_joint import JointState
+
+    solver = _ik_solver(cuda_device_cfg, mesh_self_collision_check=False)
+    q = _folded_and_default(cuda_device_cfg, solver.kinematics).view(2, 7)
+    with pytest.raises(ValueError, match="mesh_self_collision_check"):
+        solver.get_mesh_self_collision_pairs(JointState.from_position(q))
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_planner_rejects_a_self_colliding_goal(cuda_device_cfg, use_cuda_graph):
+    """plan_cspace reaches the folded configuration only without the mesh self-check."""
+    from curobo._src.motion.motion_planner import MotionPlanner
+    from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
+    from curobo._src.state.state_joint import JointState
+
+    success = {}
+    for check in (False, True):
+        planner = MotionPlanner(
+            MotionPlannerCfg.create(
+                robot="franka.yml",
+                mesh_self_collision_check=check,
+                device_cfg=cuda_device_cfg,
+                use_cuda_graph=use_cuda_graph,
+            )
+        )
+        start = JointState.from_position(
+            planner.default_joint_state.position.clone().view(1, -1),
+            joint_names=planner.joint_names,
+        )
+        goal = JointState.from_position(
+            torch.tensor([Q_FOLDED], **cuda_device_cfg.as_torch_dict()),
+            joint_names=planner.joint_names,
+        )
+        result = planner.plan_cspace(goal_state=goal, current_state=start, max_attempts=3)
+        success[check] = result is not None and bool(result.success.any().item())
+    assert success == {False: True, True: False}
+
+
+def test_replay_follows_link_mesh_updates():
+    """A captured self-collision check sees link meshes written and toggled after capture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs need CUDA")
+    from curobo._src.util.cuda_graph_util import GraphExecutor
+
+    robot = _robot(obj_slots=64)
+    tf = _transforms(
+        [[0, 0, 0], [0.05, 0, 0], [0.0, 0.1, 0]], [[0, 0, 0], [1.0, 0, 0], [0.0, 0.1, 0]]
+    )
+    n = tf.shape[0]
+    in_collision = torch.zeros(n, dtype=torch.int32, device=DEVICE_CFG.device)
+    contact = torch.zeros(n, dtype=torch.int32, device=DEVICE_CFG.device)
+    near = torch.zeros(n * 3, dtype=torch.int32, device=DEVICE_CFG.device)
+
+    def check(t):
+        return check_robot_mesh_self_collision(
+            robot, t, in_collision=in_collision, contact_pair=contact, pair_near=near
+        )
+
+    executor = GraphExecutor(check, DEVICE_CFG.device, use_cuda_graph=True, clone_outputs=True)
+    rod = trimesh.creation.box(extents=(0.02, 0.2, 0.02))
+    steps = [
+        lambda: None,
+        lambda: robot.update_link_mesh("obj", rod),
+        lambda: robot.disable_link_mesh("b"),
+        lambda: robot.enable_link_mesh("b"),
+        lambda: robot.clear_link_mesh("obj"),
+    ]
+    results = []
+    for update in steps:
+        update()
+        replayed = executor(tf)
+        eager = check_robot_mesh_self_collision(robot, tf)
+        assert torch.equal(replayed[0], eager[0]) and torch.equal(replayed[1], eager[1])
+        results.append(eager[0].tolist())
+    assert results == [[1, 0], [1, 1], [0, 1], [1, 1], [1, 0]]

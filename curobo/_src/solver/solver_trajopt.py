@@ -182,6 +182,24 @@ class TrajOptSolver:
         """
         return self.core.get_mesh_collision_links(joint_state, env_query_idx)
 
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Use it to see why a solution failed the mesh self-collision check, as
+        :meth:`get_mesh_collision_links` does for the scene. Requires
+        ``mesh_self_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        return self.core.get_mesh_self_collision_pairs(joint_state)
+
     def sample_configs(self, num_samples, rejection_ratio=10):
         return self.core.sample_configs(
             num_samples, rejection_ratio, self.config.optimizer_collision_activation_distance

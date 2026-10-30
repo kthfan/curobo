@@ -11,7 +11,7 @@ from curobo._src.geom.collision.collision_scene import SceneCollisionCfg
 from curobo._src.geom.types import SceneCfg
 from curobo._src.graph_planner.graph_planner_prm import PRMGraphPlannerCfg
 from curobo._src.rollout.cost_manager.cost_manager_robot_cfg import RobotCostManagerCfg
-from curobo._src.solver.solver_core_cfg import resolve_robot_config, uses_mesh_collision
+from curobo._src.solver.solver_core_cfg import resolve_robot_config, uses_link_meshes
 from curobo._src.solver.solver_ik_cfg import IKSolverCfg
 from curobo._src.solver.solver_trajopt_cfg import TrajOptSolverCfg
 from curobo._src.transition.robot_state_transition_cfg import (
@@ -54,6 +54,8 @@ class MotionPlannerCfg:
         self_collision_check: bool = True,
         mesh_collision_check: bool = False,
         mesh_collision_margin: float = 0.0,
+        mesh_self_collision_check: bool = False,
+        mesh_self_collision_margin: float = 0.0,
         device_cfg: DeviceCfg = DeviceCfg(),
         num_ik_seeds: Optional[int] = None,
         num_trajopt_seeds: Optional[int] = None,
@@ -122,6 +124,13 @@ class MotionPlannerCfg:
                 planner validation stays sphere-based. Needs a scene or collision cache.
             mesh_collision_margin: Clearance in meters the collision meshes must keep from
                 obstacles when ``mesh_collision_check`` is True.
+            mesh_self_collision_check: Also reject solutions in which two of the robot's
+                link meshes collide, including link pairs the sphere self-collision check
+                ignores. Adds a pass/fail constraint to the metrics rollout and loads the
+                URDF collision meshes. The pairs are set by ``mesh_self_collision_ignore``
+                in the robot YAML.
+            mesh_self_collision_margin: Clearance in meters the link meshes must keep from
+                each other when ``mesh_self_collision_check`` is True.
             device_cfg: Tensor device and dtype configuration.
             num_ik_seeds: Number of IK seeds evaluated per problem. ``None``
                 uses 32 when ``max_batch_size`` is 1 and 16 for larger batch
@@ -199,7 +208,9 @@ class MotionPlannerCfg:
             robot,
             device_cfg,
             num_envs=num_envs,
-            load_collision_meshes=mesh_collision_check or uses_mesh_collision(metrics_rollout),
+            load_collision_meshes=mesh_collision_check
+            or mesh_self_collision_check
+            or uses_link_meshes(metrics_rollout),
         )
 
         # Resolve scene model
@@ -244,6 +255,8 @@ class MotionPlannerCfg:
             self_collision_check=self_collision_check,
             mesh_collision_check=mesh_collision_check,
             mesh_collision_margin=mesh_collision_margin,
+            mesh_self_collision_check=mesh_self_collision_check,
+            mesh_self_collision_margin=mesh_self_collision_margin,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,
@@ -271,6 +284,8 @@ class MotionPlannerCfg:
             self_collision_check=self_collision_check,
             mesh_collision_check=mesh_collision_check,
             mesh_collision_margin=mesh_collision_margin,
+            mesh_self_collision_check=mesh_self_collision_check,
+            mesh_self_collision_margin=mesh_self_collision_margin,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,

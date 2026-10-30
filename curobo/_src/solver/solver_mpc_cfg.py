@@ -135,6 +135,8 @@ class MPCSolverCfg:
         self_collision_check: bool = True,
         mesh_collision_check: bool = False,
         mesh_collision_margin: float = 0.0,
+        mesh_self_collision_check: bool = False,
+        mesh_self_collision_margin: float = 0.0,
         device_cfg: DeviceCfg = DeviceCfg(),
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
@@ -180,6 +182,13 @@ class MPCSolverCfg:
                 the metrics rollout and loads the URDF collision meshes. Needs a scene.
             mesh_collision_margin: Clearance in meters the collision meshes must keep from
                 obstacles when ``mesh_collision_check`` is True.
+            mesh_self_collision_check: Also reject solutions in which two of the robot's
+                link meshes collide, including link pairs the sphere self-collision check
+                ignores. Adds a pass/fail constraint to the metrics rollout and loads the
+                URDF collision meshes. The pairs are set by ``mesh_self_collision_ignore``
+                in the robot YAML.
+            mesh_self_collision_margin: Clearance in meters the link meshes must keep from
+                each other when ``mesh_self_collision_check`` is True.
             device_cfg: Device configuration.
             position_tolerance: Position tolerance for success.
             orientation_tolerance: Orientation tolerance for success.
@@ -238,6 +247,8 @@ class MPCSolverCfg:
                 load_collision_spheres=load_collision_spheres,
                 mesh_collision_check=mesh_collision_check,
                 mesh_collision_margin=mesh_collision_margin,
+                mesh_self_collision_check=mesh_self_collision_check,
+                mesh_self_collision_margin=mesh_self_collision_margin,
             )
         )
 
