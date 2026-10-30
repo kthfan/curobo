@@ -1,13 +1,58 @@
 # TODO: Exact Mesh Collision Constraint
 
-Working notes for `dev/improve_mesh`. This file and the `cpu_verify/` directory live only on
-this branch; remove both before merging into `dev/main`.
+Working notes, carried from `dev/improve_mesh` (merged into `dev/main`) to
+`dev/mesh_self_collision`. This file and the `cpu_verify/` directory live only on these
+branches; remove both before merging into `dev/main`.
 
 Scope: the exact robot-mesh collision constraint (`RobotMeshConstraint`, the Warp kernels in
 `curobo/_src/geom/collision/wp_robot_mesh_kernel.py`, `RobotMeshData`, and its wiring into the
 solvers through `mesh_collision_check`).
 
 Priority: **P1** fix first, **P2** next, **P3** later / research.
+
+## 0. Mesh self-collision plan (`dev/mesh_self_collision`)
+
+Measured on the CPU (`cpu_verify/verify_franka_self_collision.py`, 2000 random Franka
+configurations, links decimated to 256 triangles):
+
+- The 28 pairs the sphere check tests: every mesh collision is also a sphere collision
+  (mesh-only 0 %). The spheres are conservative there (sphere-only 4.3 % of configurations).
+- The 28 pairs `self_collision_ignore` excludes: adjacent links (link1–2, 3–4, 4–5, 5–6,
+  7–hand, hand–fingers) touch in every configuration and must stay ignored. Others are ignored
+  only because their spheres always overlap, yet their meshes collide: link5–link7 8.5 %,
+  link5–hand 9.4 % (5.4 % with no sphere collision anywhere). These collisions go undetected
+  today; checking them is the main value of mesh self-collision.
+
+Decisions:
+- Own ignore list `mesh_self_collision_ignore` in the robot YAML. Default when absent: links
+  that a single joint connects, with links joined by fixed joints treated as one body. Warn at
+  load for checked pairs whose meshes touch at the default configuration.
+- Keep an automatic derivation for new robots: `RobotBuilder.compute_mesh_collision_matrix`
+  (neighbours + pairs colliding at the default configuration + optionally pairs that collide
+  in nearly every sample), written by `RobotBuilder.save`.
+- Separate option `mesh_self_collision_check` (default off) and `mesh_self_collision_margin`
+  (default 0), on the same `create` methods as `mesh_collision_check`. The sphere self-collision
+  cost stays, for the gradient.
+
+Steps:
+- [ ] Ignore list: parse `mesh_self_collision_ignore`, default neighbour rule, pair list
+  (body index pairs) in `RobotMeshData`; default-configuration warning. Franka list from the
+  derivation, checked by hand.
+- [ ] Kernel `robot_mesh_self_collision_kernel`: one thread per (configuration, pair,
+  triangle of link A). Link B is a static per-link BVH (`wp.Mesh` in the link frame, built at
+  load); A's triangle is moved into B's frame and queried like a mesh obstacle (exact
+  triangle-triangle test, `triangles_within` for the margin). Links with runtime geometry
+  (`extra_collision_meshes`) go on the A side. Pair-level culling with the link bounding
+  spheres. Disabled / cleared links skip their pairs.
+- [ ] Constraint `mesh_self_collision` in the metrics rollouts (IK, TrajOpt optimized and
+  interpolated steps, MPC), wiring in `solver_core_cfg` like `mesh_collision_cfg`, and
+  `RobotCollisionChecker` support.
+- [ ] Report the colliding pair (extend `get_mesh_collision_links` or a sibling method).
+- [ ] `RobotBuilder.compute_mesh_collision_matrix` and saving it.
+- [ ] Tests: CPU kernel tests (intersection, margin, culling equivalence, ignore list,
+  disabled link, runtime geometry), config wiring, an end-to-end IK case with link5–link7 in
+  collision, CUDA graph replay.
+- [ ] Benchmark cost per configuration (with culling), docs (concept + guide), changelog.
 
 ## 1. Correctness
 
@@ -68,8 +113,7 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   reach the graph attempts, compare graph rollout = spheres / mesh / spheres + mesh on graph
   query time, `plan_pose` success, total time and the share of graph seeds TrajOpt accepts.
 - [ ] **P2 – Mesh self-collision** (raised from P3 by request). Self-collision is sphere-only.
-  A mesh self-collision check needs a per-robot list of link pairs to test (reuse the sphere
-  self-collision ignore matrix) and a triangle-triangle kernel between robot links.
+  Planned in section 0, with its own ignore list instead of the sphere one.
 - [ ] **P2 – MPC executes infeasible actions.** `MPCSolverResult.success` is the feasibility of
   the whole horizon (mesh check included), but `optimize_next_action` / `optimize_action_sequence`
   return the optimized actions regardless. A safe-deceleration fallback for the first

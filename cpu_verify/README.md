@@ -59,3 +59,11 @@ cpu_verify/.venv/bin/pip install warp-lang numpy trimesh scipy pytest pyyaml imp
   ```bash
   PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_open_mesh_sign.py
   ```
+
+- `verify_franka_self_collision.py`: tests every Franka link pair that `self_collision_ignore`
+  checks (or, with `--ignored`, excludes) with the exact link meshes on random configurations,
+  and compares with the sphere self-collision check:
+
+  ```bash
+  PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_franka_self_collision.py --configs 2000
+  ```
