@@ -9,6 +9,9 @@ the palm of a top-down grasp pose. Every solution for that pose puts the hand me
 box, while the closest remaining sphere (on ``panda_link7``) stays 2.7 cm away.
 """
 
+# Standard Library
+from typing import Optional
+
 # Third Party
 import pytest
 import torch
@@ -60,14 +63,19 @@ def _disable_gripper_spheres(kinematics) -> None:
         kinematics.config.kinematics_config.disable_link_spheres(link_name)
 
 
-def _ik_solver(device_cfg: DeviceCfg, mesh_collision_check: bool) -> IKSolver:
+def _ik_solver(
+    device_cfg: DeviceCfg,
+    mesh_collision_check: bool,
+    scene_model: Optional[SceneCfg] = None,
+    use_cuda_graph: bool = False,
+) -> IKSolver:
     config = IKSolverCfg.create(
         robot="franka.yml",
-        scene_model=palm_box(),
+        scene_model=scene_model if scene_model is not None else palm_box(),
         mesh_collision_check=mesh_collision_check,
         device_cfg=device_cfg,
         num_seeds=32,
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
     )
     solver = IKSolver(config)
     _disable_gripper_spheres(solver.kinematics)
@@ -130,16 +138,20 @@ def test_mesh_collision_check_accepts_clear_scene(mesh_ik_solver, cuda_device_cf
 
 
 def _planner(
-    device_cfg: DeviceCfg, mesh_collision_check: bool, disable_gripper_spheres: bool = True
+    device_cfg: DeviceCfg,
+    mesh_collision_check: bool,
+    disable_gripper_spheres: bool = True,
+    scene_model: Optional[SceneCfg] = None,
+    use_cuda_graph: bool = False,
 ) -> MotionPlanner:
     config = MotionPlannerCfg.create(
         robot="franka.yml",
-        scene_model=palm_box(),
+        scene_model=scene_model if scene_model is not None else palm_box(),
         mesh_collision_check=mesh_collision_check,
         device_cfg=device_cfg,
         num_ik_seeds=32,
         num_trajopt_seeds=4,
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
     )
     planner = MotionPlanner(config)
     if disable_gripper_spheres:
@@ -205,6 +217,28 @@ def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_c
 # =============================================================================
 
 
+def _attach_rod(solver: IKSolver, result, device_cfg: DeviceCfg) -> None:
+    """Attach a rod to the hand at an IK solution, with the rod's spheres disabled.
+
+    The rod reaches from the fingertips (z = 0.19) down to z = 0.0, into the top of the box
+    placed 25 cm below the palm box position (top at z = 0.015).
+    """
+    rod = Cuboid(name="rod", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.02, 0.02, 0.19])
+    rod_pose = Pose.from_list([0.5, 0.0, 0.095, 1.0, 0.0, 0.0, 0.0], device_cfg=device_cfg)
+    solution = solver.kinematics.get_active_js(result.js_solution)
+    grasp_state = JointState.from_position(
+        solution.position.reshape(-1, solution.position.shape[-1])[0:1]
+    )
+    solver.core.attachment_manager.attach(
+        grasp_state,
+        [rod],
+        num_spheres=4,
+        sphere_fit_type=SphereFitType.VOXEL,
+        world_objects_pose_offset=rod_pose,
+    )
+    solver.kinematics.config.kinematics_config.disable_link_spheres("attached_object")
+
+
 def test_attached_object_mesh_is_checked(cuda_device_cfg):
     """An attached object's mesh takes part in the mesh check until it is detached.
 
@@ -224,23 +258,58 @@ def test_attached_object_mesh_is_checked(cuda_device_cfg):
     result = _solve(solver, cuda_device_cfg)
     assert result.success.any().item()
 
-    # Rod from the fingertips (z = 0.19) down to z = 0.0, into the box top at z = 0.015.
-    rod = Cuboid(name="rod", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.02, 0.02, 0.19])
-    rod_pose = Pose.from_list([0.5, 0.0, 0.095, 1.0, 0.0, 0.0, 0.0], device_cfg=cuda_device_cfg)
-    solution = solver.kinematics.get_active_js(result.js_solution)
-    grasp_state = JointState.from_position(
-        solution.position.reshape(-1, solution.position.shape[-1])[0:1]
-    )
-    solver.core.attachment_manager.attach(
-        grasp_state,
-        [rod],
-        num_spheres=4,
-        sphere_fit_type=SphereFitType.VOXEL,
-        world_objects_pose_offset=rod_pose,
-    )
-    kinematics_config = solver.kinematics.config.kinematics_config
-    kinematics_config.disable_link_spheres("attached_object")
+    _attach_rod(solver, result, cuda_device_cfg)
     assert not _solve(solver, cuda_device_cfg).success.any().item()
 
     solver.core.attachment_manager.detach()
     assert _solve(solver, cuda_device_cfg).success.any().item()
+
+
+# =============================================================================
+# CUDA graphs
+# =============================================================================
+
+
+def test_captured_ik_solver_follows_scene_and_attachments(cuda_device_cfg):
+    """With CUDA graphs, the mesh check sees scenes and attached objects changed after capture.
+
+    The first solve captures the graphs with the box clear of the robot. The box is then
+    moved into the palm and back, and the rod of ``test_attached_object_mesh_is_checked`` is
+    attached and detached. The gripper spheres are disabled, so only the meshes see the box.
+    """
+    clear_scene = palm_box(offset=(0.0, 0.0, -0.25))
+    solver = _ik_solver(
+        cuda_device_cfg, mesh_collision_check=True, scene_model=clear_scene, use_cuda_graph=True
+    )
+    result = _solve(solver, cuda_device_cfg)
+    assert result.success.any().item()
+
+    solver.update_world(palm_box())
+    assert not _solve(solver, cuda_device_cfg).success.any().item()
+
+    solver.update_world(clear_scene)
+    result = _solve(solver, cuda_device_cfg)
+    assert result.success.any().item()
+
+    _attach_rod(solver, result, cuda_device_cfg)
+    assert not _solve(solver, cuda_device_cfg).success.any().item()
+
+    solver.core.attachment_manager.detach()
+    assert _solve(solver, cuda_device_cfg).success.any().item()
+
+
+def test_captured_planner_follows_scene_updates(cuda_device_cfg):
+    """With CUDA graphs, plan_pose rejects a goal once a box is moved into the palm."""
+    planner = _planner(
+        cuda_device_cfg,
+        mesh_collision_check=True,
+        scene_model=palm_box(offset=(0.0, 1.5, 0.0)),
+        use_cuda_graph=True,
+    )
+    result = _plan(planner, cuda_device_cfg)
+    assert result is not None
+    assert result.success.any().item()
+
+    planner.update_world(palm_box())
+    result = _plan(planner, cuda_device_cfg)
+    assert result is None or not result.success.any().item()
