@@ -3,7 +3,7 @@
 #
 """Benchmark the exact mesh collision check on Franka.
 
-Two parts, both on equivalent cuboid, mesh, dense mesh and voxel (ESDF) scenes made of a table
+Three parts, on equivalent cuboid, mesh, dense mesh and voxel (ESDF) scenes made of a table
 and a box:
 
 - ``kernel``: time one mesh collision query for a batch of configurations, for several batch
@@ -11,6 +11,8 @@ and a box:
   collisions (what solvers mostly evaluate) or uniformly random (many collide early).
 - ``solver``: time IK (single and batched), motion planning (``plan_pose``) and an MPC step,
   with and without ``mesh_collision_check``.
+- ``self``: time the mesh self-collision query on the same configurations, and batched IK and
+  ``plan_pose`` with and without ``mesh_self_collision_check`` (cuboid scene).
 
 Results are printed as Markdown tables and written to ``--save_path`` as Markdown and YAML.
 
@@ -35,7 +37,10 @@ import torch
 import trimesh
 
 # CuRobo
-from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_collision
+from curobo._src.geom.collision.wp_robot_mesh_collision import (
+    check_robot_mesh_collision,
+    check_robot_mesh_self_collision,
+)
 from curobo._src.geom.data.data_scene import SceneData
 from curobo._src.geom.types import Cuboid, Mesh, SceneCfg, VoxelGrid
 from curobo._src.motion.motion_planner import MotionPlanner
@@ -269,12 +274,14 @@ def bench_ik(
     goals: GoalToolPose,
     batch: int,
     args: argparse.Namespace,
+    mesh_self: bool = False,
 ) -> Dict:
     """Mean IK solve time and success rate over the goals, ``batch`` goals per solve."""
     config = IKSolverCfg.create(
         robot=franka_robot(),
         scene_model=scene,
         mesh_collision_check=mesh,
+        mesh_self_collision_check=mesh_self,
         device_cfg=device_cfg,
         use_cuda_graph=args.cuda_graph,
         max_batch_size=batch,
@@ -300,12 +307,14 @@ def bench_plan(
     mesh: bool,
     goals: GoalToolPose,
     args: argparse.Namespace,
+    mesh_self: bool = False,
 ) -> Dict:
     """Mean ``plan_pose`` wall time and success rate from the default configuration."""
     config = MotionPlannerCfg.create(
         robot=franka_robot(),
         scene_model=scene,
         mesh_collision_check=mesh,
+        mesh_self_collision_check=mesh_self,
         device_cfg=device_cfg,
         use_cuda_graph=args.cuda_graph,
     )
@@ -386,10 +395,91 @@ def solver_benchmark(
     return rows
 
 
+def self_collision_benchmark(
+    args: argparse.Namespace, device_cfg: DeviceCfg, scenes: Dict[str, SceneCfg]
+) -> List[Dict]:
+    """Time the mesh self-collision query, and IK and ``plan_pose`` with and without it."""
+    batch_sizes = args.kernel_batch_sizes
+    n = max(batch_sizes)
+    q_free = sphere_free_configs(sphere_ik_solver(device_cfg, scenes["cuboid"]), n)
+    rows = []
+    for budget in args.triangle_budgets:
+        robot = franka_robot(budget)
+        robot["robot_cfg"]["kinematics"]["load_collision_meshes"] = True
+        kin = Kinematics(
+            KinematicsCfg.from_robot_yaml_file(robot, device_cfg=device_cfg),
+            compute_link_transforms=True,
+        )
+        robot_mesh = kin.config.kinematics_config.get_robot_mesh_data()
+        num_pairs = robot_mesh.self_collision_pairs.shape[0]
+        limits = kin.config.kinematics_config.joint_limits.position
+        q_random = limits[0] + (limits[1] - limits[0]) * torch.rand(
+            n, limits.shape[-1], **device_cfg.as_torch_dict()
+        )
+        for q_name, q_all in [("sphere-free", q_free), ("random", q_random)]:
+            for batch in batch_sizes:
+                state = kin.compute_kinematics(JointState.from_position(q_all[:batch]))
+                link_tf = state.link_transforms.clone()
+                in_collision = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+                contact = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+                near = torch.zeros(batch * num_pairs, dtype=torch.int32, device=device_cfg.device)
+                for margin in args.margins:
+
+                    def query() -> None:
+                        check_robot_mesh_self_collision(
+                            robot_mesh,
+                            link_tf,
+                            margin=margin,
+                            in_collision=in_collision,
+                            contact_pair=contact,
+                            pair_near=near,
+                        )
+
+                    t = time_ms(query, args.repeats)
+                    rows.append(
+                        {
+                            "configs": q_name,
+                            "batch": batch,
+                            "tri_budget": budget,
+                            "pairs": num_pairs,
+                            "margin": margin,
+                            "time_ms": t,
+                            "us_per_config": 1000.0 * t / batch,
+                            "self_colliding_%": 100.0 * in_collision.float().mean().item(),
+                        }
+                    )
+                    print(rows[-1], flush=True)
+        del kin
+        torch.cuda.empty_cache()
+
+    scene = scenes["cuboid"]
+    goals = solver_goals(device_cfg, scene, args.num_goals)
+    for mesh_self in [False, True]:
+        runs = {
+            f"IK (batch {args.ik_batch})": lambda: bench_ik(
+                device_cfg, scene, False, goals, args.ik_batch, args, mesh_self=mesh_self
+            ),
+            "plan_pose": lambda: bench_plan(
+                device_cfg,
+                scene,
+                False,
+                goal_slice(goals, 0, args.num_plans),
+                args,
+                mesh_self=mesh_self,
+            ),
+        }
+        for solver_name, run in runs.items():
+            out = run()
+            rows.append({"solver": solver_name, "mesh_self_check": mesh_self, **out})
+            print(rows[-1], flush=True)
+            torch.cuda.empty_cache()
+    return rows
+
+
 def main() -> None:
     """Parse arguments, run the selected parts and write the report."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--part", choices=["kernel", "solver", "all"], default="all")
+    parser.add_argument("--part", choices=["kernel", "solver", "self", "all"], default="all")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=3)
@@ -428,6 +518,17 @@ def main() -> None:
         rows = solver_benchmark(args, device_cfg, scenes)
         results["solver"] = rows
         report.append("## Solvers\n\n" + to_markdown(rows, list(rows[0].keys())))
+    if args.part in ("self", "all"):
+        rows = self_collision_benchmark(args, device_cfg, scenes)
+        results["self"] = rows
+        kernel_rows = [r for r in rows if "configs" in r]
+        solver_rows = [r for r in rows if "solver" in r]
+        report.append(
+            "## Self-collision kernel\n\n"
+            + to_markdown(kernel_rows, list(kernel_rows[0].keys()))
+            + "\n\n## Self-collision solvers\n\n"
+            + to_markdown(solver_rows, list(solver_rows[0].keys()))
+        )
 
     text = "\n\n".join(report)
     print(text)
