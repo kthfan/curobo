@@ -126,10 +126,12 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
     `mesh_collision_ignored_link_names`) would go unchecked. Warn about them when the mode is
     turned on; if a warning turns out hard to implement, document the limitation instead.
   - Self-collision keeps the sphere check until mesh self-collision exists.
-- [ ] **P2 – No gradient in mesh-only collisions.** When the spheres are clear but a mesh
-  collides, the optimizer has nothing to follow and only re-seeding helps. Prefer improving
-  the spheres (see "Future work") over adding a mesh gradient; at minimum, document the
-  symptom (many failed seeds in tight spaces) in the guide.
+- [x] **P2 – No gradient in mesh-only collisions.** Documented in the guide section "Fix
+  solves that fail only with the mesh check": symptom, why (no gradient), and the fixes in
+  order: find the link with `get_mesh_collision_links`, cover it better with spheres, raise
+  `optimizer_collision_activation_distance`, more seeds / attempts; avoid
+  `collision_sphere_buffer`. The root-cause fixes stay under "Future work" (sphere improvement
+  tool, mesh check with gradient).
 - [x] **P3 – Make `fast_simplification` a declared dependency.** Now a required dependency in
   `pyproject.toml` (decided over an extra: Franka's links 1–5 exceed the default budget of 256,
   so the default setup needs it). Without it trimesh's quadric decimation fails and

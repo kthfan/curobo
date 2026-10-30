@@ -165,6 +165,29 @@ positions you pass. When several links collide at one configuration, one of them
 check runs separately from the solve, so it adds no cost to planning and leaves captured CUDA
 graphs untouched.
 
+## Fix solves that fail only with the mesh check
+
+A goal that the solver reaches without the mesh check can fail with it, mostly in tight
+spaces: IK finds no successful seed, or `plan_pose` fails after all its attempts. The mesh
+check has no gradient (see {ref}`mesh_collision_note`). The optimizers move every seed with the
+sphere costs only, so when the spheres are clear while a mesh collides, nothing pushes that
+seed out of the collision; only the other seeds can succeed. To fix it:
+
+1. Find the link with `get_mesh_collision_links` (see the previous section). Many seeds failing
+   on the same link point to that link's spheres.
+2. Cover that link better with spheres: add or enlarge spheres where its mesh sticks out of
+   them, in the robot YAML (see {ref}`tutorial_build_robot_model`). The optimizer then steers
+   the link away itself, which is the most effective fix.
+3. Raise `optimizer_collision_activation_distance` (default 0.01 m) on the solver config, for
+   example to 0.02 m. The optimizer then keeps the spheres farther from obstacles, which also
+   keeps the parts of the meshes outside the spheres clear. The success check is unchanged,
+   but narrow passages become harder to pass.
+4. Give the solver more chances: raise `num_ik_seeds`, `num_trajopt_seeds` or the
+   `max_attempts` of `plan_pose`. This helps when only some seeds end in a mesh-only collision.
+
+Avoid the robot YAML's `collision_sphere_buffer` for this: it enlarges the spheres for the
+success check and self-collision too, so it rejects more solutions instead of steering them.
+
 ## Check configurations outside a solver
 
 The robot collision checker accepts the same settings. Its `validate` then includes the mesh
