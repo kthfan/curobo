@@ -98,10 +98,13 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   (`CSpacePositionCost`). `GoalManager` also kept a previous solve's dt when the next current
   state had none. Fixed in both planners and in `GoalManager`; `test_plan_grasp_moves_in_and_lifts`
   covers all phases.
-- [ ] **P2 – Report which link collided.** `RobotMeshConstraint.get_contact_link_names()` is
-  only reachable on the internal cost object. Surface the colliding link and time step in
-  the solver result or status, so a failed plan says "mesh collision: panda_hand at step 12"
-  instead of a generic failure.
+- [x] **P2 – Report which link collided.** On-demand: `get_mesh_collision_links(joint_state)`
+  on `SolverCore`, delegated by the IK, TrajOpt and MPC solvers and both motion planners. It
+  re-runs the mesh check on the auxiliary rollout (not graph-captured, so captured buffers are
+  left alone) and returns nested lists of link names (or `None`) with the leading shape of the
+  joint positions, e.g. `[batch][seed][step]` for `interpolated_trajectory`. Chosen over
+  storing the links in the results (needs plumbing through metrics, seed selection and CUDA
+  graphs, and costs every solve). Guide section "Find the link that collides".
 - [ ] **P2 – "Inflated spheres for gradients, exact meshes for checking" mode.** Option to drop
   the sphere scene-collision constraint from the metrics rollouts when the mesh check is on,
   so success is decided by the exact geometry, while the optimizers keep sphere costs inflated

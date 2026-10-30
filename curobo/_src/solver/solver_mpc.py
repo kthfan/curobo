@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 # Standard Library
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -167,6 +167,24 @@ class MPCSolver:
 
     def get_full_js(self, active_js):
         return self.core.get_full_js(active_js)
+
+    def get_mesh_collision_links(
+        self, joint_state: JointState, env_query_idx: Optional[torch.Tensor] = None
+    ) -> Union[Optional[str], List]:
+        """Name the link whose collision mesh touches the scene, for every configuration.
+
+        Use it to see why a solution failed the mesh collision check: pass the result's
+        ``js_solution``. Requires ``mesh_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+            env_query_idx: Environment index per configuration in the first dimension.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding the name
+            of a colliding link, or ``None`` where the meshes are clear of the scene.
+        """
+        return self.core.get_mesh_collision_links(joint_state, env_query_idx)
 
     def sample_configs(self, num_samples, rejection_ratio=10):
         return self.core.sample_configs(

@@ -132,6 +132,30 @@ def test_mesh_collision_check_accepts_clear_scene(mesh_ik_solver, cuda_device_cf
         checker.load_collision_model(palm_box())
 
 
+def test_mesh_collision_links_name_the_colliding_link(mesh_ik_solver, cuda_device_cfg):
+    """A failed IK solution reports the gripper link whose mesh is in the box."""
+    result = _solve(mesh_ik_solver, cuda_device_cfg)
+    assert not result.success.any().item()
+    links = mesh_ik_solver.get_mesh_collision_links(result.js_solution)
+    batch, seeds = result.js_solution.position.shape[:2]
+    assert len(links) == batch and all(len(row) == seeds for row in links)
+    assert all(name in GRIPPER_LINKS for row in links for name in row)
+
+    checker = mesh_ik_solver.scene_collision_checker
+    try:
+        checker.load_collision_model(palm_box(offset=(0.0, 1.5, 0.0)))
+        links = mesh_ik_solver.get_mesh_collision_links(result.js_solution)
+        assert all(name is None for row in links for name in row)
+    finally:
+        checker.load_collision_model(palm_box())
+
+
+def test_mesh_collision_links_need_the_mesh_check(sphere_ik_solver, cuda_device_cfg):
+    result = _solve(sphere_ik_solver, cuda_device_cfg)
+    with pytest.raises(ValueError, match="mesh_collision_check"):
+        sphere_ik_solver.get_mesh_collision_links(result.js_solution)
+
+
 # =============================================================================
 # Motion planner
 # =============================================================================
@@ -182,6 +206,28 @@ def test_mesh_collision_check_plan_pose_fails(cuda_device_cfg):
     """With the mesh check no goal configuration is feasible, so planning fails."""
     result = _plan(_planner(cuda_device_cfg, mesh_collision_check=True), cuda_device_cfg)
     assert result is None or not result.success.any().item()
+
+
+def test_mesh_collision_links_name_the_colliding_steps(cuda_device_cfg):
+    """Along a trajectory to the goal, only the final steps collide once the box is back.
+
+    The plan is made with the box moved away; with the box in the palm the trajectory starts
+    clear and ends with the hand in the box.
+    """
+    planner = _planner(
+        cuda_device_cfg, mesh_collision_check=True, scene_model=palm_box(offset=(0.0, 1.5, 0.0))
+    )
+    result = _plan(planner, cuda_device_cfg)
+    assert result is not None and result.success.any().item()
+
+    planner.update_world(palm_box())
+    trajectory = result.interpolated_trajectory
+    links = planner.get_mesh_collision_links(trajectory)
+    steps = links[0][0]
+    assert len(steps) == trajectory.position.shape[-2]
+    last = int(result.interpolated_last_tstep.view(-1)[0])
+    assert steps[0] is None
+    assert steps[last] in GRIPPER_LINKS
 
 
 def test_trajopt_checks_the_interpolated_trajectory(cuda_device_cfg):

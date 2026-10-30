@@ -617,6 +617,24 @@ class BatchMotionPlanner:
     def compute_kinematics(self, state: JointState) -> KinematicsState:
         return self.trajopt_solver.compute_kinematics(state)
 
+    def get_mesh_collision_links(
+        self, joint_state: JointState, env_query_idx: Optional[torch.Tensor] = None
+    ) -> Union[Optional[str], List]:
+        """Name the link whose collision mesh touches the scene, for every configuration.
+
+        Use it to see why a solution failed the mesh collision check: pass the result's
+        ``js_solution`` or ``interpolated_trajectory``. Requires ``mesh_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+            env_query_idx: Environment index per configuration in the first dimension.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding the name
+            of a colliding link, or ``None`` where the meshes are clear of the scene.
+        """
+        return self.trajopt_solver.get_mesh_collision_links(joint_state, env_query_idx)
+
     def update_world(self, scene_cfg: SceneCfg):
         self.scene_collision_checker.load_collision_model(scene_cfg)
         if self.graph_planner is not None:

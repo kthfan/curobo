@@ -143,6 +143,28 @@ kinematics_config.clear_link_mesh("attached_object")
 released object. The update is in place: every solver of the planner sees it at once, and
 captured CUDA graphs stay valid. Geometry larger than the reserved slots is decimated to fit.
 
+## Find the link that collides
+
+When a solve fails, `get_mesh_collision_links` tells you whether the meshes are the reason. It
+runs the mesh check again on the configurations you pass, such as the result's `js_solution` or
+`interpolated_trajectory`, and names a colliding link for each of them:
+
+```python
+result = planner.plan_pose(goal_tool_poses, current_state)
+links = planner.get_mesh_collision_links(result.interpolated_trajectory)
+# links[batch][seed][step] is a link name, or None where the meshes are clear.
+for step, link in enumerate(links[0][0]):
+    if link is not None:
+        print(f"mesh collision: {link} at step {step}")
+        break
+```
+
+The method exists on the motion planners and on the IK, trajectory optimization and MPC
+solvers, and needs `mesh_collision_check=True`. The result has the leading shape of the joint
+positions you pass. When several links collide at one configuration, one of them is named. The
+check runs separately from the solve, so it adds no cost to planning and leaves captured CUDA
+graphs untouched.
+
 ## Check configurations outside a solver
 
 The robot collision checker accepts the same settings. Its `validate` then includes the mesh
