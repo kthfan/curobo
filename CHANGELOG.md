@@ -80,6 +80,20 @@
   `max_triangles_per_link`, `mesh_collision_ignored_link_names`, and
   `extra_collision_meshes`, and `RobotCollisionCheckerCfg.load_from_config`
   accepts `use_mesh_constraint`.
+- Extend the exact mesh collision check. Trajectory optimization also checks
+  every step of the interpolated trajectory. `AttachmentManager` writes an
+  attached object's mesh into the link's reserved triangle slots and clears it
+  on detach (`franka.yml` reserves 256 for `attached_object`), and
+  `clear_link_mesh` / `enable_link_mesh` manage runtime geometry.
+  `disable_link_collision` / `enable_link_collision` toggle the link meshes
+  too, so `plan_grasp` works with the mesh check. Scene and link-mesh updates
+  are tested to reach captured CUDA graphs.
+- Add `get_mesh_collision_links` to the IK, trajectory optimization and MPC
+  solvers and the motion planners. It names the link whose collision mesh
+  touches the scene, per configuration, e.g. per step of a failed trajectory.
+- Speed up the mesh collision check by skipping links whose bounding sphere is
+  clear of every obstacle: 2x to 12x faster for 4096 configurations,
+  depending on the scene type.
 - Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
   plans one trajectory through an ordered list of Cartesian waypoints with
   per-segment tool pose criteria.
@@ -97,6 +111,19 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,
+  only intersecting triangles were reported, so the margin had almost no effect.
+- Catch obstacles between the samples of large robot triangles on fine voxel
+  grids: where the sampling cap applies, the voxel mesh check widens its
+  threshold by the extra reach of the coarser samples.
+- Require `fast_simplification`. Without it, link meshes over their triangle
+  budget fell back to their convex hull, which fills concave gaps such as the
+  space between gripper fingers.
+- Fix `GoalManager` storing the caller's goal tensors as its reusable buffer, so
+  the next solve overwrote them. `plan_grasp` lost its grasp poses this way.
+- Fix the approach-to-grasp and lift phases of `plan_grasp`, which always
+  failed: their start states carried the previous trajectory's `dt`, which
+  clamped every joint to within one step of motion.
 - Fix the `ToolPoseCost` rotation term for the default axis-angle rotation
   error. Its gradient reached the joints at half its value, which hid that the
   rotation distance was `w * theta^2` while the position distance is
