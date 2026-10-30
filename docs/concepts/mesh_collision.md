@@ -162,4 +162,5 @@ for 4096 configurations free of sphere collisions; a 1 cm `mesh_self_collision_m
 cuboid scene, turning it on made IK with 100 problems about 9 % slower and `plan_pose` about
 1 % slower, with the same success rate (measured in a separate run from the table above).
 About 10 % of the configurations free of sphere collisions that the benchmark sampled had
-colliding link meshes.
+colliding link meshes, nearly all of them `panda_link5` against the hand, `panda_link7` or a
+finger: pairs the sphere check ignores.

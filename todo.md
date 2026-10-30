@@ -59,7 +59,8 @@ Steps:
 - [x] Benchmark (`--part self`), docs (guide section, concept table and cost), changelog.
   T4, 35 pairs, default budget: 4096 sphere-free configs 4.7 ms (margin 1 cm: 12.4 ms); IK with
   100 problems +9 %, `plan_pose` +1 %. About 10 % of sphere-free configurations had colliding
-  link meshes.
+  link meshes (399 / 4096): link5 with hand 310, link7 261, fingers 79, link2 2. GPU tests pass
+  (self-collision file 20, builder + config 91).
 
 ## 1. Correctness
 
