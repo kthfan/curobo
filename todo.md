@@ -24,10 +24,17 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   sampled coarser than voxel/2 (e.g. a 10 cm edge on a 1 cm grid gives ~6 mm spacing).
   Options: subdivide large robot triangles at load time so no edge exceeds a target length,
   or make the cap depend on the triangle size and voxel size, with a warning when clamped.
-- [ ] **P2 – Containment depends on the obstacle SDF sign.** The mesh containment pass uses
-  `compute_local_sdf(...) < margin` on one vertex. Verify the sign for non-watertight
-  obstacle meshes (e.g. meshes from the mapper or scans). If it is unreliable, skip
-  containment for open meshes or document that `check_containment` needs closed meshes.
+- [x] **P2 – Containment depends on the obstacle SDF sign.** Verified on the CPU with
+  `cpu_verify/verify_open_mesh_sign.py`. The sign comes from Warp's `mesh_query_point`: rays
+  along +x, +y, +z, inside if at least two first hit a back face. The sphere collision cost uses
+  the same SDF, and containment agreed with it at every test point, so containment adds no
+  false collisions of its own. Closed meshes are reliable, also with one flipped face. Open
+  meshes are not: a bin without wall thickness reads solid (its cavity is inside), and a
+  single-sided sheet has an inside region behind it when its normal has two or more positive
+  components (none for axis-facing sheets). Decision: document it (concept page "Inside and
+  outside of mesh obstacles", guide limitations); no code change. Skipping containment for open
+  meshes would not help while the spheres see the same regions. A winding-number sign is
+  listed under "Future work".
 - [ ] **P3 – Obstacles fully inside a link are not detected.** Documented. A cheap partial
   fix: test each obstacle's AABB centre / a few obstacle vertices against the link's convex
   hull.
@@ -176,5 +183,8 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   triangle sweeps between two samples (continuous triangle collision, or conservative
   advancement with the link bounding spheres used by the culling) so that no obstacle is
   missed between samples.
+- **Winding-number sign for mesh obstacles.** Warp's `mesh_query_point_sign_winding_number`
+  classifies open meshes more robustly than the ray-parity sign. It would change the scene SDF
+  for the whole library (sphere cost included) and its cost, so it needs its own evaluation.
 - **Mesh self-collision** (see Coverage). Until it exists, self-collision stays sphere-based,
   also in the "inflated spheres + exact meshes" mode.

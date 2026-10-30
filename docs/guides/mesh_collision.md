@@ -174,4 +174,7 @@ is_valid = checker.validate(joint_positions)
   be missed. Cuboid and mesh obstacles are checked exactly.
 - An obstacle small enough to sit entirely inside a link, touching none of its triangles, is
   not detected.
+- Mesh obstacles should be closed. For open meshes, such as a bin without wall thickness or a
+  single-sided sheet, part of the free space can read as inside the obstacle, for the spheres
+  and the meshes alike. See {ref}`mesh_collision_note` for which regions are affected.
 - The check runs on CUDA devices only.

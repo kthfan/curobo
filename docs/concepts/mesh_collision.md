@@ -66,6 +66,29 @@ One case is missed for every obstacle type: an obstacle small enough to lie enti
 link, crossing none of its triangles. Detecting it would need a point-in-robot test, which is
 expensive because the robot geometry moves with every configuration.
 
+### Inside and outside of mesh obstacles
+
+The containment pass asks whether a link lies inside a mesh obstacle. The answer comes from
+the sign of the obstacle's distance field, the same one the sphere collision cost uses, so the
+spheres and the meshes always agree on what is inside. The sign is derived from the orientation
+of the faces: from the query point, rays are cast along +x, +y and +z, and the point is inside
+when at least two of them first hit the back of a face.
+
+This is reliable for closed meshes with outward-facing normals, and a single flipped face does
+not change it. Open meshes have no well-defined inside, and the result depends on their shape
+and orientation:
+
+- A container without wall thickness, such as a bin modeled as five single-sided faces, reads
+  as solid: its whole cavity is inside, so a robot reaching into it collides.
+- Behind a single-sided sheet, the result depends on the direction of its normal. A sheet
+  facing one of the axes never reads as inside, while a sheet facing, say, (1, 1, 1) has a
+  region behind it, as deep as half the sheet's bounding box, that reads as inside.
+
+Both the sphere cost and the mesh check report these regions as collisions. Give obstacle
+meshes thickness and close them, or load scanned geometry as a voxel distance field instead
+of a mesh. Skipping the containment pass for open meshes would not help, since the sphere
+cost still sees the same inside regions.
+
 ## Where the check runs
 
 | Component | Mesh check |

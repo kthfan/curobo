@@ -51,3 +51,11 @@ cpu_verify/.venv/bin/pip install warp-lang numpy trimesh scipy pytest pyyaml imp
   ```bash
   PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_cuda_graph_steps.py
   ```
+
+- `verify_open_mesh_sign.py`: classifies query points as inside or outside closed and open
+  obstacle meshes (box without a top, flipped face, single- and double-sided sheets) with the
+  mesh SDF, and checks that the containment pass and the sphere collision check agree with it:
+
+  ```bash
+  PYTHONPATH=. cpu_verify/.venv/bin/python cpu_verify/verify_open_mesh_sign.py
+  ```
