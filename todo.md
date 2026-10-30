@@ -56,7 +56,10 @@ Steps:
 - [ ] Tests: CPU kernel tests (intersection, margin, culling equivalence, ignore list,
   disabled link, runtime geometry), config wiring, an end-to-end IK case with link5–link7 in
   collision, CUDA graph replay.
-- [ ] Benchmark cost per configuration (with culling), docs (concept + guide), changelog.
+- [x] Benchmark (`--part self`), docs (guide section, concept table and cost), changelog.
+  T4, 35 pairs, default budget: 4096 sphere-free configs 4.7 ms (margin 1 cm: 12.4 ms); IK with
+  100 problems +9 %, `plan_pose` +1 %. About 10 % of sphere-free configurations had colliding
+  link meshes.
 
 ## 1. Correctness
 

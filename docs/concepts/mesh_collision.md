@@ -154,3 +154,12 @@ free of sphere collisions:
   Against the 192k-triangle mesh it makes the query about 2.7 times slower (2.7 → 7.3 ms for
   4096 sphere-free configurations), because more triangle pairs pass the broadphase and need
   the exact distance test.
+
+The mesh self-collision check (`mesh_self_collision_check`) tests 35 Franka link pairs. With
+the default budget, one query takes 0.5 ms for 32 configurations, 1.0 ms for 512 and 4.7 ms
+for 4096 configurations free of sphere collisions; a 1 cm `mesh_self_collision_margin` makes it
+2 to 3 times slower. Pairs whose link bounding spheres are apart are skipped first. In the
+cuboid scene, turning it on made IK with 100 problems about 9 % slower and `plan_pose` about
+1 % slower, with the same success rate (measured in a separate run from the table above).
+About 10 % of the configurations free of sphere collisions that the benchmark sampled had
+colliding link meshes.
