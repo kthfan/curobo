@@ -85,8 +85,11 @@
   per-segment tool pose criteria.
 - Add tool pose bounds. `ToolPoseBound` limits a tool frame's position and
   orientation over the whole trajectory relative to the goal, the start, or
-  the robot base, and is set with `update_tool_pose_bounds` on the motion
-  planner, IK, trajectory optimization, MPC, and the multi-waypoint planner.
+  the robot base: planes, lines, boxes, the tilt of a tool axis, and yaw and
+  roll ranges, with `plane`, `line`, `axis_tilt`, and `orientation_box`
+  factories. A tool frame can hold several bounds. They are set with
+  `update_tool_pose_bounds` on the motion planner, IK, trajectory
+  optimization, MPC, and the multi-waypoint planner.
   The default IK, trajectory optimization, and MPC task configs include the
   `eef_bound_cfg` cost, which has no effect until a bound is set.
 - Add `position_tolerance_traj` and `orientation_tolerance_traj` to
@@ -94,10 +97,13 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
-- Fix the scale of the `ToolPoseCost` rotation gradient for the default
-  axis-angle rotation error, which reached the joints at half its value. The
-  rotation gradient is now twice as large as before; the Lie group rotation
-  methods are unchanged.
+- Fix the `ToolPoseCost` rotation term for the default axis-angle rotation
+  error. Its gradient reached the joints at half its value, which hid that the
+  rotation distance was `w * theta^2` while the position distance is
+  `0.5 * w * |delta|^2`. The rotation distance is now `0.5 * w * theta^2` and its
+  gradient reaches the joints exactly, so the optimizers receive the same
+  rotation gradient as before and the reported rotation cost is half its
+  previous value. The Lie group rotation methods are unchanged.
 - Reduce GPU memory consumption for batched motion planning by 3x with
   batch-aware IK and TrajOpt seed defaults and a smaller interpolation buffer.
 - Fix `MotionPlanner` and `BatchMotionPlanner` attachment-manager access so
