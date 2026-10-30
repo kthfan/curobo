@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Standard Library
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 # Third Party
 import numpy as np
@@ -220,6 +220,69 @@ def _as_triangle_soup(
 
 
 # =============================================================================
+# Self-Collision Pairs
+# =============================================================================
+
+
+def mesh_self_collision_pairs(
+    link_names: Sequence[str],
+    link_name_to_idx_map: Dict[str, int],
+    parent_body_indices: Sequence[int],
+    fixed_joints: Sequence[bool],
+    ignore: Optional[Dict[str, Sequence[str]]] = None,
+) -> List[Tuple[int, int]]:
+    """Select the link pairs that the mesh self-collision check tests.
+
+    Links joined by fixed joints, including locked joints, move as one rigid body. A pair is
+    skipped when both links belong to the same rigid body or to two rigid bodies that a single
+    joint connects, since the meshes of such links usually touch at the joint. Pairs listed in
+    ``ignore`` are skipped as well.
+
+    Args:
+        link_names: Links with mesh geometry, including reserved runtime slots.
+        link_name_to_idx_map: Mapping from link name to kinematic body index.
+        parent_body_indices: Parent body index of every body, indexed by body index. The
+            root's entry is ignored.
+        fixed_joints: Whether the joint between a body and its parent is fixed, per body.
+        ignore: Additional pairs to skip, as ``{link: [links]}``, in either direction.
+
+    Returns:
+        Sorted ``(body_a, body_b)`` pairs with ``body_a < body_b``.
+    """
+    known = set(link_name_to_idx_map)
+    ignored = set()
+    for link, others in (ignore or {}).items():
+        unknown = sorted({link, *others} - known)
+        if unknown:
+            log_warn(f"mesh_self_collision_ignore names unknown links: {unknown}")
+        for other in others:
+            if link in known and other in known:
+                ignored.add(frozenset((link_name_to_idx_map[link], link_name_to_idx_map[other])))
+
+    def rigid_root(body: int) -> int:
+        while body > 0 and fixed_joints[body]:
+            body = int(parent_body_indices[body])
+        return body
+
+    def connected(root_a: int, root_b: int) -> bool:
+        return (root_a > 0 and rigid_root(int(parent_body_indices[root_a])) == root_b) or (
+            root_b > 0 and rigid_root(int(parent_body_indices[root_b])) == root_a
+        )
+
+    bodies = sorted({link_name_to_idx_map[name] for name in link_names})
+    pairs = []
+    for i, a in enumerate(bodies):
+        for b in bodies[i + 1 :]:
+            root_a, root_b = rigid_root(a), rigid_root(b)
+            if root_a == root_b or connected(root_a, root_b):
+                continue
+            if frozenset((a, b)) in ignored:
+                continue
+            pairs.append((a, b))
+    return pairs
+
+
+# =============================================================================
 # Python Dataclass
 # =============================================================================
 
@@ -268,6 +331,12 @@ class RobotMeshData:
     #: index, shape ``[num_links, 4]``. A negative radius marks a link without geometry. The
     #: kernels skip a link whose sphere is far from every obstacle.
     link_bounds: Optional[torch.Tensor] = None
+
+    #: Body index pairs ``[num_pairs, 2]`` (int32) tested by the mesh self-collision check,
+    #: set with :meth:`set_self_collision_pairs`. In each pair the first link has no more
+    #: triangle slots than the second: the kernel iterates its triangles and queries the
+    #: second link's BVH. None when no pairs are tested.
+    self_collision_pairs: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         """Recover the body indices, the reference slot owners and the link bounds."""
@@ -332,6 +401,61 @@ class RobotMeshData:
         """
         return self.link_triangle_counts[self.link_names.index(link_name)]
 
+    def set_self_collision_pairs(self, pairs: Sequence[Tuple[int, int]]) -> None:
+        """Prepare the link pairs that the mesh self-collision check tests.
+
+        Builds a BVH over each paired link's triangle slots, in its link frame and sharing
+        memory with :attr:`tri_verts`, and a flat work list with one entry per triangle slot of
+        the iterated link of each pair.
+
+        Args:
+            pairs: Body index pairs, e.g. from :func:`mesh_self_collision_pairs`.
+        """
+        body_to_name = self.body_idx_to_link_name
+        ordered = []
+        for a, b in pairs:
+            if self.get_triangle_capacity(body_to_name[a]) > self.get_triangle_capacity(
+                body_to_name[b]
+            ):
+                a, b = b, a
+            ordered.append((a, b))
+        if not ordered:
+            self.self_collision_pairs = None
+            return
+        device = self.tri_verts.device
+        self.self_collision_pairs = torch.tensor(ordered, dtype=torch.int32, device=device)
+
+        self.link_tri_start = torch.zeros(self.num_links, dtype=torch.int32, device=device)
+        self.link_mesh_ids = torch.zeros(self.num_links, dtype=torch.int64, device=device)
+        self._link_bvh: Dict[str, wp.Mesh] = {}
+        wp_device = wp.device_from_torch(device)
+        for body in sorted({b for pair in ordered for b in pair}):
+            name = body_to_name[body]
+            span = self.get_triangle_slice(name)
+            self.link_tri_start[body] = span.start
+            points = wp.from_torch(
+                self.tri_verts[span.start * 3 : span.stop * 3], dtype=wp.vec3
+            )
+            indices = wp.array(
+                np.arange((span.stop - span.start) * 3, dtype=np.int32), device=wp_device
+            )
+            self._link_bvh[name] = wp.Mesh(points=points, indices=indices)
+            self.link_mesh_ids[body] = self._link_bvh[name].id
+
+        work_tri, work_pair = [], []
+        for p, (a, _) in enumerate(ordered):
+            span = self.get_triangle_slice(body_to_name[a])
+            work_tri.extend(range(span.start, span.stop))
+            work_pair.extend([p] * (span.stop - span.start))
+        self.self_work_tri = torch.tensor(work_tri, dtype=torch.int32, device=device)
+        self.self_work_pair = torch.tensor(work_pair, dtype=torch.int32, device=device)
+
+    def _refit_link_bvh(self, link_name: str) -> None:
+        """Refit a link's self-collision BVH after its vertices changed in place."""
+        bvh = getattr(self, "_link_bvh", {}).get(link_name)
+        if bvh is not None:
+            bvh.refit()
+
     def update_link_mesh(
         self,
         link_name: str,
@@ -364,6 +488,7 @@ class RobotMeshData:
             self.reference_tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
         self.tri_link[span] = self.reference_tri_link[span]
         self._write_link_bounds(link_name, verts.view(-1, 3, 3))
+        self._refit_link_bvh(link_name)
 
     def _write_link_bounds(self, link_name: str, tris: torch.Tensor):
         """Store the bounding sphere of a link's triangles ``[n, 3, 3]``; none if ``n == 0``."""

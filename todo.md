@@ -35,10 +35,13 @@ Decisions:
   cost stays, for the gradient.
 
 Steps:
-- [ ] Ignore list: parse `mesh_self_collision_ignore`, default neighbour rule, pair list
-  (body index pairs) in `RobotMeshData`; default-configuration warning. Franka list from the
-  derivation, checked by hand.
-- [ ] Kernel `robot_mesh_self_collision_kernel`: one thread per (configuration, pair,
+- [x] Ignore list: `mesh_self_collision_ignore` (loader cfg, `KinematicsParams`) and
+  `mesh_self_collision_pairs` (one rigid body / one joint apart always skipped, plus the list).
+  Franka needs no list: the default rule already skips every pair that always touches.
+  Default-configuration warning still to do (with the constraint, it needs the kernel).
+- [x] Kernel `robot_self_collision_kernel` (`wp_robot_mesh_self_collision_kernel.py`) and
+  `check_robot_mesh_self_collision`. CPU tests pass; mutations of the B-side active check and
+  of the BVH refit are caught. Design as planned: one thread per (configuration, pair,
   triangle of link A). Link B is a static per-link BVH (`wp.Mesh` in the link frame, built at
   load); A's triangle is moved into B's frame and queried like a mesh obstacle (exact
   triangle-triangle test, `triangles_within` for the margin). Links with runtime geometry
