@@ -67,9 +67,9 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   add a narrow-passage scene to `benchmark/mesh_collision_benchmark.py` and, for plans that
   reach the graph attempts, compare graph rollout = spheres / mesh / spheres + mesh on graph
   query time, `plan_pose` success, total time and the share of graph seeds TrajOpt accepts.
-- [ ] **P3 – Mesh self-collision.** Self-collision is sphere-only. A mesh self-collision
-  check needs a per-robot list of link pairs to test (reuse the sphere self-collision
-  ignore matrix) and a triangle-triangle kernel between robot links.
+- [ ] **P2 – Mesh self-collision** (raised from P3 by request). Self-collision is sphere-only.
+  A mesh self-collision check needs a per-robot list of link pairs to test (reuse the sphere
+  self-collision ignore matrix) and a triangle-triangle kernel between robot links.
 - [ ] **P2 – MPC executes infeasible actions.** `MPCSolverResult.success` is the feasibility of
   the whole horizon (mesh check included), but `optimize_next_action` / `optimize_action_sequence`
   return the optimized actions regardless. A safe-deceleration fallback for the first
@@ -130,9 +130,13 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
   collides, the optimizer has nothing to follow and only re-seeding helps. Prefer improving
   the spheres (see "Future work") over adding a mesh gradient; at minimum, document the
   symptom (many failed seeds in tight spaces) in the guide.
-- [ ] **P3 – Make `fast_simplification` a declared dependency** (or an extra), since the
-  convex-hull fallback in `decimate_mesh` (`data_robot_mesh.py:161`) closes gripper gaps and
-  causes false collisions.
+- [x] **P3 – Make `fast_simplification` a declared dependency.** Now a required dependency in
+  `pyproject.toml` (decided over an extra: Franka's links 1–5 exceed the default budget of 256,
+  so the default setup needs it). Without it trimesh's quadric decimation fails and
+  `decimate_mesh` fell back to the convex hull, which fills concave gaps. The fallback stays for
+  a failing decimation, with a warning that names the link and the package.
+  `test_decimation_keeps_the_gap_between_fingers` fails with the convex-hull fallback, and
+  `test_decimation_respects_budget` no longer skips.
 
 ## 4. Performance
 

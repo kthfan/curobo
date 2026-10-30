@@ -23,6 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "fast_simplification",
     "importlib_resources",
     "matplotlib",
     "networkx",

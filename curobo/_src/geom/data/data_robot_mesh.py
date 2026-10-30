@@ -127,11 +127,11 @@ def decimate_mesh(
 ) -> trimesh.Trimesh:
     """Reduce a link mesh to at most ``max_triangles`` triangles.
 
-    Quadric decimation is used because it preserves concavities. It requires the optional
-    ``fast_simplification`` package; without it this falls back to the convex hull, which
-    may still exceed the budget and which closes openings such as the gap between gripper
-    fingers. Query cost scales roughly linearly with the total triangle count, so exceeding
-    the budget is a performance problem worth warning about.
+    Quadric decimation (trimesh with the ``fast_simplification`` package) is used because it
+    preserves concavities. If it fails, this falls back to the convex hull, which may still
+    exceed the budget and which closes openings such as the gap between gripper fingers.
+    Query cost scales roughly linearly with the total triangle count, so exceeding the budget
+    is a performance problem worth warning about.
 
     Note that decimation shrinks the mesh by a sub-millimetre amount, which makes the
     constraint very slightly optimistic. Use a small positive ``margin`` on the constraint
@@ -157,7 +157,10 @@ def decimate_mesh(
     try:
         simplified = mesh.simplify_quadric_decimation(face_count=max_triangles)
     except Exception as e:  # trimesh raises various backend-specific errors
-        log_warn(f"quadric decimation failed ({e}), falling back to convex hull")
+        log_warn(
+            f"quadric decimation of {label} failed ({e}); falling back to its convex hull, "
+            "which fills concave regions. Check that 'fast_simplification' is installed."
+        )
         simplified = None
 
     if simplified is None or len(simplified.faces) == 0:
@@ -165,9 +168,8 @@ def decimate_mesh(
 
     if len(simplified.faces) > max_triangles:
         log_warn(
-            f"could not reduce link mesh below {max_triangles} triangles "
-            f"(got {len(simplified.faces)}); install 'fast_simplification' to enable "
-            "quadric decimation and keep collision queries fast"
+            f"could not reduce {label} below {max_triangles} triangles "
+            f"(got {len(simplified.faces)}); collision queries on it will be slower"
         )
     return simplified
 

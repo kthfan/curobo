@@ -397,10 +397,6 @@ def test_horizon_is_flattened(robot_mesh):
 
 
 def test_decimation_respects_budget():
-    pytest.importorskip(
-        "fast_simplification",
-        reason="quadric decimation backend required to honour the triangle budget",
-    )
     sphere = trimesh.creation.icosphere(subdivisions=3)
     mesh = Mesh(
         name="l0",
@@ -418,6 +414,37 @@ def test_decimation_respects_budget():
     assert data.total_tris <= 64
     assert data.tri_verts.shape == (data.total_tris * 3, 3)
     assert data.tri_link.shape == (data.total_tris,)
+
+
+def test_decimation_keeps_the_gap_between_fingers():
+    """Decimation preserves a concave gap, which a convex-hull fallback would fill.
+
+    Two 2 cm fingers with inner faces at x = +-0.02 are refined to far over the budget; a
+    2 cm cube in the gap keeps 1 cm from each finger.
+    """
+    fingers = trimesh.util.concatenate(
+        [
+            trimesh.creation.box(extents=(0.02, 0.02, 0.1)).apply_translation([x, 0.0, 0.0])
+            for x in (-0.03, 0.03)
+        ]
+    )
+    vertices, faces = trimesh.remesh.subdivide_to_size(fingers.vertices, fingers.faces, 0.005)
+    assert len(faces) > 1000
+    data = RobotMeshData.from_link_meshes(
+        link_meshes={
+            "l0": Mesh(name="l0", vertices=vertices, faces=faces, pose=[0, 0, 0, 1, 0, 0, 0])
+        },
+        link_name_to_idx_map={"l0": 0},
+        num_links=1,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=128,
+    )
+    assert data.total_tris <= 128
+    gap = SceneData.from_scene_cfg(
+        SceneCfg(cuboid=[Cuboid(name="c", pose=[0, 0, 0, 1, 0, 0, 0], dims=[0.02, 0.02, 0.02])]),
+        device_cfg=DEVICE_CFG,
+    )
+    assert _check(data, gap, _link_transforms([0.0]))[0].tolist() == [0]
 
 
 def test_mesh_under_budget_is_left_untouched():
