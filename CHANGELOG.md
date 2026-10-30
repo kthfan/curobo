@@ -91,6 +91,16 @@
 - Add `get_mesh_collision_links` to the IK, trajectory optimization and MPC
   solvers and the motion planners. It names the link whose collision mesh
   touches the scene, per configuration, e.g. per step of a failed trajectory.
+- Add an exact self-collision check between the robot's link meshes.
+  `mesh_self_collision_check=True` (and `mesh_self_collision_margin`) on the same
+  `create` methods rejects solutions in which two link meshes collide, including
+  pairs the sphere check must ignore because their spheres always overlap, such
+  as Franka's link5 with link7 and the hand. Links in one rigid body and links
+  one joint apart are skipped, plus a `mesh_self_collision_ignore` list in the
+  robot YAML; `RobotBuilder.compute_mesh_collision_matrix` derives that list.
+  `get_mesh_self_collision_pairs` names a colliding pair, and
+  `RobotCollisionCheckerCfg.load_from_config` accepts
+  `use_mesh_self_collision_constraint`.
 - Speed up the mesh collision check by skipping links whose bounding sphere is
   clear of every obstacle: 2x to 12x faster for 4096 configurations,
   depending on the scene type.
@@ -111,6 +121,8 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- Fix `RobotCollisionChecker.validate` with `use_mesh_constraint=True`, which
+  combined terms of different shapes.
 - Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,
   only intersecting triangles were reported, so the margin had almost no effect.
 - Catch obstacles between the samples of large robot triangles on fine voxel

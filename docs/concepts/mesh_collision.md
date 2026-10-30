@@ -105,8 +105,8 @@ cost still sees the same inside regions.
 | Densely interpolated trajectory, at every interpolation step | yes |
 | MPC metrics | yes |
 | Graph planner seeding | no, spheres only |
-| Self-collision | no, spheres only |
-| Robot collision checker (`validate`) | yes, when created with `use_mesh_constraint=True` |
+| Self-collision | yes, when created with `mesh_self_collision_check=True` |
+| Robot collision checker (`validate`) | yes, when created with `use_mesh_constraint=True` (scene) or `use_mesh_self_collision_constraint=True` (self) |
 
 The optimized trajectory is already dense: in measured Franka plans its steps were about 14 ms
 apart, and the hand moved at most 1 to 2 cm between two of them. The interpolated trajectory,

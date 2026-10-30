@@ -188,6 +188,56 @@ seed out of the collision; only the other seeds can succeed. To fix it:
 Avoid the robot YAML's `collision_sphere_buffer` for this: it enlarges the spheres for the
 success check and self-collision too, so it rejects more solutions instead of steering them.
 
+## Check self-collision with the meshes
+
+The sphere self-collision check has to skip link pairs whose spheres overlap in every
+configuration, such as Franka's `panda_link5` with `panda_link7` and with `panda_hand`. Their
+meshes still collide when the wrist folds onto the forearm: in about 9 % of random Franka
+configurations for `panda_link5` and `panda_hand`. Pass `mesh_self_collision_check=True` to
+check the exact link meshes against each other as well:
+
+```python
+MotionPlannerCfg.create(
+    robot="franka.yml",
+    scene_model="collision_table.yml",
+    mesh_self_collision_check=True,
+    mesh_self_collision_margin=0.0,
+)
+```
+
+The option is independent of `mesh_collision_check` and exists on the same `create` methods.
+Like the scene check it is a pass/fail test on the result; the sphere self-collision cost still
+steers the optimizer, and its check still applies.
+
+The mesh check tests every pair of links with collision meshes, except:
+
+- links that move as one rigid body, joined by fixed or locked joints, such as Franka's hand
+  and its locked fingers;
+- links that a single joint connects, which usually touch at the joint;
+- pairs listed under `mesh_self_collision_ignore` in the robot YAML. This list is separate from
+  the sphere `self_collision_ignore`:
+
+```yaml
+robot_cfg:
+  kinematics:
+    mesh_self_collision_ignore: {panda_link0: [panda_link2]}
+```
+
+Franka needs no list. If two tested meshes collide at the robot's default joint configuration,
+cuRobo warns and names the pair; such pairs usually touch by design and belong in the list.
+For a new robot, {py:meth}`RobotBuilder.compute_mesh_collision_matrix
+<curobo.robot_builder.RobotBuilder.compute_mesh_collision_matrix>` derives
+the list: it adds pairs that collide at the default configuration or in nearly every random
+configuration.
+
+To see which pair a failed solution hits, pass its joint states to
+`get_mesh_self_collision_pairs`, the self-collision counterpart of `get_mesh_collision_links`:
+
+```python
+pairs = planner.get_mesh_self_collision_pairs(result.interpolated_trajectory)
+# pairs[batch][seed][step] is a (link_a, link_b) tuple, or None.
+```
+
 ## Check configurations outside a solver
 
 The robot collision checker accepts the same settings. Its `validate` then includes the mesh
@@ -202,6 +252,7 @@ config = RobotCollisionCheckerCfg.load_from_config(
     use_mesh_constraint=True,
     mesh_constraint_margin=0.0,
     mesh_constraint_ignored_links=["panda_link0"],
+    use_mesh_self_collision_constraint=True,
 )
 checker = RobotCollisionChecker(config)
 is_valid = checker.validate(joint_positions)
@@ -209,7 +260,10 @@ is_valid = checker.validate(joint_positions)
 
 ## Limitations
 
-- The check covers robot-scene collisions. Self-collision is still checked with the spheres.
+- Self-collision with the meshes is opt-in (`mesh_self_collision_check`). A link fully inside
+  another link, crossing none of its triangles, is not detected. Links left out with
+  `mesh_collision_ignored_link_names` have no mesh, so they are not checked against other
+  links either.
 - Trajectory optimization checks the optimized steps and every step of the interpolated
   trajectory. Both sample the motion, so an obstacle thinner than the distance a link moves
   between two samples (about 1 to 2 cm for the hand in typical plans) can be missed.
