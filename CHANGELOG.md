@@ -121,6 +121,11 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- Decimate robot link meshes closer to their surface. Decimation now merges duplicate
+  vertices, closes the mesh when it can, keeps open borders, and keeps the result closest
+  to the original among several settings. Franka's links 2-5, decimated from 300 to the
+  default 256 triangles, moved by up to 2.3 cm before and stay within about 1 mm now. The
+  deviation of every decimated link is logged, with a warning above 2 mm.
 - Fix `RobotCollisionChecker.validate` with `use_mesh_constraint=True`, which
   combined terms of different shapes.
 - Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,

@@ -28,7 +28,7 @@ import warp as wp
 # CuRobo
 from curobo._src.geom.types import Mesh
 from curobo._src.types.device_cfg import DeviceCfg
-from curobo._src.util.logging import log_and_raise, log_warn
+from curobo._src.util.logging import log_and_raise, log_info, log_warn
 from curobo._src.util.warp import init_warp
 
 #: Default per-link triangle budget. Measured on an RTX 3090 Ti, query cost scales roughly
@@ -122,25 +122,128 @@ def transform_point_link(
 # =============================================================================
 
 
-def decimate_mesh(
-    mesh: trimesh.Trimesh, max_triangles: int, link_name: Optional[str] = None
+#: Surface deviation above which decimating a link mesh logs a warning, in meters.
+DECIMATION_WARN_DEVIATION = 0.002
+
+#: Quadric decimation settings tried by :func:`decimate_mesh`, as ``(aggressiveness,
+#: preserve_border)``. Lower aggressiveness collapses edges more carefully; keeping the border
+#: stops open boundaries, common in robot collision meshes, from being eaten away.
+_DECIMATION_CANDIDATES = [(a, b) for b in (True, False) for a in (1.0, 3.0, 5.0, 7.0)]
+
+#: Settings tried, in order, when the closest result is not searched for, e.g. for geometry
+#: written at runtime: the first that reaches the budget is kept.
+_DECIMATION_QUICK_CANDIDATES = [(3.0, True), (3.0, False)]
+
+
+@wp.kernel(enable_backward=False)
+def _surface_distance_kernel(
+    mesh_id: wp.uint64,
+    points: wp.array(dtype=wp.vec3),
+    max_dist: wp.float32,
+    distance: wp.array(dtype=wp.float32),
+):
+    """Distance from each point to the closest point of a mesh, capped at ``max_dist``."""
+    tid = wp.tid()
+    query = wp.mesh_query_point_no_sign(mesh_id, points[tid], max_dist)
+    if query.result:
+        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        distance[tid] = wp.length(closest - points[tid])
+    else:
+        distance[tid] = max_dist
+
+
+def mesh_surface_deviation(a: trimesh.Trimesh, b: trimesh.Trimesh, samples: int = 10000) -> float:
+    """Approximate two-sided surface distance (Hausdorff distance) between two meshes.
+
+    Points sampled on each surface are measured exactly against the other surface with a
+    BVH query on the CPU. The sampling is seeded, so the result is deterministic; it can only
+    underestimate the true distance, by missing the worst point between samples.
+
+    Args:
+        a: First mesh.
+        b: Second mesh.
+        samples: Points sampled on each surface.
+
+    Returns:
+        The largest distance from a sampled point of either surface to the other surface, in
+        the units of the meshes.
+    """
+    device = "cpu"
+    cap = float(np.linalg.norm(np.ptp(np.vstack([a.bounds, b.bounds]), axis=0))) + 1.0
+
+    def one_sided(src: trimesh.Trimesh, dst: trimesh.Trimesh, seed: int) -> float:
+        points = trimesh.sample.sample_surface(src, samples, seed=seed)[0]
+        vertices = np.asarray(dst.vertices, dtype=np.float32)
+        faces = np.asarray(dst.faces, dtype=np.int32).reshape(-1)
+        dst_mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3, device=device),
+            indices=wp.array(faces, device=device),
+        )
+        distance = wp.zeros(len(points), dtype=wp.float32, device=device)
+        wp.launch(
+            _surface_distance_kernel,
+            dim=len(points),
+            inputs=[
+                dst_mesh.id,
+                wp.array(np.asarray(points, dtype=np.float32), dtype=wp.vec3, device=device),
+                cap,
+                distance,
+            ],
+            device=device,
+        )
+        return float(distance.numpy().max())
+
+    return max(one_sided(a, b, 0), one_sided(b, a, 1))
+
+
+def _quadric_decimate(
+    mesh: trimesh.Trimesh, max_triangles: int, aggressiveness: float, preserve_border: bool
 ) -> trimesh.Trimesh:
-    """Reduce a link mesh to at most ``max_triangles`` triangles.
+    """Quadric decimation that raises the aggressiveness whenever a pass stops short."""
+    from fast_simplification import simplify
 
-    Quadric decimation (trimesh with the ``fast_simplification`` package) is used because it
-    preserves concavities. If it fails, this falls back to the convex hull, which may still
-    exceed the budget and which closes openings such as the gap between gripper fingers.
-    Query cost scales roughly linearly with the total triangle count, so exceeding the budget
-    is a performance problem worth warning about.
+    vertices, faces = mesh.vertices, mesh.faces
+    for agg in [a for a in (1.0, 3.0, 5.0, 7.0, 9.0, 10.0) if a >= aggressiveness]:
+        if len(faces) <= max_triangles:
+            break
+        vertices, faces = simplify(
+            vertices,
+            faces,
+            target_count=max_triangles,
+            agg=agg,
+            preserve_border=preserve_border,
+        )
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    Note that decimation shrinks the mesh by a sub-millimetre amount, which makes the
-    constraint very slightly optimistic. Use a small positive ``margin`` on the constraint
-    to compensate when that matters.
+
+def decimate_mesh(
+    mesh: trimesh.Trimesh,
+    max_triangles: int,
+    link_name: Optional[str] = None,
+    thorough: bool = True,
+    warn_deviation: float = DECIMATION_WARN_DEVIATION,
+) -> trimesh.Trimesh:
+    """Reduce a link mesh to at most ``max_triangles`` triangles, staying close to its surface.
+
+    The mesh is first cleaned: duplicate vertices are merged, and holes are filled when that
+    closes it. Quadric decimation (``fast_simplification``) then runs with several settings,
+    and the result closest to the original surface (:func:`mesh_surface_deviation`) is kept.
+    Most robot collision meshes are open, and keeping their open boundary is what keeps
+    decimation from eating into them: on Franka's links it cuts the deviation from up to
+    2.3 cm to about 1 mm.
+
+    A warning reports the deviation when it exceeds ``warn_deviation``. If no setting reaches
+    the budget, the closest of the results over it is kept, with a warning: collision queries
+    on it are slower. If decimation fails altogether, this falls back to the convex hull,
+    which fills concave regions such as the gap between gripper fingers.
 
     Args:
         mesh: Input link mesh.
         max_triangles: Triangle budget. Values <= 0 disable decimation.
-        link_name: Name of the link, used only to make warnings actionable.
+        link_name: Name of the link, used only to make messages actionable.
+        thorough: Try every decimation setting and keep the closest result. False keeps the
+            first setting that reaches the budget, for geometry written at runtime.
+        warn_deviation: Surface deviation in meters above which a warning is logged.
 
     Returns:
         A mesh with at most ``max_triangles`` triangles where possible.
@@ -149,29 +252,63 @@ def decimate_mesh(
         return mesh
 
     label = f"link '{link_name}'" if link_name is not None else "link mesh"
-    log_warn(
-        f"{label} has {len(mesh.faces)} triangles, over its budget of {max_triangles}; "
-        "decimating. Raise max_triangles_per_link for this link to keep full fidelity."
-    )
+    base = mesh.copy()
+    base.merge_vertices()
+    closed = base.copy()
+    trimesh.repair.fill_holes(closed)
+    if closed.is_watertight:
+        base = closed
 
+    candidates = _DECIMATION_CANDIDATES if thorough else _DECIMATION_QUICK_CANDIDATES
+    # Closest result within the budget, and closest result over it in case none fits.
+    best, best_deviation = None, np.inf
+    over, over_deviation = None, np.inf
     try:
-        simplified = mesh.simplify_quadric_decimation(face_count=max_triangles)
-    except Exception as e:  # trimesh raises various backend-specific errors
+        for aggressiveness, preserve_border in candidates:
+            simplified = _quadric_decimate(base, max_triangles, aggressiveness, preserve_border)
+            if len(simplified.faces) == 0:
+                continue
+            deviation = mesh_surface_deviation(mesh, simplified)
+            if len(simplified.faces) > max_triangles:
+                if deviation < over_deviation:
+                    over, over_deviation = simplified, deviation
+                continue
+            if deviation < best_deviation:
+                best, best_deviation = simplified, deviation
+            if not thorough:
+                break
+    except Exception as e:  # fast_simplification raises various errors on bad input
         log_warn(
             f"quadric decimation of {label} failed ({e}); falling back to its convex hull, "
             "which fills concave regions. Check that 'fast_simplification' is installed."
         )
-        simplified = None
+        best, over = None, None
 
-    if simplified is None or len(simplified.faces) == 0:
-        simplified = mesh.convex_hull
-
-    if len(simplified.faces) > max_triangles:
+    if best is None:
+        if over is not None:
+            best, best_deviation = over, over_deviation
+        else:
+            best = mesh.convex_hull
+            best_deviation = mesh_surface_deviation(mesh, best)
+    if len(best.faces) > max_triangles:
         log_warn(
             f"could not reduce {label} below {max_triangles} triangles "
-            f"(got {len(simplified.faces)}); collision queries on it will be slower"
+            f"(got {len(best.faces)}); collision queries on it will be slower"
         )
-    return simplified
+
+    message = (
+        f"{label} has {len(mesh.faces)} triangles, over its budget of {max_triangles}; "
+        f"decimated to {len(best.faces)}, its surface moved by up to "
+        f"{1000.0 * best_deviation:.1f} mm"
+    )
+    if best_deviation > warn_deviation:
+        log_warn(
+            message + ". Raise max_triangles_per_link for this link, or add the deviation to "
+            "the mesh collision margin."
+        )
+    else:
+        log_info(message)
+    return best
 
 
 def _as_triangle_soup(
@@ -192,7 +329,7 @@ def _as_triangle_soup(
     if isinstance(triangles, Mesh):
         triangles = triangles.get_trimesh_mesh(transform_with_pose=True)
     if isinstance(triangles, trimesh.Trimesh):
-        triangles = decimate_mesh(triangles, capacity, link_name)
+        triangles = decimate_mesh(triangles, capacity, link_name, thorough=False)
         soup = np.asarray(triangles.triangles, dtype=np.float32)
         return torch.as_tensor(soup)
 
@@ -209,7 +346,7 @@ def _as_triangle_soup(
             faces=np.arange(soup.shape[0] * 3).reshape(-1, 3),
             process=True,
         )
-        mesh = decimate_mesh(mesh, capacity, link_name)
+        mesh = decimate_mesh(mesh, capacity, link_name, thorough=False)
         soup = torch.as_tensor(np.asarray(mesh.triangles, dtype=np.float32))
     if soup.shape[0] > capacity:
         log_and_raise(

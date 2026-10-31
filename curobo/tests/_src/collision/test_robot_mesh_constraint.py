@@ -11,7 +11,11 @@ import trimesh
 
 # CuRobo
 from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_collision
-from curobo._src.geom.data.data_robot_mesh import RobotMeshData
+from curobo._src.geom.data.data_robot_mesh import (
+    RobotMeshData,
+    decimate_mesh,
+    mesh_surface_deviation,
+)
 from curobo._src.geom.data.data_scene import SceneData
 from curobo._src.geom.types import Cuboid, Mesh, SceneCfg, VoxelGrid
 from curobo._src.types.device_cfg import DeviceCfg
@@ -445,6 +449,67 @@ def test_decimation_keeps_the_gap_between_fingers():
         device_cfg=DEVICE_CFG,
     )
     assert _check(data, gap, _link_transforms([0.0]))[0].tolist() == [0]
+
+
+def _open_box(subdivide_to: float = 0.02) -> trimesh.Trimesh:
+    """A 0.2 m box without its top face, refined to many triangles: an open mesh."""
+    box = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+    box = trimesh.Trimesh(box.vertices, box.faces[box.face_normals[:, 2] < 0.9])
+    vertices, faces = trimesh.remesh.subdivide_to_size(box.vertices, box.faces, subdivide_to)
+    return trimesh.Trimesh(vertices, faces)
+
+
+def test_decimation_keeps_open_meshes_close_to_their_surface():
+    """The open rim of a mesh is kept, so decimation does not eat into it."""
+    mesh = _open_box()
+    assert not mesh.is_watertight and len(mesh.faces) > 500
+    simplified = decimate_mesh(mesh, 64)
+    assert len(simplified.faces) <= 64
+    assert mesh_surface_deviation(mesh, simplified) < 0.002
+
+
+def test_decimation_of_franka_links_stays_within_two_millimeters():
+    """Franka's links 1-5 have 300 triangles, over the default budget of 256."""
+    import yourdfpy
+
+    from curobo._src.util_file import get_assets_path, join_path
+
+    root = join_path(get_assets_path(), "robot/franka_description")
+    urdf = yourdfpy.URDF.load(
+        join_path(root, "franka_panda.urdf"), load_meshes=False, build_scene_graph=False
+    )
+    for name in ["panda_link2", "panda_link3", "panda_link5"]:
+        filename = urdf.link_map[name].collisions[0].geometry.mesh.filename
+        mesh = trimesh.load(join_path(root, filename), force="mesh")
+        simplified = decimate_mesh(mesh, 256, name)
+        assert len(simplified.faces) <= 256
+        assert mesh_surface_deviation(mesh, simplified) < 0.002, name
+
+
+def test_decimation_warns_about_a_large_deviation(caplog):
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=0.1)
+    with caplog.at_level("WARNING"):
+        decimate_mesh(sphere, 16, "ball")
+    assert "link 'ball'" in caplog.text and "surface moved by up to" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        decimate_mesh(sphere, 16, "ball", warn_deviation=1.0)
+    assert "surface moved" not in caplog.text
+
+
+def test_quick_decimation_respects_the_budget():
+    """Geometry written at runtime is decimated with a single setting."""
+    simplified = decimate_mesh(_open_box(), 64, thorough=False)
+    assert 0 < len(simplified.faces) <= 64
+
+
+def test_mesh_surface_deviation_measures_an_offset():
+    box = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+    shifted = box.copy()
+    shifted.apply_translation([0.01, 0.0, 0.0])
+    assert mesh_surface_deviation(box, box) < 1.0e-3
+    assert mesh_surface_deviation(box, shifted) == pytest.approx(0.01, abs=1.5e-3)
 
 
 def test_mesh_under_budget_is_left_untouched():

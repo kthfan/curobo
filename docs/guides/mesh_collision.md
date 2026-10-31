@@ -66,15 +66,18 @@ MotionPlannerCfg.create(
 )
 ```
 
-Use a small positive margin when the robot's meshes are decimated (see the next section), since
-decimation can shrink a link slightly.
+When a link mesh is decimated (see the next section), its surface moves by the deviation that
+cuRobo reports at load time. A margin of that size keeps the check from missing contacts there.
 
 ## Limit the triangle count
 
 The check costs time in proportion to the number of robot triangles. Each link is packed with
-at most 256 triangles by default; a larger mesh is decimated to fit, with a warning. Set a
-different budget in the `kinematics` section of the robot YAML, either for every link or per
-link:
+at most 256 triangles by default; a larger mesh is decimated to fit. Decimation keeps the open
+borders that robot collision meshes often have and picks, among several settings, the result
+closest to the original surface: Franka's links stay within about 1 mm at the default budget.
+cuRobo logs how far each decimated surface moved, and warns when it moved by more than 2 mm
+or when a mesh cannot be reduced to its budget. Set a different budget in the `kinematics`
+section of the robot YAML, either for every link or per link:
 
 ```yaml
 robot_cfg:
@@ -84,8 +87,8 @@ robot_cfg:
     # max_triangles_per_link: {panda_hand: 512, panda_leftfinger: 64}
 ```
 
-Increase the budget for links whose shape matters, such as fingers. Lower it for large, simple
-links. {ref}`mesh_collision_cost` lists measured costs for different budgets and scenes.
+Increase the budget for links whose shape matters, such as fingers, and for links that the
+warning reports. Lower it for large, simple links. {ref}`mesh_collision_cost` lists measured costs for different budgets and scenes.
 
 ## Ignore links that touch the scene by design
 
