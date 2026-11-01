@@ -111,7 +111,8 @@
   orientation over the whole trajectory relative to the goal, the start, or
   the robot base: planes, lines, boxes, the tilt of a tool axis, and yaw and
   roll ranges, with `plane`, `line`, `axis_tilt`, and `orientation_box`
-  factories. A tool frame can hold several bounds. They are set with
+  factories. A tool frame can hold several bounds, and `center_weight` keeps
+  paths near the middle of limits with two ends. They are set with
   `update_tool_pose_bounds` on the motion planner, IK, trajectory
   optimization, MPC, and the multi-waypoint planner.
   The default IK, trajectory optimization, and MPC task configs include the
