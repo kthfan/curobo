@@ -24,7 +24,8 @@ import torch
 
 from curobo._src.cost.cost_eef_bound import EEFBoundCost
 from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
-from curobo._src.cost.tool_pose_bound import ToolPoseBound, _quat_mul
+from curobo._src.cost.cost_eef_bound_eval import _quat_mul
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util.warp import init_warp

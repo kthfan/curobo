@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from curobo._src.cost.tool_pose_bound import (
+from curobo._src.cost.cost_eef_bound_eval import (
     _quat_mul,
     _quat_rotate,
     tool_pose_bound_violation,

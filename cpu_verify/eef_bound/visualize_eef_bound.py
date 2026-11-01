@@ -48,13 +48,13 @@ from cpu_adapter import (
     quat_axis_angle,
     random_quat,
 )
-from curobo._src.cost.tool_pose_bound import (
-    ToolPoseBound,
+from curobo._src.cost.cost_eef_bound_eval import (
     _quat_mul,
     _quat_rotate,
     tool_pose_bound_components,
     tool_pose_bound_cost,
 )
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 
 # Reference palette (dataviz skill, light mode).

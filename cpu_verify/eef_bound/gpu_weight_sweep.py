@@ -32,7 +32,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from curobo._src.cost.tool_pose_bound import _quat_rotate, tool_pose_bound_violation
+from curobo._src.cost.cost_eef_bound_eval import _quat_rotate, tool_pose_bound_violation
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import GoalToolPose, JointState, ToolPoseBound
 from gpu_check import active_positions

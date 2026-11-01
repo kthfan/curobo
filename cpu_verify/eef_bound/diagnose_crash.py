@@ -56,7 +56,7 @@ STEPS = [
         "tilt/yaw/roll angles (TestAngles)",
         """
         import torch
-        from curobo._src.cost.tool_pose_bound import _zyz
+        from curobo._src.cost.cost_eef_bound_eval import _zyz
         print(_zyz(torch.tensor([0.9, 0.1, 0.2, 0.3])))
         """,
     ),
@@ -64,7 +64,8 @@ STEPS = [
         "tool_pose_bound_violation (TestViolation)",
         """
         import torch
-        from curobo._src.cost.tool_pose_bound import ToolPoseBound, tool_pose_bound_violation
+        from curobo._src.cost.tool_pose_bound import ToolPoseBound
+        from curobo._src.cost.cost_eef_bound_eval import tool_pose_bound_violation
         q = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
         print(tool_pose_bound_violation(ToolPoseBound.plane(anchor="base"),
               torch.tensor([[0.3, -0.2, 0.03]]), q, torch.zeros(1, 3), q))

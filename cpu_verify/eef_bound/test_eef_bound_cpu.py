@@ -30,7 +30,8 @@ from cpu_adapter import (
     quat_axis_angle,
     random_quat,
 )
-from curobo._src.cost.tool_pose_bound import ToolPoseBound, _quat_mul
+from curobo._src.cost.cost_eef_bound_eval import _quat_mul
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 
 ORIGIN = torch.zeros(3)
