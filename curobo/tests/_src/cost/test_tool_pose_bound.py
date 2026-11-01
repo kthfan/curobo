@@ -7,16 +7,20 @@ import math
 import pytest
 import torch
 
-from curobo._src.cost.tool_pose_bound import (
+from curobo._src.cost.cost_eef_bound_eval import (
     METRIC_EPSILON,
     UNBOUNDED,
-    ToolPoseBound,
-    ToolPoseBoundAnchor,
     _quat_mul,
+    eef_bound_center_pull,
+    eef_bound_limits,
     find_tool_pose_bound_violations,
-    normalize_tool_pose_bounds,
     tool_pose_bound_components,
     tool_pose_bound_violation,
+)
+from curobo._src.cost.tool_pose_bound import (
+    ToolPoseBound,
+    ToolPoseBoundAnchor,
+    normalize_tool_pose_bounds,
 )
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 
@@ -103,50 +107,92 @@ class TestKernelValues:
     """Cost and feasibility intervals ``(center, lower, upper)`` per component."""
 
     def test_unlimited_component(self):
-        center, lower, upper = ToolPoseBound(anchor="base", z=0.0).kernel_values(metric=True)
+        center, lower, upper = eef_bound_limits(ToolPoseBound(anchor="base", z=0.0), metric=True)
         assert (center[0], lower[0], upper[0]) == (0.0, -UNBOUNDED, UNBOUNDED)
 
     def test_inequality(self):
         bound = ToolPoseBound(anchor="base", z=(0.0, 0.1), position_tolerance=0.01)
-        _, lower, upper = bound.kernel_values(metric=False)
+        _, lower, upper = eef_bound_limits(bound, metric=False)
         assert (lower[2], upper[2]) == pytest.approx((0.005, 0.095))
-        _, lower, upper = bound.kernel_values(metric=True)
+        _, lower, upper = eef_bound_limits(bound, metric=True)
         assert (lower[2], upper[2]) == pytest.approx((-METRIC_EPSILON, 0.1 + METRIC_EPSILON))
 
     def test_equality(self):
         bound = ToolPoseBound(anchor="base", z=(0.2, 0.205), position_tolerance=0.01)
-        _, lower, upper = bound.kernel_values(metric=False)
+        _, lower, upper = eef_bound_limits(bound, metric=False)
         assert lower[2] == upper[2] == pytest.approx(0.2025)
-        _, lower, upper = bound.kernel_values(metric=True)
+        _, lower, upper = eef_bound_limits(bound, metric=True)
         assert (lower[2], upper[2]) == pytest.approx(
             (0.19 - METRIC_EPSILON, 0.215 + METRIC_EPSILON)
         )
 
     def test_one_sided(self):
         bound = ToolPoseBound(anchor="base", z=(0.0, None), position_tolerance=0.01)
-        _, lower, upper = bound.kernel_values(metric=False)
+        _, lower, upper = eef_bound_limits(bound, metric=False)
         assert (lower[2], upper[2]) == (pytest.approx(0.005), UNBOUNDED)
 
     def test_trivial_tilt_sides_are_unlimited(self):
         bound = ToolPoseBound(tilt=(0.0, math.pi))
-        _, lower, upper = bound.kernel_values(metric=True)
+        _, lower, upper = eef_bound_limits(bound, metric=True)
         assert (lower[3], upper[3]) == (-UNBOUNDED, UNBOUNDED)
 
     def test_wrapped_interval_is_centered(self):
         bound = ToolPoseBound(tilt=(1.0, 2.0), roll=(3.0, 3.4), rotation_tolerance=0.0)
-        center, lower, upper = bound.kernel_values(metric=False)
+        center, lower, upper = eef_bound_limits(bound, metric=False)
         assert center[5] == pytest.approx(3.2)
         assert (lower[5], upper[5]) == pytest.approx((-0.2, 0.2))
 
     def test_goal_on_edge_keeps_zero_cost(self):
         bound = ToolPoseBound(anchor="goal", z=(-0.12, 0.0), position_tolerance=0.01)
-        _, lower, upper = bound.kernel_values(metric=False)
+        _, lower, upper = eef_bound_limits(bound, metric=False)
         assert (lower[2], upper[2]) == pytest.approx((-0.115, 0.0))
 
     def test_base_anchor_shrinks_both_sides(self):
         bound = ToolPoseBound(anchor="base", z=(-0.12, 0.0), position_tolerance=0.01)
-        _, lower, upper = bound.kernel_values(metric=False)
+        _, lower, upper = eef_bound_limits(bound, metric=False)
         assert (lower[2], upper[2]) == pytest.approx((-0.115, -0.005))
+
+
+class TestCenterPull:
+    """Targets and weights of the pull toward the middle of each limit."""
+
+    def test_two_sided_limits_are_pulled_to_the_middle(self):
+        bound = ToolPoseBound(
+            anchor="base", x=(-0.1, 0.3), tilt=(0.2, 1.0), roll=(3.0, 3.4), center_weight=0.5
+        )
+        targets, weights = eef_bound_center_pull(bound, metric=False)
+        assert targets == pytest.approx([0.1, 0.0, 0.0, 0.6, 0.0, 0.0])
+        # roll is measured from the middle of its interval, so its target is 0.
+        assert weights == [0.5, 0.0, 0.0, 0.5, 0.0, 0.5]
+
+    def test_one_sided_equality_and_trivial_limits_are_not_pulled(self):
+        bound = ToolPoseBound(
+            anchor="base",
+            x=(0.0, None),
+            y=0.2,
+            tilt=(0.0, 0.3),
+            position_tolerance=0.01,
+            center_weight=0.5,
+        )
+        _, weights = eef_bound_center_pull(bound, metric=False)
+        assert weights == [0.0] * 6
+
+    def test_metric_and_zero_weight_are_not_pulled(self):
+        bound = ToolPoseBound(anchor="base", x=(-0.1, 0.3), center_weight=0.5)
+        assert eef_bound_center_pull(bound, metric=True)[1] == [0.0] * 6
+        bound = ToolPoseBound(anchor="base", x=(-0.1, 0.3))
+        assert eef_bound_center_pull(bound, metric=False)[1] == [0.0] * 6
+
+    def test_negative_weight_raises(self):
+        with pytest.raises(ValueError, match="center_weight"):
+            ToolPoseBound(z=(0.0, 0.1), center_weight=-1.0)
+
+    def test_factories_forward_the_weight(self):
+        line = ToolPoseBound.line(min_along=0.0, max_along=0.1, center_weight=0.3)
+        assert ToolPoseBound.plane(max_distance=0.1, center_weight=0.3).center_weight == 0.3
+        assert line.center_weight == 0.3
+        assert ToolPoseBound.axis_tilt(max_angle=0.1, center_weight=0.3).center_weight == 0.3
+        assert ToolPoseBound.orientation_box(0.1, center_weight=0.3).center_weight == 0.3
 
 
 class TestAngles:

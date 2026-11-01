@@ -9,10 +9,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 from curobo._src.collision.attachment_manager import AttachmentManager
+from curobo._src.cost.cost_eef_bound_eval import find_tool_pose_bound_violations
 from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     ToolPoseBounds,
-    find_tool_pose_bound_violations,
     normalize_tool_pose_bounds,
 )
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria

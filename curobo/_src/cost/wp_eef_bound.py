@@ -5,8 +5,9 @@
 One thread per ``(batch, horizon, link)``. Each link has a fixed number of bound slots. For every
 used slot the thread builds the reference frame, expresses the tool pose in it as
 ``(x, y, z, tilt, yaw, roll)`` (see :mod:`curobo._src.cost.tool_pose_bound`), and evaluates a
-squared hinge on each limited component. Goal-anchored slots are evaluated against every goal of
-the set and the goal with the lowest total cost is kept.
+squared hinge on each limited component, plus the optional pull toward the middle of each limit
+on every step except the last of the horizon. Goal-anchored slots are evaluated against every goal
+of the set and the goal with the lowest total cost is kept.
 
 Gradients are exact and written in cuRobo's convention: position gradient in the base frame,
 and orientation gradient ``q ⊗ (0, 2ω)`` (wxyz) where ``ω`` is the base-frame angular gradient,
@@ -58,6 +59,26 @@ def _squared_hinge(value: float, lower: float, upper: float) -> wp.vec2:
 
 
 @wp.func
+def _limit_cost(
+    value: float,
+    i: int,
+    lower: wp.array(dtype=wp.float32),
+    upper: wp.array(dtype=wp.float32),
+    pull_target: wp.array(dtype=wp.float32),
+    pull_weight: wp.array(dtype=wp.float32),
+    pull: int,
+) -> wp.vec2:
+    """Return ``(cost, d cost / d value)`` of component ``i``: hinge plus the optional pull."""
+    h = _squared_hinge(value, lower[i], upper[i])
+    if pull != 0:
+        weight = pull_weight[i]
+        if weight > 0.0:
+            e = value - pull_target[i]
+            h = h + wp.vec2(0.5 * weight * e * e, weight * e)
+    return h
+
+
+@wp.func
 def _wrap(angle: float) -> float:
     """Wrap to ``[-π, π)``."""
     return angle - 2.0 * _PI * wp.floor((angle + _PI) / (2.0 * _PI))
@@ -76,9 +97,15 @@ def _slot_cost(
     center: wp.array(dtype=wp.float32),
     lower: wp.array(dtype=wp.float32),
     upper: wp.array(dtype=wp.float32),
+    pull_target: wp.array(dtype=wp.float32),
+    pull_weight: wp.array(dtype=wp.float32),
     use_rotation: wp.array(dtype=wp.int32),
+    pull: int,
 ):
-    """Return cost, base-frame position gradient and base-frame angular gradient of slot ``s``."""
+    """Return cost, base-frame position gradient and base-frame angular gradient of slot ``s``.
+
+    ``pull`` is non-zero on the steps where the pull toward the middle of each limit applies.
+    """
     ref_quat = reference_rotation[s]
     if axes[s] == 0:
         ref_quat = _quat_mul(a_quat, reference_rotation[s])
@@ -87,7 +114,7 @@ def _slot_cost(
     cost = float(0.0)
     grad_local = wp.vec3(0.0)
     for k in range(3):
-        h = _squared_hinge(local_pos[k], lower[s * 6 + k], upper[s * 6 + k])
+        h = _limit_cost(local_pos[k], s * 6 + k, lower, upper, pull_target, pull_weight, pull)
         cost += h[0]
         grad_local[k] = h[1]
     grad_pos = _quat_rotate(ref_quat, grad_local)
@@ -107,7 +134,7 @@ def _slot_cost(
         tilt = wp.atan2(sin_tilt, u[2])
         omega_ref = wp.vec3(0.0)
 
-        h = _squared_hinge(tilt, lower[s * 6 + 3], upper[s * 6 + 3])
+        h = _limit_cost(tilt, s * 6 + 3, lower, upper, pull_target, pull_weight, pull)
         cost += h[0]
         if h[1] != 0.0:
             # d tilt / d omega = (z × u) / |z × u|; any horizontal axis where it is undefined.
@@ -121,14 +148,16 @@ def _slot_cost(
         if sin_tilt > 1.0e-6:
             g_sin2 = wp.max(sin2, _MIN_SIN2)
             yaw = wp.atan2(u[1], u[0])
-            h = _squared_hinge(_wrap(yaw - center[s * 6 + 4]), lower[s * 6 + 4], upper[s * 6 + 4])
+            d = _wrap(yaw - center[s * 6 + 4])
+            h = _limit_cost(d, s * 6 + 4, lower, upper, pull_target, pull_weight, pull)
             cost += h[0]
             if h[1] != 0.0:
                 d_yaw = wp.vec3(-u[0] * u[2] / g_sin2, -u[1] * u[2] / g_sin2, 1.0)
                 omega_ref += h[1] * d_yaw
 
             roll = wp.atan2(r[1], -r[0])
-            h = _squared_hinge(_wrap(roll - center[s * 6 + 5]), lower[s * 6 + 5], upper[s * 6 + 5])
+            d = _wrap(roll - center[s * 6 + 5])
+            h = _limit_cost(d, s * 6 + 5, lower, upper, pull_target, pull_weight, pull)
             cost += h[0]
             if h[1] != 0.0:
                 # Gradient in the tool axis frame, rotated into the reference frame.
@@ -157,6 +186,8 @@ def eef_bound_cost_kernel(
     center: wp.array(dtype=wp.float32),  # (L*K*6)
     lower: wp.array(dtype=wp.float32),  # (L*K*6)
     upper: wp.array(dtype=wp.float32),  # (L*K*6)
+    pull_target: wp.array(dtype=wp.float32),  # (L*K*6)
+    pull_weight: wp.array(dtype=wp.float32),  # (L*K*6), 0 where there is no pull
     use_rotation: wp.array(dtype=wp.int32),  # (L*K)
     weight: wp.array(dtype=wp.float32),  # (1) or (L)
     weight_per_link: int,
@@ -172,6 +203,11 @@ def eef_bound_cost_kernel(
     tid = wp.tid()
     b = tid / (horizon * num_links)
     li = tid - (tid / num_links) * num_links
+    h_idx = (tid / num_links) - (tid / (num_links * horizon)) * horizon
+    # The pull toward the middle of each limit spares the last step, which reaches the goal.
+    pull = int(0)
+    if h_idx < horizon - 1:
+        pull = 1
     c_pos = current_position[tid]
     c_quat = current_quaternion[tid]
 
@@ -207,7 +243,10 @@ def eef_bound_cost_kernel(
             center,
             lower,
             upper,
+            pull_target,
+            pull_weight,
             use_rotation,
+            pull,
         )
         total += cost
         grad_pos += g_pos
@@ -242,7 +281,10 @@ def eef_bound_cost_kernel(
                     center,
                     lower,
                     upper,
+                    pull_target,
+                    pull_weight,
                     use_rotation,
+                    pull,
                 )
                 goal_cost += cost
                 goal_grad_pos += g_pos
@@ -291,6 +333,8 @@ class EEFBoundCostFunction(torch.autograd.Function):
         center: torch.Tensor,
         lower: torch.Tensor,
         upper: torch.Tensor,
+        pull_target: torch.Tensor,
+        pull_weight: torch.Tensor,
         use_rotation: torch.Tensor,
         weight: torch.Tensor,
         num_goalset: int,
@@ -327,6 +371,8 @@ class EEFBoundCostFunction(torch.autograd.Function):
                 wp.from_torch(center.view(-1), dtype=wp.float32),
                 wp.from_torch(lower.view(-1), dtype=wp.float32),
                 wp.from_torch(upper.view(-1), dtype=wp.float32),
+                wp.from_torch(pull_target.view(-1), dtype=wp.float32),
+                wp.from_torch(pull_weight.view(-1), dtype=wp.float32),
                 wp.from_torch(use_rotation.view(-1), dtype=wp.int32),
                 wp.from_torch(weight.view(-1), dtype=wp.float32),
                 int(weight.numel() == num_links and num_links > 1),
@@ -350,7 +396,7 @@ class EEFBoundCostFunction(torch.autograd.Function):
     def backward(ctx, grad_cost: torch.Tensor):
         """Return the cached pose gradients, scaled by ``grad_cost`` when requested."""
         position_gradient, quaternion_gradient = ctx.saved_tensors
-        grads = [None] * 22
+        grads = [None] * 24
         if ctx.use_grad_input:
             grad_cost = grad_cost.unsqueeze(-1)
             position_gradient = position_gradient * grad_cost
