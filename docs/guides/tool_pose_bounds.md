@@ -149,6 +149,38 @@ Adjust them as follows:
   trajectory optimization, and MPC task configs (default `1e5`). A higher weight competes more
   strongly with the other costs, such as collision avoidance.
 
+## Prefer the middle of a limit
+
+Inside its limits a bound costs nothing, so a path may run along an edge. To keep paths near
+the middle of a limit, set `center_weight`:
+
+```python
+# Slide within ±20 mm of the table height, preferring the middle.
+ToolPoseBound(anchor="base", z=(0.38, 0.42), center_weight=1.0)
+ToolPoseBound.orientation_box(0.26, 0.26, 0.26, center_weight=1.0)
+```
+
+- It adds `0.5 * center_weight * (value - middle)²` per limited component, relative to
+  `eef_bound_cfg.weight`, with values in meters or radians.
+- It applies to limits with two ends that are wider than the tolerance. One-sided limits such
+  as `plane(..., max_distance=None)` have no middle and are not pulled; to center them, give
+  both ends. Equality limits already pull to their center.
+- It acts on every step except the last, so a goal away from the middle is still reached.
+- It never changes which paths are feasible.
+
+Measured with the Franka planner and the default `eef_bound_cfg.weight` of `1e5`, on paths
+within ±20 mm of a height:
+
+| `center_weight` | RMS distance from the middle | Largest distance |
+| --- | --- | --- |
+| 0 | 2.6 mm | 4.2 mm |
+| 1 | 1.2 mm | 2.0 mm |
+| 10 | 0.3 mm | 0.5 mm |
+
+Success rate and planning time were unchanged, and paths still ended at goals 15 mm off the
+middle. Values below 0.1 have little effect. Start at 1 and raise it if paths should stay
+closer to the middle; a large value competes with the other costs, such as collision avoidance.
+
 ## Bound multi-waypoint plans
 
 {py:class}`~curobo.multi_waypoint_planner.MultiWaypointMotionPlanner` plans each segment
