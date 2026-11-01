@@ -20,6 +20,9 @@ from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
 from curobo._src.cost.cost_robot_mesh_constraint_cfg import RobotMeshConstraintCfg
+from curobo._src.cost.cost_robot_mesh_self_collision_cfg import (
+    RobotMeshSelfCollisionConstraintCfg,
+)
 from curobo._src.types.device_cfg import DeviceCfg
 
 if TYPE_CHECKING:
@@ -72,6 +75,9 @@ class RobotCostManagerCfg:
     # Robot mesh collision cost configuration.
     mesh_collision_cfg: Optional[RobotMeshConstraintCfg] = None
 
+    #: Exact self-collision constraint between the robot's link meshes. None disables it.
+    mesh_self_collision_cfg: Optional[RobotMeshSelfCollisionConstraintCfg] = None
+
     def __post_init__(self):
         from .cost_manager_robot import RobotCostManager
 
@@ -97,6 +103,7 @@ class RobotCostManagerCfg:
             "tool_pose_cfg": ToolPoseCostCfg,
             "eef_bound_cfg": EEFBoundCostCfg,
             "mesh_collision_cfg": RobotMeshConstraintCfg,
+            "mesh_self_collision_cfg": RobotMeshSelfCollisionConstraintCfg,
         }
         data = {}
         for k, cfg_class in cost_key_map.items():

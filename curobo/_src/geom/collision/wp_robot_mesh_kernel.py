@@ -13,7 +13,8 @@ obstacle's own acceleration structure, so once a configuration is known to colli
 remaining threads exit immediately.
 
 Accuracy per obstacle type:
-    - Mesh: exact triangle-triangle intersection, plus an optional containment pass so a
+    - Mesh: exact triangle-triangle intersection, plus an exact triangle-triangle distance
+      test against ``margin`` when it is positive, plus an optional containment pass so a
       link fully swallowed by a large obstacle is still detected.
     - Cuboid: exact triangle-box overlap via the separating axis theorem. Containment is
       handled inherently by the test, so no second pass is needed.
@@ -28,6 +29,7 @@ geometry is re-posed for every configuration.
 
 # Standard Library
 from importlib import import_module
+from typing import Any
 
 # Third Party
 import warp as wp
@@ -99,8 +101,279 @@ def tri_aabb_hi(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, margin: wp.float32) -> wp
 
 
 # =============================================================================
+# Link-level culling
+# =============================================================================
+#
+# Before the per-triangle work, each (configuration, link) pair tests the link's bounding
+# sphere against every obstacle of one type with a single SDF query. A link that is clear of
+# all of them by more than what the per-triangle test could still flag is skipped. Each
+# ``link_clear_of_obstacle`` overload (one per obstacle type, resolved by Warp from the argument
+# type) is conservative with respect to the matching kernel.
+
+#: Absolute slack added to every culling threshold, covering float round-off.
+LINK_CULL_EPS = wp.constant(1.0e-4)
+
+#: Cap on barycentric subdivisions per robot triangle in the voxel kernel. It bounds the work
+#: per thread; a triangle that needs more is sampled coarser with a widened threshold.
+MAX_VOXEL_SAMPLES_PER_EDGE = wp.constant(16)
+
+
+@wp.func
+def link_clear_of_obstacle(
+    obs: CuboidDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether no triangle inside the sphere can overlap the margin-inflated cuboid.
+
+    The kernel inflates each half extent by ``margin``, which reaches up to ``sqrt(3) *
+    margin`` from the box at its corners.
+    """
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    return compute_local_sdf(obs, env_idx, o, local) > radius + 1.7320508 * margin + LINK_CULL_EPS
+
+
+@wp.func
+def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
+    obs: MeshDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether every point of the sphere is farther than ``margin`` outside the mesh.
+
+    Requiring a positive distance also covers the containment pass, which uses the same SDF.
+    """
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    return compute_local_sdf(obs, env_idx, o, local) > radius + margin + LINK_CULL_EPS
+
+
+@wp.func
+def link_clear_of_obstacle(  # noqa: F811 (Warp overload)
+    obs: VoxelDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    center: wp.vec3,
+    radius: wp.float32,
+    margin: wp.float32,
+) -> wp.bool:
+    """Whether no sample inside the sphere can read an ESDF value at or below its threshold.
+
+    Assumes the ESDF holds distances, as the sphere collision cost does. Trilinear
+    interpolation stays within ``sqrt(3) * voxel_size`` of the stored distance, once at the
+    centre and once at a sample, hence the ``2 sqrt(3) voxel_size`` slack. The voxel kernel
+    widens its threshold beyond ``margin`` when the sampling cap applies, by less than
+    ``longest_edge / (MAX_VOXEL_SAMPLES_PER_EDGE * sqrt(3))``, and no triangle edge inside the
+    sphere is longer than its diameter. Outside the grid the ESDF reads as free, so a centre
+    outside the grid only proves clearance when the whole sphere is outside it.
+    """
+    flat = env_idx * obs.max_n + o
+    voxel_size = obs.params[flat, 3]
+    half = wp.vec3(
+        obs.params[flat, 0] * voxel_size * 0.5,
+        obs.params[flat, 1] * voxel_size * 0.5,
+        obs.params[flat, 2] * voxel_size * 0.5,
+    )
+    local = wp.transform_point(load_obstacle_transform(obs, env_idx, o), center)
+    outside = wp.vec3(
+        wp.max(wp.abs(local[0]) - half[0], 0.0),
+        wp.max(wp.abs(local[1]) - half[1], 0.0),
+        wp.max(wp.abs(local[2]) - half[2], 0.0),
+    )
+    distance_to_grid = wp.length(outside)
+    if distance_to_grid > 0.0:
+        return distance_to_grid > radius + LINK_CULL_EPS
+    widening = 2.0 * radius / (wp.float32(MAX_VOXEL_SAMPLES_PER_EDGE) * 1.7320508)
+    slack = radius + margin + widening + 3.4641016 * voxel_size + LINK_CULL_EPS
+    return compute_local_sdf(obs, env_idx, o, local) > slack
+
+
+@wp.kernel(enable_backward=False)
+def robot_link_near_kernel(
+    robot: RobotMeshWarp,
+    obs: Any,
+    env_query_idx: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
+    batch_horizon: wp.int32,
+    horizon: wp.int32,
+    margin: wp.float32,
+    use_multi_env: wp.uint8,
+):
+    """Flag the (configuration, link) pairs whose bounding sphere may reach an obstacle.
+
+    Thread ``tid`` is ``cfg_idx * num_links + link_idx``, the same row as ``link_tf``.
+
+    Args:
+        robot: Robot collision triangles, link bounds and per-link transforms.
+        obs: Obstacle set of one type.
+        env_query_idx: Environment index per batch element.
+        link_near: Output flag per (configuration, link), pre-zeroed; 1 where the link must
+            be tested triangle by triangle.
+        batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
+        margin: Clearance distance used by the per-triangle kernel.
+        use_multi_env: If 1, look up the environment from ``env_query_idx``.
+    """
+    tid = wp.tid()
+    cfg_idx = tid / robot.num_links
+    link_idx = tid - cfg_idx * robot.num_links
+    if cfg_idx >= batch_horizon:
+        return
+
+    bound = robot.link_bounds[link_idx]
+    if bound[3] < 0.0:
+        return
+    center = transform_point_link(robot.link_tf, tid, wp.vec3(bound[0], bound[1], bound[2]))
+
+    env_idx = wp.int32(0)
+    if use_multi_env == wp.uint8(1):
+        env_idx = env_query_idx[cfg_idx / horizon]
+
+    n_obs = obs.n_per_env[env_idx]
+    for o in range(n_obs):
+        if not is_obs_enabled(obs, env_idx, o):
+            continue
+        if not link_clear_of_obstacle(obs, env_idx, o, center, bound[3], margin):
+            link_near[tid] = 1
+            return
+
+
+# =============================================================================
 # Mesh Obstacles: exact triangle-triangle
 # =============================================================================
+
+
+@wp.func
+def point_face_within(
+    p: wp.vec3,
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    dist_sq: wp.float32,
+) -> wp.bool:
+    """Check whether ``p`` projects inside triangle ``abc`` closer than ``sqrt(dist_sq)``.
+
+    Only the face interior is tested. A closest point on the triangle boundary is covered by
+    the edge-edge tests in :func:`triangles_within`, and a degenerate triangle, having no face
+    interior, is skipped.
+    """
+    n = wp.cross(b - a, c - a)
+    n_sq = wp.dot(n, n)
+    if n_sq <= 1.0e-20:
+        return False
+    h = wp.dot(p - a, n)
+    # Compare h^2 / |n|^2 < dist_sq without dividing.
+    if h * h >= dist_sq * n_sq:
+        return False
+    if wp.dot(wp.cross(b - a, p - a), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(c - b, p - b), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(a - c, p - c), n) < 0.0:
+        return False
+    return True
+
+
+@wp.func
+def segment_segment_dist_sq(
+    p1: wp.vec3,
+    q1: wp.vec3,
+    p2: wp.vec3,
+    q2: wp.vec3,
+) -> wp.float32:
+    """Squared distance between segments ``p1q1`` and ``p2q2`` (Ericson, RTCD 5.1.9)."""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, r)
+    eps = wp.float32(1.0e-12)
+
+    s = wp.float32(0.0)
+    t = wp.float32(0.0)
+    if a <= eps and e <= eps:
+        s = 0.0
+        t = 0.0
+    elif a <= eps:
+        s = 0.0
+        t = wp.clamp(f / e, 0.0, 1.0)
+    else:
+        c = wp.dot(d1, r)
+        if e <= eps:
+            t = 0.0
+            s = wp.clamp(-c / a, 0.0, 1.0)
+        else:
+            b = wp.dot(d1, d2)
+            denom = a * e - b * b
+            # Near-parallel segments: any s works, the clamps below fix up t.
+            if denom > 1.0e-6 * a * e:
+                s = wp.clamp((b * f - c * e) / denom, 0.0, 1.0)
+            else:
+                s = 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = wp.clamp(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = wp.clamp((b - c) / a, 0.0, 1.0)
+
+    diff = (p1 + d1 * s) - (p2 + d2 * t)
+    return wp.dot(diff, diff)
+
+
+@wp.func
+def triangles_within(
+    a0: wp.vec3,
+    a1: wp.vec3,
+    a2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+    dist_sq: wp.float32,
+) -> wp.bool:
+    """Check whether two non-intersecting triangles are closer than ``sqrt(dist_sq)``.
+
+    The distance between two disjoint triangles is attained either between a vertex of one
+    and the face interior of the other, or between an edge of each. Testing the 6
+    vertex-face and 9 edge-edge pairs is therefore exact. Intersecting triangles must be
+    caught beforehand with ``wp.intersect_tri_tri``.
+    """
+    if point_face_within(a0, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(a1, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(a2, b0, b1, b2, dist_sq):
+        return True
+    if point_face_within(b0, a0, a1, a2, dist_sq):
+        return True
+    if point_face_within(b1, a0, a1, a2, dist_sq):
+        return True
+    if point_face_within(b2, a0, a1, a2, dist_sq):
+        return True
+
+    for i in range(3):
+        pa = a0
+        qa = a1
+        if i == 1:
+            pa = a1
+            qa = a2
+        elif i == 2:
+            pa = a2
+            qa = a0
+        if segment_segment_dist_sq(pa, qa, b0, b1) < dist_sq:
+            return True
+        if segment_segment_dist_sq(pa, qa, b1, b2) < dist_sq:
+            return True
+        if segment_segment_dist_sq(pa, qa, b2, b0) < dist_sq:
+            return True
+    return False
 
 
 @wp.kernel(enable_backward=False)
@@ -110,6 +383,7 @@ def robot_mesh_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
@@ -126,8 +400,11 @@ def robot_mesh_collision_kernel(
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
-        margin: Clearance distance added to the broadphase AABB.
+        horizon: Time steps per batch element; maps a configuration to its batch index.
+        margin: Clearance distance. A pair of triangles closer than ``margin`` collides.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
         check_containment: If 1, also flag links that lie entirely inside an obstacle.
     """
@@ -152,9 +429,12 @@ def robot_mesh_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
+    margin_sq = margin * margin
 
     n_obs = obs.n_per_env[env_idx]
     for o in range(n_obs):
@@ -179,14 +459,18 @@ def robot_mesh_collision_kernel(
             b1 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 1)
             b2 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 2)
 
-            # Narrowphase: exact triangle-triangle predicate.
+            # Narrowphase: exact triangle-triangle predicate, then exact distance < margin.
             if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
+                report_collision(in_collision, contact_link, cfg_idx, link_idx)
+                return
+            if margin_sq > 0.0 and triangles_within(a0, a1, a2, b0, b1, b2, margin_sq):
                 report_collision(in_collision, contact_link, cfg_idx, link_idx)
                 return
 
         # Containment: surface crossing alone misses a link sitting entirely inside a large
         # obstacle, because no triangle pair intersects. A point-in-mesh test on one vertex
-        # suffices, since a non-crossing triangle is wholly inside or wholly outside.
+        # suffices: a triangle that passed the test above keeps at least ``margin`` from the
+        # surface everywhere, so it is wholly inside or wholly outside by that much.
         if check_containment == wp.uint8(1):
             if compute_local_sdf(obs, env_idx, o, a0) < margin:
                 report_collision(in_collision, contact_link, cfg_idx, link_idx)
@@ -300,6 +584,7 @@ def robot_cuboid_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
@@ -313,7 +598,10 @@ def robot_cuboid_collision_kernel(
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; inflates the box half-extents.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
     """
@@ -336,6 +624,8 @@ def robot_cuboid_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
@@ -375,11 +665,11 @@ def robot_voxel_collision_kernel(
     env_query_idx: wp.array(dtype=wp.int32),
     in_collision: wp.array(dtype=wp.int32),
     contact_link: wp.array(dtype=wp.int32),
+    link_near: wp.array(dtype=wp.int32),
     batch_horizon: wp.int32,
     horizon: wp.int32,
     margin: wp.float32,
     use_multi_env: wp.uint8,
-    max_samples_per_edge: wp.int32,
 ):
     """Sampled robot-triangle vs voxel ESDF collision.
 
@@ -387,17 +677,22 @@ def robot_voxel_collision_kernel(
     at most half a voxel apart, then each sample is tested against the ESDF. This is
     **not exact**: geometry thinner than the voxel size can slip between samples.
 
+    A triangle that needs more than ``MAX_VOXEL_SAMPLES_PER_EDGE`` subdivisions is sampled
+    coarser, and its threshold is widened so that it catches everything a half-voxel lattice
+    would: it may report collisions slightly farther than ``margin`` instead of missing any.
+
     Args:
         robot: Robot collision triangles and per-link transforms.
         obs: Voxel grid obstacle set.
         env_query_idx: Environment index per configuration.
         in_collision: Output flag per configuration, pre-zeroed.
         contact_link: Output contacting link index per configuration, pre-filled with -1.
+        link_near: Per (configuration, link) flag from :func:`robot_link_near_kernel`; links
+            flagged 0 are clear of every obstacle and skipped.
         batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance; a sample collides when its ESDF value is <= margin.
         use_multi_env: If 1, look up the environment from ``env_query_idx``.
-        max_samples_per_edge: Upper bound on lattice subdivisions, capping per-thread cost
-            for large triangles or fine grids.
     """
     tid = wp.tid()
 
@@ -418,6 +713,8 @@ def robot_voxel_collision_kernel(
     if link_idx < 0:
         return
     row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
     v0_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 0])
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
@@ -437,8 +734,14 @@ def robot_voxel_collision_kernel(
 
         # Choose a subdivision count so adjacent samples are at most voxel_size/2 apart.
         longest = wp.max(wp.length(a1 - a0), wp.max(wp.length(a2 - a1), wp.length(a0 - a2)))
-        steps = wp.int32(wp.ceil(longest / wp.max(voxel_size * 0.5, 1.0e-6)))
-        steps = wp.clamp(steps, 1, max_samples_per_edge)
+        half_voxel = voxel_size * 0.5
+        steps = wp.int32(wp.ceil(longest / wp.max(half_voxel, 1.0e-6)))
+        steps = wp.clamp(steps, 1, MAX_VOXEL_SAMPLES_PER_EDGE)
+        # Every point of the triangle lies within spacing / sqrt(3) of a lattice sample, and
+        # the ESDF changes by at most the distance moved. Where the cap makes the spacing
+        # coarser than half a voxel, widen the threshold by the extra reach.
+        spacing = longest / wp.float32(steps)
+        threshold = margin + wp.max(spacing - half_voxel, 0.0) / 1.7320508
 
         inv_steps = 1.0 / wp.float32(steps)
         for i in range(steps + 1):
@@ -446,6 +749,6 @@ def robot_voxel_collision_kernel(
             for j in range(steps + 1 - i):
                 v = wp.float32(j) * inv_steps
                 p = a0 + (a1 - a0) * u + (a2 - a0) * v
-                if compute_local_sdf(obs, env_idx, o, p) <= margin:
+                if compute_local_sdf(obs, env_idx, o, p) <= threshold:
                     report_collision(in_collision, contact_link, cfg_idx, link_idx)
                     return

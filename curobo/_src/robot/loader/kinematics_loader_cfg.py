@@ -180,6 +180,13 @@ class KinematicsLoaderCfg:
     #: triangle budget.
     extra_collision_meshes: Optional[Dict[str, int]] = None
 
+    #: Link pairs to leave out of the mesh self-collision check, as ``{link: [links]}``. Its
+    #: own list, separate from :attr:`self_collision_ignore`: the sphere list also skips
+    #: pairs whose spheres always overlap, which the exact meshes can check. Links in one
+    #: rigid body (joined by fixed or locked joints) and links that a single joint connects
+    #: are always skipped.
+    mesh_self_collision_ignore: Optional[Dict[str, List[str]]] = None
+
     #: Per-link triangle budget for the exact-mesh collision constraint. Either one value
     #: applied to every link, or a per-link mapping. Links not covered fall back to
     #: :data:`~curobo._src.geom.data.data_robot_mesh.DEFAULT_MAX_TRIANGLES_PER_LINK`. A link

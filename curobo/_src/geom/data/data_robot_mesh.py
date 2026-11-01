@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Standard Library
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 # Third Party
 import numpy as np
@@ -28,7 +28,7 @@ import warp as wp
 # CuRobo
 from curobo._src.geom.types import Mesh
 from curobo._src.types.device_cfg import DeviceCfg
-from curobo._src.util.logging import log_and_raise, log_warn
+from curobo._src.util.logging import log_and_raise, log_info, log_warn
 from curobo._src.util.warp import init_warp
 
 #: Default per-link triangle budget. Measured on an RTX 3090 Ti, query cost scales roughly
@@ -79,11 +79,14 @@ class RobotMeshWarp:
             Shape: (batch * horizon * num_links, 12).
         num_links: Number of links in the kinematic tree (stride of ``link_tf``).
         total_tris: Total number of robot collision triangles.
+        link_bounds: Link-local bounding sphere ``(x, y, z, radius)`` per body index; a
+            negative radius marks a link without geometry. Shape: (num_links,).
     """
 
     tri_verts: wp.array(dtype=wp.vec3)
     tri_link: wp.array(dtype=wp.int32)
     link_tf: wp.array2d(dtype=wp.float32)
+    link_bounds: wp.array(dtype=wp.vec4)
     num_links: wp.int32
     total_tris: wp.int32
 
@@ -119,25 +122,128 @@ def transform_point_link(
 # =============================================================================
 
 
-def decimate_mesh(
-    mesh: trimesh.Trimesh, max_triangles: int, link_name: Optional[str] = None
+#: Surface deviation above which decimating a link mesh logs a warning, in meters.
+DECIMATION_WARN_DEVIATION = 0.002
+
+#: Quadric decimation settings tried by :func:`decimate_mesh`, as ``(aggressiveness,
+#: preserve_border)``. Lower aggressiveness collapses edges more carefully; keeping the border
+#: stops open boundaries, common in robot collision meshes, from being eaten away.
+_DECIMATION_CANDIDATES = [(a, b) for b in (True, False) for a in (1.0, 3.0, 5.0, 7.0)]
+
+#: Settings tried, in order, when the closest result is not searched for, e.g. for geometry
+#: written at runtime: the first that reaches the budget is kept.
+_DECIMATION_QUICK_CANDIDATES = [(3.0, True), (3.0, False)]
+
+
+@wp.kernel(enable_backward=False)
+def _surface_distance_kernel(
+    mesh_id: wp.uint64,
+    points: wp.array(dtype=wp.vec3),
+    max_dist: wp.float32,
+    distance: wp.array(dtype=wp.float32),
+):
+    """Distance from each point to the closest point of a mesh, capped at ``max_dist``."""
+    tid = wp.tid()
+    query = wp.mesh_query_point_no_sign(mesh_id, points[tid], max_dist)
+    if query.result:
+        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        distance[tid] = wp.length(closest - points[tid])
+    else:
+        distance[tid] = max_dist
+
+
+def mesh_surface_deviation(a: trimesh.Trimesh, b: trimesh.Trimesh, samples: int = 10000) -> float:
+    """Approximate two-sided surface distance (Hausdorff distance) between two meshes.
+
+    Points sampled on each surface are measured exactly against the other surface with a
+    BVH query on the CPU. The sampling is seeded, so the result is deterministic; it can only
+    underestimate the true distance, by missing the worst point between samples.
+
+    Args:
+        a: First mesh.
+        b: Second mesh.
+        samples: Points sampled on each surface.
+
+    Returns:
+        The largest distance from a sampled point of either surface to the other surface, in
+        the units of the meshes.
+    """
+    device = "cpu"
+    cap = float(np.linalg.norm(np.ptp(np.vstack([a.bounds, b.bounds]), axis=0))) + 1.0
+
+    def one_sided(src: trimesh.Trimesh, dst: trimesh.Trimesh, seed: int) -> float:
+        points = trimesh.sample.sample_surface(src, samples, seed=seed)[0]
+        vertices = np.asarray(dst.vertices, dtype=np.float32)
+        faces = np.asarray(dst.faces, dtype=np.int32).reshape(-1)
+        dst_mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3, device=device),
+            indices=wp.array(faces, device=device),
+        )
+        distance = wp.zeros(len(points), dtype=wp.float32, device=device)
+        wp.launch(
+            _surface_distance_kernel,
+            dim=len(points),
+            inputs=[
+                dst_mesh.id,
+                wp.array(np.asarray(points, dtype=np.float32), dtype=wp.vec3, device=device),
+                cap,
+                distance,
+            ],
+            device=device,
+        )
+        return float(distance.numpy().max())
+
+    return max(one_sided(a, b, 0), one_sided(b, a, 1))
+
+
+def _quadric_decimate(
+    mesh: trimesh.Trimesh, max_triangles: int, aggressiveness: float, preserve_border: bool
 ) -> trimesh.Trimesh:
-    """Reduce a link mesh to at most ``max_triangles`` triangles.
+    """Quadric decimation that raises the aggressiveness whenever a pass stops short."""
+    from fast_simplification import simplify
 
-    Quadric decimation is used because it preserves concavities. It requires the optional
-    ``fast_simplification`` package; without it this falls back to the convex hull, which
-    may still exceed the budget and which closes openings such as the gap between gripper
-    fingers. Query cost scales roughly linearly with the total triangle count, so exceeding
-    the budget is a performance problem worth warning about.
+    vertices, faces = mesh.vertices, mesh.faces
+    for agg in [a for a in (1.0, 3.0, 5.0, 7.0, 9.0, 10.0) if a >= aggressiveness]:
+        if len(faces) <= max_triangles:
+            break
+        vertices, faces = simplify(
+            vertices,
+            faces,
+            target_count=max_triangles,
+            agg=agg,
+            preserve_border=preserve_border,
+        )
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    Note that decimation shrinks the mesh by a sub-millimetre amount, which makes the
-    constraint very slightly optimistic. Use a small positive ``margin`` on the constraint
-    to compensate when that matters.
+
+def decimate_mesh(
+    mesh: trimesh.Trimesh,
+    max_triangles: int,
+    link_name: Optional[str] = None,
+    thorough: bool = True,
+    warn_deviation: float = DECIMATION_WARN_DEVIATION,
+) -> trimesh.Trimesh:
+    """Reduce a link mesh to at most ``max_triangles`` triangles, staying close to its surface.
+
+    The mesh is first cleaned: duplicate vertices are merged, and holes are filled when that
+    closes it. Quadric decimation (``fast_simplification``) then runs with several settings,
+    and the result closest to the original surface (:func:`mesh_surface_deviation`) is kept.
+    Most robot collision meshes are open, and keeping their open boundary is what keeps
+    decimation from eating into them: on Franka's links it cuts the deviation from up to
+    2.3 cm to about 1 mm.
+
+    A warning reports the deviation when it exceeds ``warn_deviation``. If no setting reaches
+    the budget, the closest of the results over it is kept, with a warning: collision queries
+    on it are slower. If decimation fails altogether, this falls back to the convex hull,
+    which fills concave regions such as the gap between gripper fingers.
 
     Args:
         mesh: Input link mesh.
         max_triangles: Triangle budget. Values <= 0 disable decimation.
-        link_name: Name of the link, used only to make warnings actionable.
+        link_name: Name of the link, used only to make messages actionable.
+        thorough: Try every decimation setting and keep the closest result. False keeps the
+            first setting that reaches the budget, for geometry written at runtime.
+        warn_deviation: Surface deviation in meters above which a warning is logged.
 
     Returns:
         A mesh with at most ``max_triangles`` triangles where possible.
@@ -146,27 +252,63 @@ def decimate_mesh(
         return mesh
 
     label = f"link '{link_name}'" if link_name is not None else "link mesh"
-    log_warn(
-        f"{label} has {len(mesh.faces)} triangles, over its budget of {max_triangles}; "
-        "decimating. Raise max_triangles_per_link for this link to keep full fidelity."
-    )
+    base = mesh.copy()
+    base.merge_vertices()
+    closed = base.copy()
+    trimesh.repair.fill_holes(closed)
+    if closed.is_watertight:
+        base = closed
 
+    candidates = _DECIMATION_CANDIDATES if thorough else _DECIMATION_QUICK_CANDIDATES
+    # Closest result within the budget, and closest result over it in case none fits.
+    best, best_deviation = None, np.inf
+    over, over_deviation = None, np.inf
     try:
-        simplified = mesh.simplify_quadric_decimation(face_count=max_triangles)
-    except Exception as e:  # trimesh raises various backend-specific errors
-        log_warn(f"quadric decimation failed ({e}), falling back to convex hull")
-        simplified = None
-
-    if simplified is None or len(simplified.faces) == 0:
-        simplified = mesh.convex_hull
-
-    if len(simplified.faces) > max_triangles:
+        for aggressiveness, preserve_border in candidates:
+            simplified = _quadric_decimate(base, max_triangles, aggressiveness, preserve_border)
+            if len(simplified.faces) == 0:
+                continue
+            deviation = mesh_surface_deviation(mesh, simplified)
+            if len(simplified.faces) > max_triangles:
+                if deviation < over_deviation:
+                    over, over_deviation = simplified, deviation
+                continue
+            if deviation < best_deviation:
+                best, best_deviation = simplified, deviation
+            if not thorough:
+                break
+    except Exception as e:  # fast_simplification raises various errors on bad input
         log_warn(
-            f"could not reduce link mesh below {max_triangles} triangles "
-            f"(got {len(simplified.faces)}); install 'fast_simplification' to enable "
-            "quadric decimation and keep collision queries fast"
+            f"quadric decimation of {label} failed ({e}); falling back to its convex hull, "
+            "which fills concave regions. Check that 'fast_simplification' is installed."
         )
-    return simplified
+        best, over = None, None
+
+    if best is None:
+        if over is not None:
+            best, best_deviation = over, over_deviation
+        else:
+            best = mesh.convex_hull
+            best_deviation = mesh_surface_deviation(mesh, best)
+    if len(best.faces) > max_triangles:
+        log_warn(
+            f"could not reduce {label} below {max_triangles} triangles "
+            f"(got {len(best.faces)}); collision queries on it will be slower"
+        )
+
+    message = (
+        f"{label} has {len(mesh.faces)} triangles, over its budget of {max_triangles}; "
+        f"decimated to {len(best.faces)}, its surface moved by up to "
+        f"{1000.0 * best_deviation:.1f} mm"
+    )
+    if best_deviation > warn_deviation:
+        log_warn(
+            message + ". Raise max_triangles_per_link for this link, or add the deviation to "
+            "the mesh collision margin."
+        )
+    else:
+        log_info(message)
+    return best
 
 
 def _as_triangle_soup(
@@ -187,7 +329,7 @@ def _as_triangle_soup(
     if isinstance(triangles, Mesh):
         triangles = triangles.get_trimesh_mesh(transform_with_pose=True)
     if isinstance(triangles, trimesh.Trimesh):
-        triangles = decimate_mesh(triangles, capacity, link_name)
+        triangles = decimate_mesh(triangles, capacity, link_name, thorough=False)
         soup = np.asarray(triangles.triangles, dtype=np.float32)
         return torch.as_tensor(soup)
 
@@ -204,7 +346,7 @@ def _as_triangle_soup(
             faces=np.arange(soup.shape[0] * 3).reshape(-1, 3),
             process=True,
         )
-        mesh = decimate_mesh(mesh, capacity, link_name)
+        mesh = decimate_mesh(mesh, capacity, link_name, thorough=False)
         soup = torch.as_tensor(np.asarray(mesh.triangles, dtype=np.float32))
     if soup.shape[0] > capacity:
         log_and_raise(
@@ -212,6 +354,69 @@ def _as_triangle_soup(
             "slots are reserved; raise its extra_collision_meshes budget"
         )
     return soup
+
+
+# =============================================================================
+# Self-Collision Pairs
+# =============================================================================
+
+
+def mesh_self_collision_pairs(
+    link_names: Sequence[str],
+    link_name_to_idx_map: Dict[str, int],
+    parent_body_indices: Sequence[int],
+    fixed_joints: Sequence[bool],
+    ignore: Optional[Dict[str, Sequence[str]]] = None,
+) -> List[Tuple[int, int]]:
+    """Select the link pairs that the mesh self-collision check tests.
+
+    Links joined by fixed joints, including locked joints, move as one rigid body. A pair is
+    skipped when both links belong to the same rigid body or to two rigid bodies that a single
+    joint connects, since the meshes of such links usually touch at the joint. Pairs listed in
+    ``ignore`` are skipped as well.
+
+    Args:
+        link_names: Links with mesh geometry, including reserved runtime slots.
+        link_name_to_idx_map: Mapping from link name to kinematic body index.
+        parent_body_indices: Parent body index of every body, indexed by body index. The
+            root's entry is ignored.
+        fixed_joints: Whether the joint between a body and its parent is fixed, per body.
+        ignore: Additional pairs to skip, as ``{link: [links]}``, in either direction.
+
+    Returns:
+        Sorted ``(body_a, body_b)`` pairs with ``body_a < body_b``.
+    """
+    known = set(link_name_to_idx_map)
+    ignored = set()
+    for link, others in (ignore or {}).items():
+        unknown = sorted({link, *others} - known)
+        if unknown:
+            log_warn(f"mesh_self_collision_ignore names unknown links: {unknown}")
+        for other in others:
+            if link in known and other in known:
+                ignored.add(frozenset((link_name_to_idx_map[link], link_name_to_idx_map[other])))
+
+    def rigid_root(body: int) -> int:
+        while body > 0 and fixed_joints[body]:
+            body = int(parent_body_indices[body])
+        return body
+
+    def connected(root_a: int, root_b: int) -> bool:
+        return (root_a > 0 and rigid_root(int(parent_body_indices[root_a])) == root_b) or (
+            root_b > 0 and rigid_root(int(parent_body_indices[root_b])) == root_a
+        )
+
+    bodies = sorted({link_name_to_idx_map[name] for name in link_names})
+    pairs = []
+    for i, a in enumerate(bodies):
+        for b in bodies[i + 1 :]:
+            root_a, root_b = rigid_root(a), rigid_root(b)
+            if root_a == root_b or connected(root_a, root_b):
+                continue
+            if frozenset((a, b)) in ignored:
+                continue
+            pairs.append((a, b))
+    return pairs
 
 
 # =============================================================================
@@ -255,12 +460,39 @@ class RobotMeshData:
     #: :attr:`tri_link` when not supplied.
     link_body_indices: Optional[List[int]] = None
 
+    #: :attr:`tri_link` as last written by packing or :meth:`update_link_mesh`, before any
+    #: :meth:`disable_link_mesh`. :meth:`enable_link_mesh` restores slots from it.
+    reference_tri_link: Optional[torch.Tensor] = None
+
+    #: Link-local bounding sphere ``(x, y, z, radius)`` of each link's geometry, indexed by body
+    #: index, shape ``[num_links, 4]``. A negative radius marks a link without geometry. The
+    #: kernels skip a link whose sphere is far from every obstacle.
+    link_bounds: Optional[torch.Tensor] = None
+
+    #: Body index pairs ``[num_pairs, 2]`` (int32) tested by the mesh self-collision check,
+    #: set with :meth:`set_self_collision_pairs`. In each pair the first link has no more
+    #: triangle slots than the second: the kernel iterates its triangles and queries the
+    #: second link's BVH. None when no pairs are tested.
+    self_collision_pairs: Optional[torch.Tensor] = None
+
     def __post_init__(self):
-        """Recover the body index of each packed link when it was not supplied."""
-        if self.link_body_indices is not None:
-            return
-        offsets = np.cumsum([0] + list(self.link_triangle_counts[:-1]))
-        self.link_body_indices = [int(self.tri_link[int(o)].item()) for o in offsets]
+        """Recover the body indices, the reference slot owners and the link bounds."""
+        if self.link_body_indices is None:
+            offsets = np.cumsum([0] + list(self.link_triangle_counts[:-1]))
+            self.link_body_indices = [int(self.tri_link[int(o)].item()) for o in offsets]
+        if self.reference_tri_link is None:
+            self.reference_tri_link = self.tri_link.clone()
+        if self.link_bounds is None:
+            self.link_bounds = torch.full(
+                (self.num_links, 4), -1.0, dtype=torch.float32, device=self.tri_verts.device
+            )
+            active = (self.reference_tri_link >= 0).cpu().numpy()
+            for link_name in self.link_names:
+                span = self.get_triangle_slice(link_name)
+                count = int(active[span].sum())
+                # Packing fills a link's slots from the start, so active slots come first.
+                tris = self.tri_verts[span.start * 3 : (span.start + count) * 3].view(-1, 3, 3)
+                self._write_link_bounds(link_name, tris)
 
     @property
     def body_idx_to_link_name(self) -> Dict[int, str]:
@@ -306,6 +538,79 @@ class RobotMeshData:
         """
         return self.link_triangle_counts[self.link_names.index(link_name)]
 
+    def set_self_collision_pairs(self, pairs: Sequence[Tuple[int, int]]) -> None:
+        """Prepare the link pairs that the mesh self-collision check tests.
+
+        Builds a BVH over each paired link's triangle slots, in its link frame and sharing
+        memory with :attr:`tri_verts`, and a flat work list with one entry per triangle slot of
+        the iterated link of each pair.
+
+        Args:
+            pairs: Body index pairs, e.g. from :func:`mesh_self_collision_pairs`.
+        """
+        body_to_name = self.body_idx_to_link_name
+        ordered = []
+        for a, b in pairs:
+            if self.get_triangle_capacity(body_to_name[a]) > self.get_triangle_capacity(
+                body_to_name[b]
+            ):
+                a, b = b, a
+            ordered.append((a, b))
+        if not ordered:
+            self.self_collision_pairs = None
+            return
+        device = self.tri_verts.device
+        self.self_collision_pairs = torch.tensor(ordered, dtype=torch.int32, device=device)
+
+        self.link_tri_start = torch.zeros(self.num_links, dtype=torch.int32, device=device)
+        self.link_mesh_ids = torch.zeros(self.num_links, dtype=torch.int64, device=device)
+        self._link_bvh: Dict[str, wp.Mesh] = {}
+        wp_device = wp.device_from_torch(device)
+        for body in sorted({b for pair in ordered for b in pair}):
+            name = body_to_name[body]
+            span = self.get_triangle_slice(name)
+            self.link_tri_start[body] = span.start
+            points = wp.from_torch(
+                self.tri_verts[span.start * 3 : span.stop * 3], dtype=wp.vec3
+            )
+            indices = wp.array(
+                np.arange((span.stop - span.start) * 3, dtype=np.int32), device=wp_device
+            )
+            self._link_bvh[name] = wp.Mesh(points=points, indices=indices)
+            self.link_mesh_ids[body] = self._link_bvh[name].id
+
+        work_tri, work_pair = [], []
+        for p, (a, _) in enumerate(ordered):
+            span = self.get_triangle_slice(body_to_name[a])
+            work_tri.extend(range(span.start, span.stop))
+            work_pair.extend([p] * (span.stop - span.start))
+        self.self_work_tri = torch.tensor(work_tri, dtype=torch.int32, device=device)
+        self.self_work_pair = torch.tensor(work_pair, dtype=torch.int32, device=device)
+
+    def self_collision_pair_names(
+        self, contact_pair: torch.Tensor
+    ) -> List[Optional[Tuple[str, str]]]:
+        """Resolve reported self-collision pair indices to link names.
+
+        Args:
+            contact_pair: Pair indices into :attr:`self_collision_pairs`, as returned by the
+                self-collision query, where -1 marks a configuration without self-collision.
+
+        Returns:
+            One ``(link_a, link_b)`` tuple per entry, flattened, with ``None`` where there was
+            no self-collision.
+        """
+        lookup = self.body_idx_to_link_name
+        pairs = [] if self.self_collision_pairs is None else self.self_collision_pairs.tolist()
+        names = [(lookup[a], lookup[b]) for a, b in pairs]
+        return [names[i] if i >= 0 else None for i in contact_pair.flatten().tolist()]
+
+    def _refit_link_bvh(self, link_name: str) -> None:
+        """Refit a link's self-collision BVH after its vertices changed in place."""
+        bvh = getattr(self, "_link_bvh", {}).get(link_name)
+        if bvh is not None:
+            bvh.refit()
+
     def update_link_mesh(
         self,
         link_name: str,
@@ -333,20 +638,69 @@ class RobotMeshData:
 
         verts = tris.reshape(-1, 3).to(dtype=self.tri_verts.dtype, device=self.tri_verts.device)
         self.tri_verts[span.start * 3 : (span.start + n) * 3] = verts
-        self.tri_link[span.start : span.start + n] = body_idx
+        self.reference_tri_link[span.start : span.start + n] = body_idx
         if n < capacity:
-            self.tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
+            self.reference_tri_link[span.start + n : span.stop] = INACTIVE_TRI_LINK
+        self.tri_link[span] = self.reference_tri_link[span]
+        self._write_link_bounds(link_name, verts.view(-1, 3, 3))
+        self._refit_link_bvh(link_name)
+
+    def _write_link_bounds(self, link_name: str, tris: torch.Tensor):
+        """Store the bounding sphere of a link's triangles ``[n, 3, 3]``; none if ``n == 0``."""
+        body_idx = self.link_body_indices[self.link_names.index(link_name)]
+        if tris.shape[0] == 0:
+            self.link_bounds[body_idx, 3] = -1.0
+            return
+        verts = tris.reshape(-1, 3).to(self.link_bounds)
+        center = 0.5 * (verts.min(dim=0).values + verts.max(dim=0).values)
+        self.link_bounds[body_idx, :3] = center
+        self.link_bounds[body_idx, 3] = (verts - center).norm(dim=-1).max()
 
     def disable_link_mesh(self, link_name: str):
         """Deactivate every triangle slot of a link, so it can no longer report a collision.
 
-        The geometry is left in place; :meth:`update_link_mesh` reactivates the slots.
+        The geometry is left in place; :meth:`enable_link_mesh` or :meth:`update_link_mesh`
+        reactivates the slots.
 
         Args:
             link_name: Name of the link to deactivate.
         """
         span = self.get_triangle_slice(link_name)
         self.tri_link[span] = INACTIVE_TRI_LINK
+
+    def enable_link_mesh(self, link_name: str):
+        """Reactivate a link's triangles after :meth:`disable_link_mesh`.
+
+        Restores the geometry last packed or written with :meth:`update_link_mesh`, so a
+        reserved link that holds no geometry stays inactive. The write is in-place.
+
+        Args:
+            link_name: Name of the link to reactivate.
+        """
+        span = self.get_triangle_slice(link_name)
+        self.tri_link[span] = self.reference_tri_link[span]
+
+    def clear_link_mesh(self, link_name: str):
+        """Remove a link's geometry, so that :meth:`enable_link_mesh` keeps it inactive.
+
+        Use this when runtime geometry such as an attached object is released; unlike
+        :meth:`disable_link_mesh`, the geometry is not restored later. The write is in-place.
+
+        Args:
+            link_name: Name of the link to clear.
+        """
+        span = self.get_triangle_slice(link_name)
+        self.reference_tri_link[span] = INACTIVE_TRI_LINK
+        self.tri_link[span] = INACTIVE_TRI_LINK
+        self._write_link_bounds(link_name, self.tri_verts[:0].view(0, 3, 3))
+
+    def has_link_mesh(self, link_name: str) -> bool:
+        """Whether a link owns triangle slots, packed or reserved.
+
+        Args:
+            link_name: Name of the link.
+        """
+        return link_name in self.link_names
 
     @property
     def num_active_triangles(self) -> int:
@@ -532,4 +886,5 @@ class RobotMeshData:
         )
         s.num_links = self.num_links
         s.total_tris = self.total_tris
+        s.link_bounds = wp.from_torch(self.link_bounds, dtype=wp.vec4)
         return s

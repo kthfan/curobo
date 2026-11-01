@@ -16,8 +16,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 import torch
 
 from curobo._src.cost.cost_base import BaseCost
-from curobo._src.cost.tool_pose_bound import (
+from curobo._src.cost.cost_eef_bound_eval import (
     UNBOUNDED,
+    eef_bound_center_pull,
+    eef_bound_limits,
+)
+from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     ToolPoseBoundAnchor,
     normalize_tool_pose_bounds,
@@ -66,6 +70,8 @@ class EEFBoundCost(BaseCost):
         self._center = torch.zeros((*slots, 6), device=device, dtype=dtype)
         self._lower = torch.full((*slots, 6), -UNBOUNDED, device=device, dtype=dtype)
         self._upper = torch.full((*slots, 6), UNBOUNDED, device=device, dtype=dtype)
+        self._pull_target = torch.zeros((*slots, 6), device=device, dtype=dtype)
+        self._pull_weight = torch.zeros((*slots, 6), device=device, dtype=dtype)
         self._use_rotation = torch.zeros(slots, device=device, dtype=torch.int32)
         # Placeholders for anchors that are not in use.
         self._unused_position = torch.zeros((1, 3), device=device, dtype=dtype)
@@ -103,7 +109,8 @@ class EEFBoundCost(BaseCost):
             self._bounds[name] = frame_bounds
             self._anchor[i] = -1
             for k, bound in enumerate(frame_bounds):
-                center, lower, upper = bound.kernel_values(self.config.metric)
+                center, lower, upper = eef_bound_limits(bound, self.config.metric)
+                pull_target, pull_weight = eef_bound_center_pull(bound, self.config.metric)
                 self._axes[i, k] = 0 if bound.reference_axes == "anchor" else 1
                 self._reference_rotation[i, k] = self._reference_rotation.new_tensor(
                     bound.reference_rotation
@@ -112,6 +119,8 @@ class EEFBoundCost(BaseCost):
                 self._center[i, k] = self._center.new_tensor(center)
                 self._lower[i, k] = self._lower.new_tensor(lower)
                 self._upper[i, k] = self._upper.new_tensor(upper)
+                self._pull_target[i, k] = self._pull_target.new_tensor(pull_target)
+                self._pull_weight[i, k] = self._pull_weight.new_tensor(pull_weight)
                 self._use_rotation[i, k] = int(bound.uses_rotation)
                 self._anchor[i, k] = bound.anchor.value
 
@@ -222,6 +231,8 @@ class EEFBoundCost(BaseCost):
             self._center,
             self._lower,
             self._upper,
+            self._pull_target,
+            self._pull_weight,
             self._use_rotation,
             self._weight,
             num_goalset,

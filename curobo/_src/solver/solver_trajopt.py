@@ -10,7 +10,7 @@ solution ranking. Supports both Cartesian-space (solve_pose) and configuration-s
 from __future__ import annotations
 
 # Standard Library
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -57,12 +57,6 @@ class TrajOptSolver:
             use_cuda_graph=self.config.use_cuda_graph,
         )
         rollout_instance.rollout_instance_name = "interpolated_rollout"
-
-        # disable mesh collision check for interpolated_rollout
-        if rollout_instance.metrics_constraint_manager.has_cost("mesh_collision"):
-            mesh_collision_cost = rollout_instance.metrics_constraint_manager.get_cost("mesh_collision")
-            mesh_collision_cost.disable_cost()
-
         self.core.additional_metrics_rollouts["interpolated_rollout"] = rollout_instance
 
         # TrajOpt-specific: trajectory seed generator and interpolation buffers
@@ -169,6 +163,42 @@ class TrajOptSolver:
 
     def get_full_js(self, active_js):
         return self.core.get_full_js(active_js)
+
+    def get_mesh_collision_links(
+        self, joint_state: JointState, env_query_idx: Optional[torch.Tensor] = None
+    ) -> Union[Optional[str], List]:
+        """Name the link whose collision mesh touches the scene, for every configuration.
+
+        Use it to see why a solution failed the mesh collision check: pass the result's
+        ``js_solution`` or ``interpolated_trajectory``. Requires ``mesh_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+            env_query_idx: Environment index per configuration in the first dimension.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding the name
+            of a colliding link, or ``None`` where the meshes are clear of the scene.
+        """
+        return self.core.get_mesh_collision_links(joint_state, env_query_idx)
+
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Use it to see why a solution failed the mesh self-collision check, as
+        :meth:`get_mesh_collision_links` does for the scene. Requires
+        ``mesh_self_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        return self.core.get_mesh_self_collision_pairs(joint_state)
 
     def sample_configs(self, num_samples, rejection_ratio=10):
         return self.core.sample_configs(
@@ -502,8 +532,9 @@ class TrajOptSolver:
         interpolated_rollout = self.additional_metrics_rollouts["interpolated_rollout"]
 
         interpolated_js, last_tstep, buffer_updated = self.get_interpolated_trajectory(js_optimized)
-        interpolated_robot_state = interpolated_rollout.transition_model.compute_augmented_state(
-            interpolated_js
+        # The metrics transition model also exposes the link transforms the mesh check needs.
+        interpolated_robot_state = (
+            interpolated_rollout.metrics_transition_model.compute_augmented_state(interpolated_js)
         )
         interpolated_metrics = interpolated_rollout.compute_metrics_from_state(
             interpolated_robot_state

@@ -166,6 +166,10 @@ class KinematicsParams:
     #: Links excluded from the exact-mesh collision constraint entirely, by name.
     mesh_collision_ignored_link_names: Optional[List[str]] = None
 
+    #: Link pairs left out of the mesh self-collision check, as ``{link: [links]}``. Links in
+    #: one rigid body and links that a single joint connects are always left out.
+    mesh_self_collision_ignore: Optional[Dict[str, List[str]]] = None
+
     #: Link indices sorted by tree depth level (BFS level-order). Links at the same depth
     #: have no parent-child dependencies, enabling parallel processing.
     #: Shape: [num_links], dtype: int16. Computed from link_map in __post_init__.
@@ -637,7 +641,10 @@ class KinematicsParams:
             The shared :class:`~curobo._src.geom.data.data_robot_mesh.RobotMeshData`.
         """
         if getattr(self, "_robot_mesh_data", None) is None:
-            from curobo._src.geom.data.data_robot_mesh import RobotMeshData
+            from curobo._src.geom.data.data_robot_mesh import (
+                RobotMeshData,
+                mesh_self_collision_pairs,
+            )
 
             if self.link_collision_meshes is None:
                 log_and_raise(
@@ -653,6 +660,14 @@ class KinematicsParams:
                 ignored_link_names=self.mesh_collision_ignored_link_names,
                 extra_link_triangles=self.extra_collision_meshes,
             )
+            pairs = mesh_self_collision_pairs(
+                link_names=self._robot_mesh_data.link_names,
+                link_name_to_idx_map=self.link_name_to_idx_map,
+                parent_body_indices=self.link_map.cpu().tolist(),
+                fixed_joints=(self.joint_map_type == JointType.FIXED.value).cpu().tolist(),
+                ignore=self.mesh_self_collision_ignore,
+            )
+            self._robot_mesh_data.set_self_collision_pairs(pairs)
         return self._robot_mesh_data
 
     def update_link_mesh(self, link_name: str, triangles):
@@ -676,6 +691,36 @@ class KinematicsParams:
         """
         self.get_robot_mesh_data().disable_link_mesh(link_name)
 
+    def enable_link_mesh(self, link_name: str):
+        """Reactivate a link's triangles after :meth:`disable_link_mesh`.
+
+        Args:
+            link_name: Name of the link to reactivate.
+        """
+        self.get_robot_mesh_data().enable_link_mesh(link_name)
+
+    def clear_link_mesh(self, link_name: str):
+        """Remove a link's runtime geometry from the exact-mesh constraint.
+
+        Unlike :meth:`disable_link_mesh`, :meth:`enable_link_mesh` does not restore it.
+
+        Args:
+            link_name: Name of the link to clear.
+        """
+        self.get_robot_mesh_data().clear_link_mesh(link_name)
+
+    def has_link_mesh(self, link_name: str) -> bool:
+        """Whether a link takes part in the exact-mesh constraint.
+
+        False when the collision meshes were not loaded, so this never builds the mesh data
+        for a robot that does not use mesh collision.
+
+        Args:
+            link_name: Name of the link.
+        """
+        if self.link_collision_meshes is None:
+            return False
+        return self.get_robot_mesh_data().has_link_mesh(link_name)
 
     def get_link_masses_com(self, link_name: str) -> torch.Tensor:
         """Get link masses and center of mass for a link

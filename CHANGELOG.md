@@ -80,6 +80,30 @@
   `max_triangles_per_link`, `mesh_collision_ignored_link_names`, and
   `extra_collision_meshes`, and `RobotCollisionCheckerCfg.load_from_config`
   accepts `use_mesh_constraint`.
+- Extend the exact mesh collision check. Trajectory optimization also checks
+  every step of the interpolated trajectory. `AttachmentManager` writes an
+  attached object's mesh into the link's reserved triangle slots and clears it
+  on detach (`franka.yml` reserves 256 for `attached_object`), and
+  `clear_link_mesh` / `enable_link_mesh` manage runtime geometry.
+  `disable_link_collision` / `enable_link_collision` toggle the link meshes
+  too, so `plan_grasp` works with the mesh check. Scene and link-mesh updates
+  are tested to reach captured CUDA graphs.
+- Add `get_mesh_collision_links` to the IK, trajectory optimization and MPC
+  solvers and the motion planners. It names the link whose collision mesh
+  touches the scene, per configuration, e.g. per step of a failed trajectory.
+- Add an exact self-collision check between the robot's link meshes.
+  `mesh_self_collision_check=True` (and `mesh_self_collision_margin`) on the same
+  `create` methods rejects solutions in which two link meshes collide, including
+  pairs the sphere check must ignore because their spheres always overlap, such
+  as Franka's link5 with link7 and the hand. Links in one rigid body and links
+  one joint apart are skipped, plus a `mesh_self_collision_ignore` list in the
+  robot YAML; `RobotBuilder.compute_mesh_collision_matrix` derives that list.
+  `get_mesh_self_collision_pairs` names a colliding pair, and
+  `RobotCollisionCheckerCfg.load_from_config` accepts
+  `use_mesh_self_collision_constraint`.
+- Speed up the mesh collision check by skipping links whose bounding sphere is
+  clear of every obstacle: 2x to 12x faster for 4096 configurations,
+  depending on the scene type.
 - Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
   plans one trajectory through an ordered list of Cartesian waypoints with
   per-segment tool pose criteria.
@@ -97,6 +121,26 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- Decimate robot link meshes closer to their surface. Decimation now merges duplicate
+  vertices, closes the mesh when it can, keeps open borders, and keeps the result closest
+  to the original among several settings. Franka's links 2-5, decimated from 300 to the
+  default 256 triangles, moved by up to 2.3 cm before and stay within about 1 mm now. The
+  deviation of every decimated link is logged, with a warning above 2 mm.
+- Fix `RobotCollisionChecker.validate` with `use_mesh_constraint=True`, which
+  combined terms of different shapes.
+- Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,
+  only intersecting triangles were reported, so the margin had almost no effect.
+- Catch obstacles between the samples of large robot triangles on fine voxel
+  grids: where the sampling cap applies, the voxel mesh check widens its
+  threshold by the extra reach of the coarser samples.
+- Require `fast_simplification`. Without it, link meshes over their triangle
+  budget fell back to their convex hull, which fills concave gaps such as the
+  space between gripper fingers.
+- Fix `GoalManager` storing the caller's goal tensors as its reusable buffer, so
+  the next solve overwrote them. `plan_grasp` lost its grasp poses this way.
+- Fix the approach-to-grasp and lift phases of `plan_grasp`, which always
+  failed: their start states carried the previous trajectory's `dt`, which
+  clamped every joint to within one step of motion.
 - Fix the `ToolPoseCost` rotation term for the default axis-angle rotation
   error. Its gradient reached the joints at half its value, which hid that the
   rotation distance was `w * theta^2` while the position distance is

@@ -850,3 +850,39 @@ class TestRobotBuilderEdgeCases:
         assert builder_low.num_spheres > 0
         assert builder_high.num_spheres > 0
         assert builder_high.num_spheres > builder_low.num_spheres
+
+
+class TestRobotBuilderMeshCollisionMatrix:
+    """Test RobotBuilder.compute_mesh_collision_matrix()."""
+
+    @pytest.fixture(scope="class")
+    def franka_builder(self):
+        """Builder loaded from franka.yml, which already has its collision spheres."""
+        return RobotBuilder.from_config(join_path(get_robot_configs_path(), "franka.yml"))
+
+    def test_mesh_matrix_needs_spheres(self, franka_urdf_path, franka_asset_path):
+        builder = RobotBuilder(urdf_path=franka_urdf_path, asset_path=franka_asset_path)
+        with pytest.raises(ValueError):
+            builder.compute_mesh_collision_matrix(num_samples=10)
+
+    def test_mesh_matrix_keeps_pairs_that_collide_only_sometimes(self, franka_builder):
+        """link5 and the hand collide in some configurations, so they stay checked."""
+        ignore = franka_builder.compute_mesh_collision_matrix(
+            num_samples=200, custom_ignore={"panda_link0": ["panda_link4"]}
+        )
+        pairs = {frozenset((a, b)) for a, others in ignore.items() for b in others}
+        assert frozenset(("panda_link5", "panda_hand")) not in pairs
+        assert frozenset(("panda_link0", "panda_link4")) in pairs
+        # Adjacent links are skipped by the check itself, so they are never listed.
+        assert frozenset(("panda_link5", "panda_link6")) not in pairs
+
+    def test_mesh_matrix_is_built_and_saved(self, franka_builder, tmp_path):
+        ignore = franka_builder.compute_mesh_collision_matrix(
+            num_samples=50, custom_ignore={"panda_link0": ["panda_link4"]}
+        )
+        config = franka_builder.build()
+        assert config.mesh_self_collision_ignore == ignore
+        output_path = str(tmp_path / "robot.yml")
+        franka_builder.save(config, output_path)
+        saved = load_yaml(output_path)["kinematics"]["mesh_self_collision_ignore"]
+        assert saved["panda_link0"] == ["panda_link4"]

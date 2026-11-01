@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Tests for the ``mesh_collision_check`` solver config option."""
+"""Tests for the ``mesh_collision_check`` and ``mesh_self_collision_check`` solver options."""
 
 # Third Party
 import pytest
@@ -12,9 +12,12 @@ from curobo._src.solver import solver_core_cfg
 from curobo._src.solver.solver_core_cfg import (
     MESH_COLLISION_CONSTRAINT_WEIGHT,
     enable_mesh_collision,
+    enable_mesh_self_collision,
     resolve_robot_config,
     resolve_yaml_configs,
+    uses_link_meshes,
     uses_mesh_collision,
+    uses_mesh_self_collision,
 )
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
@@ -117,6 +120,30 @@ def test_resolve_task_config_with_mesh_constraint_loads_meshes(fake_robot_cfg, m
         DeviceCfg(), metrics_rollout=metrics_base_dict
     )
     assert uses_mesh_collision(metrics_dict)
+    assert robot_config.load_collision_meshes
+
+
+def test_enable_mesh_self_collision_adds_constraint(metrics_base_dict):
+    enabled = enable_mesh_self_collision(metrics_base_dict, margin=0.003)
+    self_cfg = enabled["rollout"]["constraint_cfg"]["mesh_self_collision_cfg"]
+    assert self_cfg == {"weight": MESH_COLLISION_CONSTRAINT_WEIGHT, "margin": 0.003}
+    assert uses_mesh_self_collision(enabled) and uses_link_meshes(enabled)
+    assert not uses_mesh_collision(enabled)
+    assert not uses_link_meshes(metrics_base_dict)
+
+
+def test_enable_mesh_self_collision_rejects_negative_margin(metrics_base_dict):
+    with pytest.raises(Exception):
+        enable_mesh_self_collision(metrics_base_dict, margin=-0.01)
+
+
+def test_resolve_mesh_self_collision_check_loads_meshes(fake_robot_cfg):
+    robot_config, _, metrics_dict, _, _ = _resolve(
+        DeviceCfg(), mesh_self_collision_check=True, mesh_self_collision_margin=0.002
+    )
+    self_cfg = metrics_dict["rollout"]["constraint_cfg"]["mesh_self_collision_cfg"]
+    assert self_cfg["margin"] == 0.002
+    assert not uses_mesh_collision(metrics_dict)
     assert robot_config.load_collision_meshes
 
 

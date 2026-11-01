@@ -4,15 +4,15 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
 from curobo._src.collision.attachment_manager import AttachmentManager
+from curobo._src.cost.cost_eef_bound_eval import find_tool_pose_bound_violations
 from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     ToolPoseBounds,
-    find_tool_pose_bound_violations,
     normalize_tool_pose_bounds,
 )
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
@@ -137,6 +137,42 @@ class MotionPlanner:
 
     def compute_kinematics(self, state: JointState) -> KinematicsState:
         return self.trajopt_solver.compute_kinematics(state)
+
+    def get_mesh_collision_links(
+        self, joint_state: JointState, env_query_idx: Optional[torch.Tensor] = None
+    ) -> Union[Optional[str], List]:
+        """Name the link whose collision mesh touches the scene, for every configuration.
+
+        Use it to see why a solution failed the mesh collision check: pass the result's
+        ``js_solution`` or ``interpolated_trajectory``. Requires ``mesh_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+            env_query_idx: Environment index per configuration in the first dimension.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding the name
+            of a colliding link, or ``None`` where the meshes are clear of the scene.
+        """
+        return self.trajopt_solver.get_mesh_collision_links(joint_state, env_query_idx)
+
+    def get_mesh_self_collision_pairs(
+        self, joint_state: JointState
+    ) -> Union[Optional[Tuple[str, str]], List]:
+        """Name two links whose collision meshes touch each other, for every configuration.
+
+        Use it to see why a solution failed the mesh self-collision check, as
+        :meth:`get_mesh_collision_links` does for the scene. Requires
+        ``mesh_self_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+
+        Returns:
+            Nested lists with the leading shape of ``joint_state.position``, holding a
+            ``(link_a, link_b)`` pair that collides, or ``None`` where no tested pair does.
+        """
+        return self.trajopt_solver.get_mesh_self_collision_pairs(joint_state)
 
     # -- Warmup --
 
@@ -541,6 +577,10 @@ class MotionPlanner:
         # Step 3: Linear motion from approach to grasp
         approach_end = get_joint_state_at_horizon_index(approach_result.js_solution, -1).squeeze(0)
         approach_end = self.kinematics.get_active_js(approach_end)
+        # The end of a planned trajectory is the start of the next plan, not a state observed
+        # one trajectory step ago: keep its trajectory dt out, or IK clamps every joint to
+        # within max velocity * dt of it and cannot reach the next pose.
+        approach_end.dt = None
 
         linear_motion = ToolPoseCriteria.linear_motion(
             axis=grasp_approach_axis, non_terminal_scale=1.0,
@@ -577,6 +617,7 @@ class MotionPlanner:
         # Step 4: Lift motion
         lift_start = get_joint_state_at_horizon_index(grasp_result.js_solution, -1).squeeze(0)
         lift_start = self.kinematics.get_active_js(lift_start)
+        lift_start.dt = None
 
         lift_offset = Pose.from_list([
             grasp_lift_offset * v
@@ -622,12 +663,20 @@ class MotionPlanner:
     # -- Scene / collision management --
 
     def enable_link_collision(self, enable_collision_links: List[str]):
+        """Re-enable scene collision for links, on both their spheres and their meshes."""
+        kinematics_config = self.kinematics.config.kinematics_config
         for link_name in enable_collision_links:
-            self.kinematics.config.kinematics_config.enable_link_spheres(link_name)
+            kinematics_config.enable_link_spheres(link_name)
+            if kinematics_config.has_link_mesh(link_name):
+                kinematics_config.enable_link_mesh(link_name)
 
     def disable_link_collision(self, disable_collision_links: List[str]):
+        """Disable scene collision for links, on both their spheres and their meshes."""
+        kinematics_config = self.kinematics.config.kinematics_config
         for link_name in disable_collision_links:
-            self.kinematics.config.kinematics_config.disable_link_spheres(link_name)
+            kinematics_config.disable_link_spheres(link_name)
+            if kinematics_config.has_link_mesh(link_name):
+                kinematics_config.disable_link_mesh(link_name)
 
     def update_world(self, scene_cfg: SceneCfg):
         self.scene_collision_checker.load_collision_model(scene_cfg)

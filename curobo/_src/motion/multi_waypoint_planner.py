@@ -26,12 +26,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 # CuRobo
+from curobo._src.cost.cost_eef_bound_eval import tool_pose_bounds_violation
 from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     ToolPoseBoundAnchor,
     ToolPoseBounds,
     normalize_tool_pose_bounds,
-    tool_pose_bounds_violation,
 )
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.motion.ik_dedup import dedup_joint_solutions

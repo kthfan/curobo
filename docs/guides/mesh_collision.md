@@ -66,15 +66,18 @@ MotionPlannerCfg.create(
 )
 ```
 
-Use a small positive margin when the robot's meshes are decimated (see the next section), since
-decimation can shrink a link slightly.
+When a link mesh is decimated (see the next section), its surface moves by the deviation that
+cuRobo reports at load time. A margin of that size keeps the check from missing contacts there.
 
 ## Limit the triangle count
 
 The check costs time in proportion to the number of robot triangles. Each link is packed with
-at most 256 triangles by default; a larger mesh is decimated to fit, with a warning. Set a
-different budget in the `kinematics` section of the robot YAML, either for every link or per
-link:
+at most 256 triangles by default; a larger mesh is decimated to fit. Decimation keeps the open
+borders that robot collision meshes often have and picks, among several settings, the result
+closest to the original surface: Franka's links stay within about 1 mm at the default budget.
+cuRobo logs how far each decimated surface moved, and warns when it moved by more than 2 mm
+or when a mesh cannot be reduced to its budget. Set a different budget in the `kinematics`
+section of the robot YAML, either for every link or per link:
 
 ```yaml
 robot_cfg:
@@ -84,8 +87,8 @@ robot_cfg:
     # max_triangles_per_link: {panda_hand: 512, panda_leftfinger: 64}
 ```
 
-Increase the budget for links whose shape matters, such as fingers. Lower it for large, simple
-links.
+Increase the budget for links whose shape matters, such as fingers, and for links that the
+warning reports. Lower it for large, simple links. {ref}`mesh_collision_cost` lists measured costs for different budgets and scenes.
 
 ## Ignore links that touch the scene by design
 
@@ -101,6 +104,14 @@ robot_cfg:
 
 Ignored links are skipped only by the mesh check; the collision spheres still apply to them.
 
+## Let links touch the scene for a while
+
+`MotionPlanner.disable_link_collision(links)` turns off scene collision for links on both
+their spheres and their meshes, and `enable_link_collision(links)` turns it back on.
+`plan_grasp` does this for the robot's `grasp_contact_link_names` while it plans to the grasp,
+moves in and lifts the object, so the fingers may touch it with the mesh check on. To toggle
+only the mesh check, call `disable_link_mesh` and `enable_link_mesh` on the kinematics config.
+
 ## Add geometry at runtime
 
 To check geometry that is known only at runtime, such as a grasped object, reserve triangle
@@ -109,23 +120,126 @@ slots for a link in the robot YAML:
 ```yaml
 robot_cfg:
   kinematics:
-    extra_collision_meshes: {attached_object: 200}
+    extra_collision_meshes: {attached_object: 256}
 ```
 
-Then write the geometry in the link's frame, as a `[n, 3, 3]` triangle tensor or a mesh, and
-clear it when the object is released:
+`franka.yml` already reserves 256 slots for `attached_object`. Reserved slots cost nothing
+without the mesh check; with it, empty slots are skipped right away.
+
+The attachment manager fills these slots: attaching an object writes its mesh along with its
+collision spheres, and detaching it clears both. The link meshes are shared by all
+environments, so with several environments the object must have the same offset to the link in
+each of them; otherwise the manager warns and checks the object with its spheres only.
+
+To manage the geometry yourself, write it in the link's frame, as a `[n, 3, 3]` triangle tensor
+or a mesh, and clear it when the object is released:
 
 ```python
 kinematics_config = planner.kinematics.config.kinematics_config
 kinematics_config.update_link_mesh("attached_object", object_triangles)
 ...
-kinematics_config.disable_link_mesh("attached_object")
+kinematics_config.clear_link_mesh("attached_object")
 ```
 
-The update is in place: every solver of the planner sees it at once, and captured CUDA graphs
-stay valid. Geometry larger than the reserved slots is decimated to fit.
-Attaching an object with the attachment manager updates the collision spheres only, so call
-`update_link_mesh` as well when the mesh check should cover the object.
+`disable_link_mesh` only pauses the geometry, and `enable_link_mesh` (also called by
+`enable_link_collision` and `plan_grasp`) brings it back, so use `clear_link_mesh` for a
+released object. The update is in place: every solver of the planner sees it at once, and
+captured CUDA graphs stay valid. Geometry larger than the reserved slots is decimated to fit.
+
+## Find the link that collides
+
+When a solve fails, `get_mesh_collision_links` tells you whether the meshes are the reason. It
+runs the mesh check again on the configurations you pass, such as the result's `js_solution` or
+`interpolated_trajectory`, and names a colliding link for each of them:
+
+```python
+result = planner.plan_pose(goal_tool_poses, current_state)
+links = planner.get_mesh_collision_links(result.interpolated_trajectory)
+# links[batch][seed][step] is a link name, or None where the meshes are clear.
+for step, link in enumerate(links[0][0]):
+    if link is not None:
+        print(f"mesh collision: {link} at step {step}")
+        break
+```
+
+The method exists on the motion planners and on the IK, trajectory optimization and MPC
+solvers, and needs `mesh_collision_check=True`. The result has the leading shape of the joint
+positions you pass. When several links collide at one configuration, one of them is named. The
+check runs separately from the solve, so it adds no cost to planning and leaves captured CUDA
+graphs untouched.
+
+## Fix solves that fail only with the mesh check
+
+A goal that the solver reaches without the mesh check can fail with it, mostly in tight
+spaces: IK finds no successful seed, or `plan_pose` fails after all its attempts. The mesh
+check has no gradient (see {ref}`mesh_collision_note`). The optimizers move every seed with the
+sphere costs only, so when the spheres are clear while a mesh collides, nothing pushes that
+seed out of the collision; only the other seeds can succeed. To fix it:
+
+1. Find the link with `get_mesh_collision_links` (see the previous section). Many seeds failing
+   on the same link point to that link's spheres.
+2. Cover that link better with spheres: add or enlarge spheres where its mesh sticks out of
+   them, in the robot YAML (see {ref}`tutorial_build_robot_model`). The optimizer then steers
+   the link away itself, which is the most effective fix.
+3. Raise `optimizer_collision_activation_distance` (default 0.01 m) on the solver config, for
+   example to 0.02 m. The optimizer then keeps the spheres farther from obstacles, which also
+   keeps the parts of the meshes outside the spheres clear. The success check is unchanged,
+   but narrow passages become harder to pass.
+4. Give the solver more chances: raise `num_ik_seeds`, `num_trajopt_seeds` or the
+   `max_attempts` of `plan_pose`. This helps when only some seeds end in a mesh-only collision.
+
+Avoid the robot YAML's `collision_sphere_buffer` for this: it enlarges the spheres for the
+success check and self-collision too, so it rejects more solutions instead of steering them.
+
+## Check self-collision with the meshes
+
+The sphere self-collision check has to skip link pairs whose spheres overlap in every
+configuration, such as Franka's `panda_link5` with `panda_link7` and with `panda_hand`. Their
+meshes still collide when the wrist folds onto the forearm: in about 9 % of random Franka
+configurations for `panda_link5` and `panda_hand`. Pass `mesh_self_collision_check=True` to
+check the exact link meshes against each other as well:
+
+```python
+MotionPlannerCfg.create(
+    robot="franka.yml",
+    scene_model="collision_table.yml",
+    mesh_self_collision_check=True,
+    mesh_self_collision_margin=0.0,
+)
+```
+
+The option is independent of `mesh_collision_check` and exists on the same `create` methods.
+Like the scene check it is a pass/fail test on the result; the sphere self-collision cost still
+steers the optimizer, and its check still applies.
+
+The mesh check tests every pair of links with collision meshes, except:
+
+- links that move as one rigid body, joined by fixed or locked joints, such as Franka's hand
+  and its locked fingers;
+- links that a single joint connects, which usually touch at the joint;
+- pairs listed under `mesh_self_collision_ignore` in the robot YAML. This list is separate from
+  the sphere `self_collision_ignore`:
+
+```yaml
+robot_cfg:
+  kinematics:
+    mesh_self_collision_ignore: {panda_link0: [panda_link2]}
+```
+
+Franka needs no list. If two tested meshes collide at the robot's default joint configuration,
+cuRobo warns and names the pair; such pairs usually touch by design and belong in the list.
+For a new robot, {py:meth}`RobotBuilder.compute_mesh_collision_matrix
+<curobo.robot_builder.RobotBuilder.compute_mesh_collision_matrix>` derives
+the list: it adds pairs that collide at the default configuration or in nearly every random
+configuration.
+
+To see which pair a failed solution hits, pass its joint states to
+`get_mesh_self_collision_pairs`, the self-collision counterpart of `get_mesh_collision_links`:
+
+```python
+pairs = planner.get_mesh_self_collision_pairs(result.interpolated_trajectory)
+# pairs[batch][seed][step] is a (link_a, link_b) tuple, or None.
+```
 
 ## Check configurations outside a solver
 
@@ -141,6 +255,7 @@ config = RobotCollisionCheckerCfg.load_from_config(
     use_mesh_constraint=True,
     mesh_constraint_margin=0.0,
     mesh_constraint_ignored_links=["panda_link0"],
+    use_mesh_self_collision_constraint=True,
 )
 checker = RobotCollisionChecker(config)
 is_valid = checker.validate(joint_positions)
@@ -148,13 +263,21 @@ is_valid = checker.validate(joint_positions)
 
 ## Limitations
 
-- The check covers robot-scene collisions. Self-collision is still checked with the spheres.
-- Trajectory optimization checks the optimized trajectory steps, not the densely interpolated
-  trajectory between them.
+- Self-collision with the meshes is opt-in (`mesh_self_collision_check`). A link fully inside
+  another link, crossing none of its triangles, is not detected. Links left out with
+  `mesh_collision_ignored_link_names` have no mesh, so they are not checked against other
+  links either.
+- Trajectory optimization checks the optimized steps and every step of the interpolated
+  trajectory. Both sample the motion, so an obstacle thinner than the distance a link moves
+  between two samples (about 1 to 2 cm for the hand in typical plans) can be missed.
 - The graph planner that seeds trajectory optimization uses the spheres only; the trajectory
   optimization that follows the seed applies the mesh check.
 - Voxel (ESDF) obstacles are checked by sampling, so features thinner than the voxel size can
-  be missed. Cuboid and mesh obstacles are checked exactly.
+  be missed, and nothing outside the voxel grid is seen. Large robot triangles on fine grids
+  are checked slightly conservatively. Cuboid and mesh obstacles are checked exactly.
 - An obstacle small enough to sit entirely inside a link, touching none of its triangles, is
   not detected.
+- Mesh obstacles should be closed. For open meshes, such as a bin without wall thickness or a
+  single-sided sheet, part of the free space can read as inside the obstacle, for the spheres
+  and the meshes alike. See {ref}`mesh_collision_note` for which regions are affected.
 - The check runs on CUDA devices only.

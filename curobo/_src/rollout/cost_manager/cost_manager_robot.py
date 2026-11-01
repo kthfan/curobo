@@ -21,6 +21,7 @@ from curobo._src.cost.cost_scene_collision import SceneCollisionCost
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_tool_pose import ToolPoseCost
 from curobo._src.cost.cost_robot_mesh_constraint import RobotMeshConstraint
+from curobo._src.cost.cost_robot_mesh_self_collision import RobotMeshSelfCollisionConstraint
 from curobo._src.geom.collision.collision_scene import SceneCollision
 from curobo._src.rollout.goal_registry import GoalRegistry
 from curobo._src.rollout.metrics import CostCollection
@@ -203,6 +204,14 @@ class RobotCostManager:
                 "mesh_collision", RobotMeshConstraint(config.mesh_collision_cfg)
             )
 
+        # Robot mesh self-collision
+        if config.mesh_self_collision_cfg is not None:
+            config.mesh_self_collision_cfg.initialize_from_transition_model(transition_model)
+            self.register_cost(
+                "mesh_self_collision",
+                RobotMeshSelfCollisionConstraint(config.mesh_self_collision_cfg),
+            )
+
         self._initialized = True
         log_info(f"Initialized {len(self.costs)} costs for robot rollout")
 
@@ -327,6 +336,14 @@ class RobotCostManager:
                         idxs_env,
                     )
                     cost_collection.add(cost_value, "mesh_collision")
+
+        # Robot mesh self-collision
+        if self.has_cost("mesh_self_collision"):
+            mesh_self_collision_cost = self.get_cost("mesh_self_collision")
+            if mesh_self_collision_cost.enabled:
+                with self._stream_context("mesh_self_collision"):
+                    cost_value = mesh_self_collision_cost.forward(state.cuda_robot_model_state)
+                    cost_collection.add(cost_value, "mesh_self_collision")
                     
         synchronize_cuda_streams(self._costs_events, self.device_cfg.device)
         return cost_collection

@@ -172,6 +172,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
             max_triangles_per_link=self.max_triangles_per_link,
             extra_collision_meshes=self.extra_collision_meshes,
             mesh_collision_ignored_link_names=self.mesh_collision_ignored_link_names,
+            mesh_self_collision_ignore=self.mesh_self_collision_ignore,
         )
         self._kinematics_config.make_contiguous()
         if self.asset_root_path is not None and self.asset_root_path != "":

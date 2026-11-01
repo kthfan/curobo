@@ -165,6 +165,7 @@ class RobotBuilder:
         # Storage for computed data
         self._collision_spheres: Optional[Dict[str, List[Dict]]] = None
         self._self_collision_ignore: Optional[Dict[str, List[str]]] = None
+        self._mesh_self_collision_ignore: Optional[Dict[str, List[str]]] = None
         self._self_collision_buffer: Dict[str, float] = {}
         self._cspace_config: Optional[Dict] = None
         self._link_metrics: Dict[str, SphereFitMetrics] = {}
@@ -227,6 +228,11 @@ class RobotBuilder:
             instance._self_collision_buffer = kinematics_data[
                 "self_collision_buffer"
             ].copy()
+
+        if kinematics_data.get("mesh_self_collision_ignore"):
+            instance._mesh_self_collision_ignore = {
+                k: list(v) for k, v in kinematics_data["mesh_self_collision_ignore"].items()
+            }
 
         if "cspace" in kinematics_data:
             instance._cspace_config = kinematics_data["cspace"].copy()
@@ -504,6 +510,101 @@ class RobotBuilder:
 
         return self._self_collision_ignore
 
+    def compute_mesh_collision_matrix(
+        self,
+        num_samples: int = 1000,
+        always_colliding_ratio: float = 0.99,
+        seed: int = 345,
+        custom_ignore: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, List[str]]:
+        """Compute the ignore list of the mesh self-collision check.
+
+        The exact link meshes are tested pair by pair. The check itself always skips links in
+        one rigid body and links that a single joint connects, so those are not listed. The
+        list holds:
+
+        1. Pairs that collide at the default joint configuration.
+        2. Pairs that collide in at least ``always_colliding_ratio`` of ``num_samples`` random
+           configurations: they touch by design, e.g. through a joint housing.
+        3. ``custom_ignore``.
+
+        Unlike :meth:`compute_collision_matrix`, pairs that never collide in the samples stay
+        checked: the per-configuration culling makes far pairs cheap, and a rare collision
+        must not be missed. The result is written by :meth:`build` and :meth:`save` as
+        ``mesh_self_collision_ignore``.
+
+        Args:
+            num_samples: Number of random joint configurations to test.
+            always_colliding_ratio: Fraction of samples in which a pair must collide to be
+                ignored.
+            seed: Random seed of the joint samples.
+            custom_ignore: Additional pairs to ignore, as ``{link: [links]}``.
+
+        Returns:
+            The ignore list, as ``{link: [links]}``.
+
+        Raises:
+            ValueError: If :meth:`fit_collision_spheres` hasn't been called yet; the mesh
+                check uses the same collision links.
+        """
+        from curobo._src.geom.collision.wp_robot_mesh_collision import (
+            check_robot_mesh_self_collision,
+        )
+
+        if self._collision_spheres is None:
+            log_and_raise(
+                "Must call fit_collision_spheres() before compute_mesh_collision_matrix()"
+            )
+        ignore: Dict[str, List[str]] = {k: list(v) for k, v in (custom_ignore or {}).items()}
+        robot_config = self._build_temp_config(load_collision_meshes=True)
+        robot_config.kinematics_config.mesh_self_collision_ignore = ignore
+        kinematics = Kinematics(robot_config, compute_link_transforms=True)
+        data = robot_config.kinematics_config.get_robot_mesh_data()
+        if data.self_collision_pairs is None:
+            self._mesh_self_collision_ignore = ignore
+            return ignore
+        all_pairs = data.self_collision_pairs.tolist()
+
+        joint_limits = kinematics.config.get_joint_limits()
+        samples = SampleBuffer.create_halton_sample_buffer(
+            robot_config.dof,
+            device_cfg=robot_config.device_cfg,
+            low_bounds=joint_limits.position_lower_limits,
+            up_bounds=joint_limits.position_upper_limits,
+            seed=seed,
+            store_buffer=None,
+        ).get_samples(num_samples, bounded=True)
+        default = kinematics.default_joint_state.position.view(1, -1)
+        q = torch.cat([default, samples.to(default)])
+        state = kinematics.compute_kinematics(
+            JointState.from_position(q.unsqueeze(1), joint_names=kinematics.joint_names)
+        )
+
+        names = data.body_idx_to_link_name
+        num_added = 0
+        try:
+            for a, b in all_pairs:
+                data.set_self_collision_pairs([(a, b)])
+                hit, _ = check_robot_mesh_self_collision(data, state.link_transforms)
+                hit = hit.bool()
+                at_default = bool(hit[0].item())
+                ratio = hit[1:].float().mean().item()
+                if at_default or ratio >= always_colliding_ratio:
+                    link_a, link_b = names[a], names[b]
+                    ignore.setdefault(link_a, [])
+                    if link_b not in ignore[link_a]:
+                        ignore[link_a].append(link_b)
+                        num_added += 1
+                    reason = "at the default configuration" if at_default else (
+                        f"in {100 * ratio:.0f} % of the samples"
+                    )
+                    log_info(f"Ignoring mesh pair {link_a} - {link_b}: collides {reason}")
+        finally:
+            data.set_self_collision_pairs(all_pairs)
+        log_info(f"Added {num_added} pairs to the mesh self-collision ignore list")
+        self._mesh_self_collision_ignore = ignore
+        return ignore
+
     def add_collision_ignore(
         self,
         link_name: str,
@@ -608,6 +709,7 @@ class RobotBuilder:
             mesh_link_names=collision_link_names,
             self_collision_buffer=self._self_collision_buffer,
             self_collision_ignore=self._self_collision_ignore,
+            mesh_self_collision_ignore=self._mesh_self_collision_ignore,
             device_cfg=self.device_cfg,
         )
 
@@ -976,7 +1078,7 @@ class RobotBuilder:
                 if ignore_link not in self._self_collision_ignore[link_name]:
                     self._self_collision_ignore[link_name].append(ignore_link)
 
-    def _build_temp_config(self) -> KinematicsCfg:
+    def _build_temp_config(self, load_collision_meshes: bool = False) -> KinematicsCfg:
         """Build temporary config for collision checking (internal)."""
         temp_gen_config = KinematicsLoaderCfg(
             base_link=self._base_link,
@@ -990,6 +1092,7 @@ class RobotBuilder:
             self_collision_ignore=self._self_collision_ignore,
             device_cfg=self.device_cfg,
             load_meshes=False,
+            load_collision_meshes=load_collision_meshes,
         )
 
         data_dict = {"kinematics": vars(temp_gen_config)}

@@ -41,6 +41,7 @@ class RobotMeshConstraint(BaseCost):
             log_and_raise("_robot_mesh_data must be set for RobotMeshConstraintCfg")
         self._in_collision: Optional[torch.Tensor] = None
         self._contact_link: Optional[torch.Tensor] = None
+        self._link_near: Optional[torch.Tensor] = None
 
     def setup_batch_tensors(self, batch_size: int, horizon: int):
         """Allocate the per-configuration output buffers.
@@ -58,6 +59,12 @@ class RobotMeshConstraint(BaseCost):
         )
         self._contact_link = torch.zeros(
             batch_size * horizon, dtype=torch.int32, device=self.device_cfg.device
+        )
+        self._link_near = torch.zeros(
+            3,
+            batch_size * horizon * self.config.robot_mesh_data.num_links,
+            dtype=torch.int32,
+            device=self.device_cfg.device,
         )
 
     def forward(
@@ -104,6 +111,7 @@ class RobotMeshConstraint(BaseCost):
             check_containment=self.config.check_containment,
             in_collision=self._in_collision,
             contact_link=self._contact_link,
+            link_near=self._link_near,
         )
 
         cost = in_collision.view(batch, horizon, 1).to(dtype=link_transforms.dtype)

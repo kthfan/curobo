@@ -234,6 +234,45 @@ def enable_mesh_collision(metrics_rollout_dict: Dict, margin: float = 0.0) -> Di
     return metrics_rollout_dict
 
 
+def uses_mesh_self_collision(metrics_rollout_dict: Dict) -> bool:
+    """True if a resolved metrics rollout dict declares the mesh self-collision constraint."""
+    constraint_cfg = metrics_rollout_dict.get("rollout", {}).get("constraint_cfg") or {}
+    return constraint_cfg.get("mesh_self_collision_cfg") is not None
+
+
+def uses_link_meshes(metrics_rollout_dict: Dict) -> bool:
+    """True if a resolved metrics rollout dict needs the robot's collision meshes."""
+    return uses_mesh_collision(metrics_rollout_dict) or uses_mesh_self_collision(
+        metrics_rollout_dict
+    )
+
+
+def enable_mesh_self_collision(metrics_rollout_dict: Dict, margin: float = 0.0) -> Dict:
+    """Return a copy of a metrics rollout dict with the mesh self-collision constraint enabled.
+
+    An existing ``mesh_self_collision_cfg`` entry is kept and only its ``margin`` is replaced.
+
+    Args:
+        metrics_rollout_dict: Resolved metrics rollout YAML dict. Not modified.
+        margin: Clearance in meters the robot's link meshes must keep from each other.
+
+    Returns:
+        New metrics rollout dict.
+    """
+    if margin < 0.0:
+        log_and_raise(f"mesh_self_collision_margin must be non-negative, got {margin}")
+    metrics_rollout_dict = deepcopy(metrics_rollout_dict)
+    rollout = metrics_rollout_dict.setdefault("rollout", {})
+    constraint_cfg = rollout.get("constraint_cfg") or {}
+    rollout["constraint_cfg"] = constraint_cfg
+    self_cfg = constraint_cfg.get("mesh_self_collision_cfg") or {
+        "weight": MESH_COLLISION_CONSTRAINT_WEIGHT
+    }
+    self_cfg["margin"] = margin
+    constraint_cfg["mesh_self_collision_cfg"] = self_cfg
+    return metrics_rollout_dict
+
+
 def resolve_robot_config(
     robot: Union[str, Dict[str, Any], RobotCfg],
     device_cfg: DeviceCfg,
@@ -287,6 +326,8 @@ def resolve_yaml_configs(
     num_envs: int = 1,
     mesh_collision_check: bool = False,
     mesh_collision_margin: float = 0.0,
+    mesh_self_collision_check: bool = False,
+    mesh_self_collision_margin: float = 0.0,
 ) -> Tuple[RobotCfg, List[Dict], Dict, Dict, Optional[Dict]]:
     """Resolve YAML file paths to configuration dicts/objects.
 
@@ -308,6 +349,9 @@ def resolve_yaml_configs(
         mesh_collision_check: Add the exact mesh collision constraint to the metrics rollout.
             The robot's collision meshes are loaded whenever the metrics rollout uses it.
         mesh_collision_margin: Clearance in meters for the exact mesh collision constraint.
+        mesh_self_collision_check: Add the exact self-collision constraint between the robot's
+            link meshes to the metrics rollout.
+        mesh_self_collision_margin: Clearance in meters for the mesh self-collision constraint.
 
     Returns:
         Tuple of (robot_config, optimizer_dicts, metrics_rollout_dict,
@@ -320,13 +364,17 @@ def resolve_yaml_configs(
     )
     if mesh_collision_check:
         metrics_rollout_dict = enable_mesh_collision(metrics_rollout_dict, mesh_collision_margin)
+    if mesh_self_collision_check:
+        metrics_rollout_dict = enable_mesh_self_collision(
+            metrics_rollout_dict, mesh_self_collision_margin
+        )
 
     robot_config = resolve_robot_config(
         robot,
         device_cfg,
         load_collision_spheres=load_collision_spheres,
         num_envs=num_envs,
-        load_collision_meshes=uses_mesh_collision(metrics_rollout_dict),
+        load_collision_meshes=uses_link_meshes(metrics_rollout_dict),
     )
 
     # Resolve scene model

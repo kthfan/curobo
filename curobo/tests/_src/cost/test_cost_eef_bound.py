@@ -9,12 +9,12 @@ import torch
 
 from curobo._src.cost.cost_eef_bound import EEFBoundCost
 from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
-from curobo._src.cost.tool_pose_bound import (
-    ToolPoseBound,
+from curobo._src.cost.cost_eef_bound_eval import (
     _quat_mul,
     tool_pose_bound_components,
     tool_pose_bound_cost,
 )
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
@@ -92,6 +92,27 @@ BOUNDS = {
         ToolPoseBound.axis_tilt((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), 1.2, 1.6, anchor="base"),
         ToolPoseBound.line((0.0, 1.0, 1.0), min_along=-0.1, max_along=0.1, anchor="start"),
     ],
+    "base_centered": lambda: [
+        ToolPoseBound(
+            anchor="base",
+            reference_rotation=[0.9, 0.1, -0.3, 0.2],
+            x=(-0.2, 0.3),
+            z=(-0.1, None),
+            tilt=(0.3, 1.6),
+            roll=(2.8, 3.6),
+            center_weight=0.5,
+        )
+    ],
+    "goal_and_start_centered": lambda: [
+        ToolPoseBound.orientation_box(0.3, 0.4, 0.5, center_weight=0.2),
+        ToolPoseBound.plane(
+            (0.0, 0.0, 1.0),
+            min_distance=-0.05,
+            max_distance=0.05,
+            anchor="start",
+            center_weight=1.0,
+        ),
+    ],
 }
 
 
@@ -139,14 +160,24 @@ class Problem:
         return self.position[:, :, 0].unsqueeze(2), self.quaternion[:, :, 0].unsqueeze(2)
 
     def reference_per_goal(self, bounds):
-        """PyTorch cost ``(B, H, G)``: every goal of the set as the anchor of goal bounds."""
+        """PyTorch cost ``(B, H, G)``: every goal of the set as the anchor of goal bounds.
+
+        The pull toward the middle of each limit applies to every step but the last.
+        """
         position, quaternion = self.pose()
         total = torch.zeros(position.shape[:2] + (1,), device=position.device)
         goal_total = torch.zeros(
             position.shape[:2] + (self.goal.num_goalset,), device=position.device
         )
+        horizon = position.shape[1]
+        pulled = (torch.arange(horizon, device=position.device) < horizon - 1).view(1, -1, 1)
         for bound in bounds:
-            cost = tool_pose_bound_cost(bound, position, quaternion, *self.anchors(bound))
+            anchors = self.anchors(bound)
+            cost = torch.where(
+                pulled,
+                tool_pose_bound_cost(bound, position, quaternion, *anchors, center_pull=True),
+                tool_pose_bound_cost(bound, position, quaternion, *anchors),
+            )
             if bound.anchor.name == "GOAL":
                 goal_total = goal_total + cost
             else:
@@ -364,6 +395,31 @@ def test_wrapped_roll_interval(device_cfg):
     out = make_cost(device_cfg, {"ee": bound}).forward(tool_poses)[0, :, 0]
     assert out[0].item() == 0.0 and out[1].item() == 0.0
     assert out[2].item() > 1.0
+
+
+def test_center_pull_spares_the_last_step(device_cfg):
+    """The pull toward the middle acts on every step but the last, never in metrics."""
+    device = device_cfg.device
+    bound = ToolPoseBound(anchor="base", z=(0.0, 0.2), position_tolerance=0.0, center_weight=2.0)
+    tool_poses = _poses_along_z([0.05, 0.05, 0.05], device)
+    out = make_cost(device_cfg, {"ee": bound}).forward(tool_poses)[0, :, 0]
+    expected = 0.5 * 2.0 * 0.05**2
+    assert out[0].item() == pytest.approx(expected, rel=1e-4)
+    assert out[1].item() == pytest.approx(expected, rel=1e-4)
+    assert out[2].item() == 0.0
+    metrics = make_cost(device_cfg, {"ee": bound}, metric=True).forward(tool_poses)
+    assert metrics.abs().sum().item() == 0.0
+
+
+def test_center_pull_skips_one_sided_and_equality_limits(device_cfg):
+    device = device_cfg.device
+    tool_poses = _poses_along_z([0.05, 0.05], device)
+    for bound in (
+        ToolPoseBound(anchor="base", z=(0.0, None), position_tolerance=0.0, center_weight=2.0),
+        ToolPoseBound(anchor="base", z=0.05, center_weight=2.0),
+    ):
+        out = make_cost(device_cfg, {"ee": bound}).forward(tool_poses)
+        assert out.abs().sum().item() == 0.0
 
 
 def test_per_link_weight(device_cfg):
