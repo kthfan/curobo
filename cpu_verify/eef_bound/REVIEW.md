@@ -142,3 +142,18 @@ bound：錨點可以是 goal、start 或 base，加上 offset，每個分量（x
 - 另修：`resolve_yaml_configs` 複製 metrics rollout dict（`c870790`），否則 `dev/main` 的
   `MotionPlanner` 無法建立。
 - 待決：`dev/main` 尚未包含 `c870790`、`2dfdd4d`。
+
+## center_weight（`dev/eef_cost` @ `c05ed0b`，Kaggle 2×T4）
+
+- 重構：轉換成 kernel 數值與 PyTorch 參考實作移到 `cost_eef_bound_eval.py`，ToolPoseBound 只描述限制。
+- 回歸：單元測試 932 passed；`gpu_check.py` 19/19。
+- `gpu_center_sweep.py`（權重 1e5，每組 8 個 goal，全部 100% 成功、規劃時間不變、無違規、終點誤差 0）：
+
+| 情境 | c=0 | c=0.01 | c=0.1 | c=1 | c=10 |
+|---|---|---|---|---|---|
+| ±20 mm 帶狀，RMS 離中點 | 2.56 mm | 2.06 | 2.36 | 1.18 | 0.28 |
+| 同上，目標偏中點 15 mm，RMS（前 90%） | 10.38 mm | 10.11 | 9.26 | 7.04 | 3.95 |
+| 傾斜 ±10°，RMS | 0.09° | 0.07 | 0.04 | 0.01 | 0.00 |
+| orientation box ±15°（起點離中心 8°），RMS | 5.35° | 5.14 | 4.24 | 3.46 | 3.01 |
+
+- 建議從 1 開始；< 0.1 效果有限。有障礙物逼路徑偏離中間時的取捨尚未量測。
