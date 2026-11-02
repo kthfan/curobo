@@ -132,6 +132,17 @@ def box_corner(half: wp.vec3, k: wp.int32) -> wp.vec3:
 
 
 @wp.func
+def aabb_dist_sq(lo0: wp.vec3, hi0: wp.vec3, lo1: wp.vec3, hi1: wp.vec3) -> wp.float32:
+    """Squared distance between two axis-aligned boxes, 0 where they overlap."""
+    gap = wp.vec3(
+        wp.max(wp.max(lo0[0] - hi1[0], lo1[0] - hi0[0]), 0.0),
+        wp.max(wp.max(lo0[1] - hi1[1], lo1[1] - hi0[1]), 0.0),
+        wp.max(wp.max(lo0[2] - hi1[2], lo1[2] - hi0[2]), 0.0),
+    )
+    return wp.dot(gap, gap)
+
+
+@wp.func
 def triangle_box_dist_sq(
     a0: wp.vec3,
     a1: wp.vec3,
@@ -140,13 +151,15 @@ def triangle_box_dist_sq(
     outside0: wp.float32,
     outside1: wp.float32,
     outside2: wp.float32,
+    bound_sq: wp.float32,
 ) -> wp.float32:
-    """Squared distance between a triangle and a disjoint box ``[-half, half]``.
+    """Squared distance between a triangle and a disjoint box ``[-half, half]``, up to a bound.
 
     The closest pair of two disjoint convex polytopes is a vertex of one and a face of the
     other, or an edge of each. The triangle vertices against the box are given as
     ``outside0..2`` (the box SDF); the box corners are measured against the triangle face and
-    the 12 box edges against the 3 triangle edges.
+    the 12 box edges against the 3 triangle edges. Corners and edges whose bounding boxes are
+    farther from the triangle's than the running minimum are skipped.
 
     Args:
         a0: First triangle vertex in the box frame.
@@ -156,21 +169,26 @@ def triangle_box_dist_sq(
         outside0: Box SDF at ``a0``, positive.
         outside1: Box SDF at ``a1``, positive.
         outside2: Box SDF at ``a2``, positive.
+        bound_sq: Squared distance already known; the result is at most this.
     """
     m = wp.min(outside0, wp.min(outside1, outside2))
-    d = m * m
+    d = wp.min(m * m, bound_sq)
+    lo = tri_aabb_lo(a0, a1, a2, 0.0)
+    hi = tri_aabb_hi(a0, a1, a2, 0.0)
     for k in range(8):
         corner = box_corner(half, k)
-        d = wp.min(d, point_face_dist_sq(corner, a0, a1, a2))
+        if aabb_dist_sq(lo, hi, corner, corner) < d:
+            d = wp.min(d, point_face_dist_sq(corner, a0, a1, a2))
         # Each corner starts the edges along the axes where its coordinate is negative, so
         # every one of the 12 edges is visited once.
         for axis in range(3):
             if (k & (1 << axis)) == 0:
                 other = wp.vec3(corner)
                 other[axis] = half[axis]
-                d = wp.min(d, segment_segment_dist_sq(a0, a1, corner, other))
-                d = wp.min(d, segment_segment_dist_sq(a1, a2, corner, other))
-                d = wp.min(d, segment_segment_dist_sq(a2, a0, corner, other))
+                if aabb_dist_sq(lo, hi, corner, other) < d:
+                    d = wp.min(d, segment_segment_dist_sq(a0, a1, corner, other))
+                    d = wp.min(d, segment_segment_dist_sq(a1, a2, corner, other))
+                    d = wp.min(d, segment_segment_dist_sq(a2, a0, corner, other))
     return d
 
 
@@ -194,17 +212,6 @@ def triangle_centroid_radius(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3) -> wp.vec4:
     c = (a0 + a1 + a2) / 3.0
     r = wp.max(wp.length(a0 - c), wp.max(wp.length(a1 - c), wp.length(a2 - c)))
     return wp.vec4(c[0], c[1], c[2], r)
-
-
-@wp.func
-def aabb_dist_sq(lo0: wp.vec3, hi0: wp.vec3, lo1: wp.vec3, hi1: wp.vec3) -> wp.float32:
-    """Squared distance between two axis-aligned boxes, 0 where they overlap."""
-    gap = wp.vec3(
-        wp.max(wp.max(lo0[0] - hi1[0], lo1[0] - hi0[0]), 0.0),
-        wp.max(wp.max(lo0[1] - hi1[1], lo1[1] - hi0[1]), 0.0),
-        wp.max(wp.max(lo0[2] - hi1[2], lo1[2] - hi0[2]), 0.0),
-    )
-    return wp.dot(gap, gap)
 
 
 @wp.func
@@ -366,21 +373,29 @@ def robot_cuboid_distance_kernel(
         a1 = wp.transform_point(inv_tf, v1_w)
         a2 = wp.transform_point(inv_tf, v2_w)
 
-        # The box SDF changes no faster than the distance, so no point of the triangle, and
-        # hence neither a crossing's deepest vertex nor a gap, comes below ``lower``.
-        cr = triangle_centroid_radius(a0, a1, a2)
-        lower = compute_local_sdf(obs, env_idx, o, wp.vec3(cr[0], cr[1], cr[2])) - cr[3]
-        if lower >= best:
-            continue
-
+        # A triangle whose box is apart from the obstacle is at least that gap away. Otherwise
+        # the box SDF, changing no faster than the distance, keeps every point of the
+        # triangle, and hence a crossing's deepest vertex, above the centroid's SDF less r.
         half = wp.vec3(obs.dims[flat, 0] * 0.5, obs.dims[flat, 1] * 0.5, obs.dims[flat, 2] * 0.5)
+        gap_sq = aabb_dist_sq(
+            tri_aabb_lo(a0, a1, a2, 0.0), tri_aabb_hi(a0, a1, a2, 0.0), -half, half
+        )
+        if gap_sq > 0.0:
+            if best <= 0.0 or gap_sq >= best * best:
+                continue
+        else:
+            cr = triangle_centroid_radius(a0, a1, a2)
+            if compute_local_sdf(obs, env_idx, o, wp.vec3(cr[0], cr[1], cr[2])) - cr[3] >= best:
+                continue
+
         s0 = compute_local_sdf(obs, env_idx, o, a0)
         s1 = compute_local_sdf(obs, env_idx, o, a1)
         s2 = compute_local_sdf(obs, env_idx, o, a2)
-        if triangle_box_overlap(a0, a1, a2, half):
+        if gap_sq == 0.0 and triangle_box_overlap(a0, a1, a2, half):
             best = wp.min(best, deepest_vertex(s0, s1, s2))
-        else:
-            best = wp.min(best, wp.sqrt(triangle_box_dist_sq(a0, a1, a2, half, s0, s1, s2)))
+        elif best > 0.0:
+            dist_sq = triangle_box_dist_sq(a0, a1, a2, half, s0, s1, s2, best * best)
+            best = wp.min(best, wp.sqrt(dist_sq))
 
     if best < max_distance:
         wp.atomic_min(link_distance, row, best)
