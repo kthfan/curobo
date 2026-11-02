@@ -422,3 +422,19 @@ def test_replay_follows_link_mesh_updates():
         results.append(eager[0].tolist())
     # Without a, only b and the rod overlap, in the first configuration.
     assert results == [[1, 0], [1, 1], [1, 0], [1, 1], [1, 0]]
+
+
+def test_franka_scene_ignored_base_stays_in_self_collision():
+    """Leaving the base out of the scene check keeps its self-collision pairs."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    robot["robot_cfg"]["kinematics"]["load_collision_meshes"] = True
+    robot["robot_cfg"]["kinematics"]["mesh_collision_ignored_link_names"] = ["panda_link0"]
+    config = KinematicsCfg.from_robot_yaml_file(robot, device_cfg=DeviceCfg())
+    data = config.kinematics_config.get_robot_mesh_data()
+    lookup = data.body_idx_to_link_name
+    pairs = {tuple(sorted((lookup[a], lookup[b]))) for a, b in data.self_collision_pairs.tolist()}
+    assert ("panda_hand", "panda_link0") in pairs
+    base = config.kinematics_config.link_name_to_idx_map["panda_link0"]
+    assert data.link_scene_check[base].item() == 0
