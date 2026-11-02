@@ -10,6 +10,8 @@ import torch
 import trimesh
 
 # CuRobo
+import curobo._src.geom.data.data_robot_mesh as data_robot_mesh
+import curobo._src.runtime as curobo_runtime
 from curobo._src.geom.collision.wp_robot_mesh_collision import (
     check_robot_mesh_collision,
     check_robot_mesh_self_collision,
@@ -504,6 +506,78 @@ def test_decimation_warns_about_a_large_deviation(caplog):
 def test_quick_decimation_respects_the_budget():
     """Geometry written at runtime is decimated with a single setting."""
     simplified = decimate_mesh(_open_box(), 64, thorough=False)
+    assert 0 < len(simplified.faces) <= 64
+
+
+@pytest.fixture
+def decimation_cache(tmp_path, monkeypatch):
+    """Point the decimation cache at an empty directory and return its folder."""
+    monkeypatch.setattr(curobo_runtime, "cache_dir", str(tmp_path))
+    monkeypatch.setattr(curobo_runtime, "cache_decimated_meshes", True)
+    return tmp_path / "decimated_meshes"
+
+
+def _cache_files(folder) -> list:
+    return sorted(folder.glob("*.npz")) if folder.exists() else []
+
+
+def test_decimation_cache_reuses_the_result(decimation_cache, monkeypatch):
+    mesh = _open_box()
+    first = decimate_mesh(mesh, 64)
+    assert len(_cache_files(decimation_cache)) == 1
+
+    def fail(*args, **kwargs):
+        raise AssertionError("decimated again despite a cached result")
+
+    monkeypatch.setattr(data_robot_mesh, "_closest_decimation", fail)
+    second = decimate_mesh(mesh, 64)
+    np.testing.assert_array_equal(second.faces, first.faces)
+    np.testing.assert_allclose(second.vertices, first.vertices, rtol=0.0, atol=0.0)
+
+
+def test_decimation_cache_still_warns_about_a_large_deviation(decimation_cache, caplog):
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=0.1)
+    decimate_mesh(sphere, 16, "ball")
+    assert len(_cache_files(decimation_cache)) == 1
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        decimate_mesh(sphere, 16, "ball")
+    assert "link 'ball'" in caplog.text and "surface moved by up to" in caplog.text
+
+
+def test_decimation_cache_is_keyed_by_mesh_and_budget(decimation_cache):
+    sphere = trimesh.creation.icosphere(subdivisions=2)
+    decimate_mesh(sphere, 64)
+    decimate_mesh(sphere, 32)
+    decimate_mesh(sphere.copy().apply_scale(2.0), 64)
+    assert len(_cache_files(decimation_cache)) == 3
+
+
+def test_decimation_cache_recomputes_an_unreadable_file(decimation_cache):
+    sphere = trimesh.creation.icosphere(subdivisions=2)
+    expected = decimate_mesh(sphere, 64)
+    (path,) = _cache_files(decimation_cache)
+    path.write_bytes(b"not an npz file")
+    simplified = decimate_mesh(sphere, 64)
+    np.testing.assert_array_equal(simplified.faces, expected.faces)
+    with np.load(path) as data:
+        np.testing.assert_array_equal(data["faces"], expected.faces)
+
+
+def test_decimation_cache_skips_quick_and_disabled_decimation(decimation_cache, monkeypatch):
+    sphere = trimesh.creation.icosphere(subdivisions=2)
+    decimate_mesh(sphere, 64, thorough=False)
+    monkeypatch.setattr(curobo_runtime, "cache_decimated_meshes", False)
+    decimate_mesh(sphere, 64)
+    assert _cache_files(decimation_cache) == []
+
+
+def test_decimation_cache_write_failure_still_returns_a_mesh(tmp_path, monkeypatch):
+    blocker = tmp_path / "not_a_directory"
+    blocker.write_text("")
+    monkeypatch.setattr(curobo_runtime, "cache_dir", str(blocker))
+    monkeypatch.setattr(curobo_runtime, "cache_decimated_meshes", True)
+    simplified = decimate_mesh(trimesh.creation.icosphere(subdivisions=2), 64)
     assert 0 < len(simplified.faces) <= 64
 
 

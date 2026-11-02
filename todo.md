@@ -43,20 +43,32 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
 - Tests: `pytest_ignore_collect` returns None (so `--ignore` works), multi-waypoint planner tests
   capped at 16 edges per segment.
 
+## Done on `dev/mesh_followups` (not merged yet)
+
+- Decimated meshes are cached under `runtime.cache_dir/decimated_meshes`, keyed by the mesh,
+  the budget and a fingerprint of the decimation code and of `fast_simplification`/`trimesh`;
+  `runtime.cache_decimated_meshes = False` disables it. Only thorough (load-time) decimation
+  is cached; runtime geometry is not. Writes are atomic; unreadable files are recomputed.
+  CPU: Franka 0.80 s -> 3 ms, UR10e 1.13 s -> 3 ms; the deviation warning is still logged.
+
 ## Open items
 
 ### Small, ready to do
 
+None right now.
+
+### Postponed (user's decision)
+
 - [ ] **UR10e decimation.** `upper_arm_link` and `forearm_link` still move by 7-17 mm at the
   default budget of 256 and cannot reach 128. Raise their `max_triangles_per_link` in
   `ur10e.yml`, or evaluate voxel remeshing as a fallback (needs scikit-image; 2-17 s per link).
-- [ ] **Multi-waypoint planner with `max_batch_size > 1` crashes.** `_solve_segment_edges`
-  chunks edges by `max_batch_size`; a last chunk smaller than the batch raises a tensor size
-  mismatch in trajectory optimization. Found while speeding up the tests; not ours, check
-  `dev/improve_multi_waypoint` first, it may already touch this.
-- [ ] **Cache decimated meshes** (P3, more useful now): decimation costs 0.1-0.3 s per decimated
-  link at every start-up (about 1.5 s for Franka). Cache the packed triangles per (mesh hash,
-  budget) under the runtime cache dir.
+  Measured on this branch: `upper_arm_link` 16.7 mm, `forearm_link` 6.7 mm at 256.
+
+### Handed off
+
+- [x] **Multi-waypoint planner with `max_batch_size > 1` crashes.** Belongs to another
+  session; noted as a P1 item in the todo of `dev/improve_multi_waypoint` (`7663527`), ahead
+  of raising its batch default.
 
 ### Blocked on decisions
 

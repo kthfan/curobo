@@ -53,9 +53,13 @@ kernel_backend: str = "auto"
 
 # --- Paths ---
 
-#: Directory for cuRobo outputs (example results, saved configs, etc.).
-#: Defaults to ``~/.cache/curobo``.
+#: Directory for cuRobo outputs (example results, saved configs, decimated collision
+#: meshes, etc.). Defaults to ``~/.cache/curobo``.
 cache_dir: str = str(Path.home() / ".cache" / "curobo")
+
+#: Cache decimated robot collision meshes under ``cache_dir``, so that loading a robot
+#: does not decimate its link meshes again on every start-up.
+cache_decimated_meshes: bool = True
 
 # --- Debug ---
 

@@ -16,7 +16,14 @@ unaffected.
 from __future__ import annotations
 
 # Standard Library
+import hashlib
+import importlib.metadata
+import inspect
+import os
+import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 # Third Party
@@ -26,6 +33,7 @@ import trimesh
 import warp as wp
 
 # CuRobo
+import curobo._src.runtime as curobo_runtime
 from curobo._src.geom.types import Mesh
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise, log_info, log_warn
@@ -219,6 +227,112 @@ def _quadric_decimate(
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
+def _closest_decimation(
+    mesh: trimesh.Trimesh, max_triangles: int, thorough: bool
+) -> Optional[Tuple[trimesh.Trimesh, float]]:
+    """Clean a mesh, decimate it with several settings and keep the closest result.
+
+    Args:
+        mesh: Input link mesh, over ``max_triangles``.
+        max_triangles: Triangle budget.
+        thorough: Try every setting. False keeps the first that reaches the budget.
+
+    Returns:
+        The closest result within the budget and its surface deviation, else the closest
+        result over the budget, or None when no setting produced any triangles.
+    """
+    base = mesh.copy()
+    base.merge_vertices()
+    closed = base.copy()
+    trimesh.repair.fill_holes(closed)
+    if closed.is_watertight:
+        base = closed
+
+    candidates = _DECIMATION_CANDIDATES if thorough else _DECIMATION_QUICK_CANDIDATES
+    # Closest result within the budget, and closest result over it in case none fits.
+    best, best_deviation = None, np.inf
+    over, over_deviation = None, np.inf
+    for aggressiveness, preserve_border in candidates:
+        simplified = _quadric_decimate(base, max_triangles, aggressiveness, preserve_border)
+        if len(simplified.faces) == 0:
+            continue
+        deviation = mesh_surface_deviation(mesh, simplified)
+        if len(simplified.faces) > max_triangles:
+            if deviation < over_deviation:
+                over, over_deviation = simplified, deviation
+            continue
+        if deviation < best_deviation:
+            best, best_deviation = simplified, deviation
+        if not thorough:
+            break
+    if best is not None:
+        return best, best_deviation
+    if over is not None:
+        return over, over_deviation
+    return None
+
+
+@lru_cache(maxsize=1)
+def _decimation_fingerprint() -> bytes:
+    """Identify the decimation code and libraries, so that a change invalidates the cache."""
+    parts = [repr(_DECIMATION_CANDIDATES)]
+    for package in ("fast_simplification", "trimesh"):
+        try:
+            parts.append(f"{package}=={importlib.metadata.version(package)}")
+        except importlib.metadata.PackageNotFoundError:
+            parts.append(f"{package}==unknown")
+    for function in (_closest_decimation, _quadric_decimate, mesh_surface_deviation):
+        try:
+            parts.append(inspect.getsource(function))
+        except (OSError, TypeError):
+            parts.append(function.__qualname__)
+    return "\n".join(parts).encode()
+
+
+def _decimation_cache_path(mesh: trimesh.Trimesh, max_triangles: int) -> Path:
+    """Cache file of a mesh decimated to a budget, under :data:`runtime.cache_dir`."""
+    digest = hashlib.sha256(_decimation_fingerprint())
+    digest.update(str(max_triangles).encode())
+    for array, dtype in ((mesh.vertices, np.float64), (mesh.faces, np.int64)):
+        array = np.ascontiguousarray(array, dtype=dtype)
+        digest.update(str(array.shape).encode())
+        digest.update(array.tobytes())
+    return Path(curobo_runtime.cache_dir) / "decimated_meshes" / f"{digest.hexdigest()}.npz"
+
+
+def _load_cached_decimation(path: Path) -> Optional[Tuple[trimesh.Trimesh, float]]:
+    """Read a decimated mesh and its deviation; None when missing or unreadable."""
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            mesh = trimesh.Trimesh(vertices=data["vertices"], faces=data["faces"], process=False)
+            return mesh, float(data["deviation"])
+    except Exception as e:  # a truncated or foreign file is recomputed and rewritten
+        log_info(f"ignoring unreadable decimation cache file {path}: {e}")
+        return None
+
+
+def _store_cached_decimation(path: Path, mesh: trimesh.Trimesh, deviation: float) -> None:
+    """Write a decimated mesh atomically, so concurrent processes never read a partial file."""
+    tmp_name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            np.savez(
+                f,
+                vertices=np.asarray(mesh.vertices, dtype=np.float64),
+                faces=np.asarray(mesh.faces, dtype=np.int64),
+                deviation=np.float64(deviation),
+            )
+        os.replace(tmp_name, path)
+    except OSError as e:
+        log_info(f"could not write decimation cache file {path}: {e}")
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.remove(tmp_name)
+
+
 def decimate_mesh(
     mesh: trimesh.Trimesh,
     max_triangles: int,
@@ -235,6 +349,11 @@ def decimate_mesh(
     decimation from eating into them: on Franka's links it cuts the deviation from up to
     2.3 cm to about 1 mm.
 
+    A thorough result is cached on disk under :data:`curobo._src.runtime.cache_dir`, keyed by
+    the mesh, the budget and the decimation code, so the next start-up loads it instead of
+    decimating again. Set :data:`curobo._src.runtime.cache_decimated_meshes` to False to
+    disable the cache.
+
     A warning reports the deviation when it exceeds ``warn_deviation``. If no setting reaches
     the budget, the closest of the results over it is kept, with a warning: collision queries
     on it are slower. If decimation fails altogether, this falls back to the convex hull,
@@ -245,7 +364,8 @@ def decimate_mesh(
         max_triangles: Triangle budget. Values <= 0 disable decimation.
         link_name: Name of the link, used only to make messages actionable.
         thorough: Try every decimation setting and keep the closest result. False keeps the
-            first setting that reaches the budget, for geometry written at runtime.
+            first setting that reaches the budget, for geometry written at runtime; such
+            results are not cached.
         warn_deviation: Surface deviation in meters above which a warning is logged.
 
     Returns:
@@ -255,44 +375,27 @@ def decimate_mesh(
         return mesh
 
     label = f"link '{link_name}'" if link_name is not None else "link mesh"
-    base = mesh.copy()
-    base.merge_vertices()
-    closed = base.copy()
-    trimesh.repair.fill_holes(closed)
-    if closed.is_watertight:
-        base = closed
+    cache_path = None
+    if thorough and curobo_runtime.cache_decimated_meshes:
+        cache_path = _decimation_cache_path(mesh, max_triangles)
+    result = _load_cached_decimation(cache_path) if cache_path is not None else None
+    if result is None:
+        try:
+            result = _closest_decimation(mesh, max_triangles, thorough)
+        except Exception as e:  # fast_simplification raises various errors on bad input
+            log_warn(
+                f"quadric decimation of {label} failed ({e}); falling back to its convex "
+                "hull, which fills concave regions. Check that 'fast_simplification' is "
+                "installed."
+            )
+            result = None
+        if result is not None and cache_path is not None:
+            _store_cached_decimation(cache_path, *result)
+    if result is None:
+        hull = mesh.convex_hull
+        result = (hull, mesh_surface_deviation(mesh, hull))
+    best, best_deviation = result
 
-    candidates = _DECIMATION_CANDIDATES if thorough else _DECIMATION_QUICK_CANDIDATES
-    # Closest result within the budget, and closest result over it in case none fits.
-    best, best_deviation = None, np.inf
-    over, over_deviation = None, np.inf
-    try:
-        for aggressiveness, preserve_border in candidates:
-            simplified = _quadric_decimate(base, max_triangles, aggressiveness, preserve_border)
-            if len(simplified.faces) == 0:
-                continue
-            deviation = mesh_surface_deviation(mesh, simplified)
-            if len(simplified.faces) > max_triangles:
-                if deviation < over_deviation:
-                    over, over_deviation = simplified, deviation
-                continue
-            if deviation < best_deviation:
-                best, best_deviation = simplified, deviation
-            if not thorough:
-                break
-    except Exception as e:  # fast_simplification raises various errors on bad input
-        log_warn(
-            f"quadric decimation of {label} failed ({e}); falling back to its convex hull, "
-            "which fills concave regions. Check that 'fast_simplification' is installed."
-        )
-        best, over = None, None
-
-    if best is None:
-        if over is not None:
-            best, best_deviation = over, over_deviation
-        else:
-            best = mesh.convex_hull
-            best_deviation = mesh_surface_deviation(mesh, best)
     if len(best.faces) > max_triangles:
         log_warn(
             f"could not reduce {label} below {max_triangles} triangles "
