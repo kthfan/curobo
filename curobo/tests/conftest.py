@@ -47,10 +47,14 @@ def pytest_configure(config):
 
 # Add a hook to skip test_robot_world_model.py
 def pytest_ignore_collect(collection_path, config):
-    """Skip collection of specific test files."""
+    """Skip collection of specific test files.
+
+    Returns None for every other path, so that ``--ignore`` and other plugins still decide
+    about it: returning False would force pytest to collect the path.
+    """
     if collection_path.name == "test_robot_world_model.py":
         return True
-    return False
+    return None
 
 
 # Common fixtures
