@@ -13,6 +13,8 @@ and a box:
   with and without ``mesh_collision_check``.
 - ``self``: time the mesh self-collision query on the same configurations, and batched IK and
   ``plan_pose`` with and without ``mesh_self_collision_check`` (cuboid scene).
+- ``distance``: time the signed clearance query (``compute_robot_mesh_distance``) next to the
+  collision query at margin 0, on the same configurations, for several distance caps.
 
 Results are printed as Markdown tables and written to ``--save_path`` as Markdown and YAML.
 
@@ -25,7 +27,7 @@ Example::
 import argparse
 import os
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import curobo._src.runtime as runtime
 
@@ -40,6 +42,7 @@ import trimesh
 from curobo._src.geom.collision.wp_robot_mesh_collision import (
     check_robot_mesh_collision,
     check_robot_mesh_self_collision,
+    compute_robot_mesh_distance,
 )
 from curobo._src.geom.data.data_scene import SceneData
 from curobo._src.geom.types import Cuboid, Mesh, SceneCfg, VoxelGrid
@@ -180,14 +183,14 @@ def sphere_free_configs(solver: IKSolver, n: int) -> torch.Tensor:
     return torch.cat(samples)[:n]
 
 
-def kernel_benchmark(
+def kernel_setups(
     args: argparse.Namespace, device_cfg: DeviceCfg, scenes: Dict[str, SceneCfg]
-) -> List[Dict]:
-    """Time one mesh collision query per batch size, triangle budget, scene and margin."""
+) -> Iterator[Tuple[int, object, Dict[str, torch.Tensor], Dict[str, SceneData]]]:
+    """Per triangle budget: the robot mesh data, link transforms per configuration set and the
+    scenes, as ``(budget, robot_mesh, {(configs, batch): link_tf}, scene_data)``."""
     batch_sizes = args.kernel_batch_sizes
     n = max(batch_sizes)
     q_free = sphere_free_configs(sphere_ik_solver(device_cfg, scenes["cuboid"]), n)
-    rows = []
     for budget in args.triangle_budgets:
         robot = franka_robot(budget)
         robot["robot_cfg"]["kinematics"]["load_collision_meshes"] = True
@@ -204,45 +207,124 @@ def kernel_benchmark(
             name: SceneData.from_scene_cfg(scene, device_cfg=device_cfg)
             for name, scene in scenes.items()
         }
+        transforms = {}
         for q_name, q_all in [("sphere-free", q_free), ("random", q_random)]:
             for batch in batch_sizes:
                 state = kin.compute_kinematics(JointState.from_position(q_all[:batch]))
-                link_tf = state.link_transforms.clone()
-                env = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
-                in_collision = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
-                contact = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
-                for scene_name, data in scene_data.items():
-                    for margin in args.margins:
-
-                        def query() -> None:
-                            check_robot_mesh_collision(
-                                robot_mesh,
-                                link_tf,
-                                data,
-                                env,
-                                False,
-                                margin=margin,
-                                in_collision=in_collision,
-                                contact_link=contact,
-                            )
-
-                        t = time_ms(query, args.repeats)
-                        rows.append(
-                            {
-                                "configs": q_name,
-                                "batch": batch,
-                                "tri_budget": budget,
-                                "robot_tris": robot_mesh.total_tris,
-                                "scene": scene_name,
-                                "margin": margin,
-                                "time_ms": t,
-                                "us_per_config": 1000.0 * t / batch,
-                                "colliding_%": 100.0 * in_collision.float().mean().item(),
-                            }
-                        )
-                        print(rows[-1], flush=True)
+                transforms[(q_name, batch)] = state.link_transforms.clone()
+        yield budget, robot_mesh, transforms, scene_data
         del kin
         torch.cuda.empty_cache()
+
+
+def kernel_benchmark(
+    args: argparse.Namespace, device_cfg: DeviceCfg, scenes: Dict[str, SceneCfg]
+) -> List[Dict]:
+    """Time one mesh collision query per batch size, triangle budget, scene and margin."""
+    rows = []
+    for budget, robot_mesh, transforms, scene_data in kernel_setups(args, device_cfg, scenes):
+        for (q_name, batch), link_tf in transforms.items():
+            env = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            in_collision = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            contact = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            for scene_name, data in scene_data.items():
+                for margin in args.margins:
+
+                    def query() -> None:
+                        check_robot_mesh_collision(
+                            robot_mesh,
+                            link_tf,
+                            data,
+                            env,
+                            False,
+                            margin=margin,
+                            in_collision=in_collision,
+                            contact_link=contact,
+                        )
+
+                    t = time_ms(query, args.repeats)
+                    rows.append(
+                        {
+                            "configs": q_name,
+                            "batch": batch,
+                            "tri_budget": budget,
+                            "robot_tris": robot_mesh.total_tris,
+                            "scene": scene_name,
+                            "margin": margin,
+                            "time_ms": t,
+                            "us_per_config": 1000.0 * t / batch,
+                            "colliding_%": 100.0 * in_collision.float().mean().item(),
+                        }
+                    )
+                    print(rows[-1], flush=True)
+    return rows
+
+
+def distance_benchmark(
+    args: argparse.Namespace, device_cfg: DeviceCfg, scenes: Dict[str, SceneCfg]
+) -> List[Dict]:
+    """Time the clearance query next to the collision query, on the same configurations."""
+    rows = []
+    for budget, robot_mesh, transforms, scene_data in kernel_setups(args, device_cfg, scenes):
+        num_links = robot_mesh.num_links
+        for (q_name, batch), link_tf in transforms.items():
+            env = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            in_collision = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            contact = torch.zeros(batch, dtype=torch.int32, device=device_cfg.device)
+            link_near = torch.zeros(
+                3, batch * num_links, dtype=torch.int32, device=device_cfg.device
+            )
+            link_distance = torch.zeros(
+                batch * num_links, dtype=torch.float32, device=device_cfg.device
+            )
+            for scene_name, data in scene_data.items():
+
+                def check() -> None:
+                    check_robot_mesh_collision(
+                        robot_mesh,
+                        link_tf,
+                        data,
+                        env,
+                        False,
+                        in_collision=in_collision,
+                        contact_link=contact,
+                        link_near=link_near,
+                    )
+
+                check_ms = time_ms(check, args.repeats)
+                for max_distance in args.max_distances:
+
+                    def distance() -> torch.Tensor:
+                        return compute_robot_mesh_distance(
+                            robot_mesh,
+                            link_tf,
+                            data,
+                            env,
+                            False,
+                            max_distance=max_distance,
+                            link_distance=link_distance,
+                            link_near=link_near,
+                        )
+
+                    distance_ms = time_ms(distance, args.repeats)
+                    clearance = distance().min(dim=-1).values
+                    rows.append(
+                        {
+                            "configs": q_name,
+                            "batch": batch,
+                            "tri_budget": budget,
+                            "robot_tris": robot_mesh.total_tris,
+                            "scene": scene_name,
+                            "max_distance": max_distance,
+                            "check_ms": check_ms,
+                            "distance_ms": distance_ms,
+                            "ratio": distance_ms / check_ms,
+                            "within_cap_%": 100.0
+                            * (clearance < max_distance).float().mean().item(),
+                            "colliding_%": 100.0 * (clearance <= 0.0).float().mean().item(),
+                        }
+                    )
+                    print(rows[-1], flush=True)
     return rows
 
 
@@ -479,13 +561,16 @@ def self_collision_benchmark(
 def main() -> None:
     """Parse arguments, run the selected parts and write the report."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--part", choices=["kernel", "solver", "self", "all"], default="all")
+    parser.add_argument(
+        "--part", choices=["kernel", "solver", "self", "distance", "all"], default="all"
+    )
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--kernel_batch_sizes", type=int, nargs="+", default=[32, 512, 4096])
     parser.add_argument("--triangle_budgets", type=int, nargs="+", default=[64, 256, 1024])
     parser.add_argument("--margins", type=float, nargs="+", default=[0.0, 0.01])
+    parser.add_argument("--max_distances", type=float, nargs="+", default=[0.05, 0.1, 0.3])
     parser.add_argument("--solver_scenes", nargs="+", default=["cuboid", "mesh", "voxel"])
     parser.add_argument("--num_goals", type=int, default=200)
     parser.add_argument("--ik_batch", type=int, default=100)
@@ -529,6 +614,11 @@ def main() -> None:
             + "\n\n## Self-collision solvers\n\n"
             + to_markdown(solver_rows, list(solver_rows[0].keys()))
         )
+
+    if args.part in ("distance", "all"):
+        rows = distance_benchmark(args, device_cfg, scenes)
+        results["distance"] = rows
+        report.append("## Clearance query\n\n" + to_markdown(rows, list(rows[0].keys())))
 
     text = "\n\n".join(report)
     print(text)
