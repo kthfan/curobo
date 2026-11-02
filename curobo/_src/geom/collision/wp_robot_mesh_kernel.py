@@ -385,6 +385,12 @@ def segment_hits_triangle(
 
 
 @wp.func
+def strictly_one_side(d0: wp.float32, d1: wp.float32, d2: wp.float32) -> wp.bool:
+    """Check whether three signed volumes are all positive or all negative."""
+    return (d0 > 0.0 and d1 > 0.0 and d2 > 0.0) or (d0 < 0.0 and d1 < 0.0 and d2 < 0.0)
+
+
+@wp.func
 def triangles_intersect(
     a0: wp.vec3,
     a1: wp.vec3,
@@ -403,6 +409,11 @@ def triangles_intersect(
     """
     na = wp.cross(a1 - a0, a2 - a0)
     nb = wp.cross(b1 - b0, b2 - b0)
+    # Most candidate pairs have one triangle wholly on one side of the other's plane.
+    if strictly_one_side(wp.dot(na, b0 - a0), wp.dot(na, b1 - a0), wp.dot(na, b2 - a0)):
+        return False
+    if strictly_one_side(wp.dot(nb, a0 - b0), wp.dot(nb, a1 - b0), wp.dot(nb, a2 - b0)):
+        return False
     if segment_hits_triangle(a0, a1, b0, b1, b2, nb):
         return True
     if segment_hits_triangle(a1, a2, b0, b1, b2, nb):
