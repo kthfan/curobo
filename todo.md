@@ -11,6 +11,14 @@ Priority: **P1** fix first, **P2** next, **P3** later / research.
 
 ## 1. Performance
 
+- [ ] **P1 – `max_batch_size > 1` crashes; fix before raising the default below.**
+  `_solve_segment_edges` (`multi_waypoint_planner.py:315`) cuts the edges into chunks of
+  `max_batch_size`; when the edge count is not a multiple of it, the last, smaller chunk
+  raises a tensor size mismatch in trajectory optimization, which expects the batch size it
+  was built for. Found on `dev/mesh_followups` while speeding up the tests (they use the
+  default `max_batch_size` of 1). Likely fix: pad the last chunk to `max_batch_size` by repeating its
+  last edge and drop the padded results. Add a test whose edge count is not a multiple of
+  the batch size.
 - [ ] **P1 – Edges are solved one at a time by default.** `_solve_segment_edges` chunks edges
   by `trajopt_solver.config.max_batch_size` (`multi_waypoint_planner.py:313`), and
   `MotionPlannerCfg.create` defaults `max_batch_size` to 1. With ~8 IK nodes per layer a
