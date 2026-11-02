@@ -21,6 +21,7 @@ import warp as wp
 from curobo._src.geom.collision.wp_robot_mesh_distance_kernel import (
     robot_cuboid_distance_kernel,
     robot_mesh_distance_kernel,
+    robot_vertex_bound_kernel,
     robot_voxel_distance_kernel,
 )
 from curobo._src.geom.collision.wp_robot_mesh_kernel import (
@@ -301,17 +302,29 @@ def compute_robot_mesh_distance(
         (scene.meshes, robot_mesh_distance_kernel, [wp.uint8(check_containment)]),
         (scene.voxels, robot_voxel_distance_kernel, []),
     ]
+    launches = []
     for row, (obstacles, kernel, extra) in enumerate(obstacle_sets):
         if obstacles is None:
             continue
         obs_wp = obstacles.to_warp()
         near_wp = flag_near_links(obs_wp, link_near[row])
+        inputs = [robot_wp, obs_wp, env_idx_wp, distance_wp, near_wp, *common]
+        launches.append((kernel, inputs, extra))
+
+    # Seed every link with the distance of its vertices to all cuboids and meshes first, so the
+    # exact kernels start from a tight bound and skip the triangles that cannot come closer.
+    for kernel, inputs, _ in launches:
+        if kernel is not robot_voxel_distance_kernel:
+            wp.launch(
+                kernel=robot_vertex_bound_kernel,
+                dim=dim,
+                inputs=inputs,
+                stream=stream,
+                device=wp_device,
+            )
+    for kernel, inputs, extra in launches:
         wp.launch(
-            kernel=kernel,
-            dim=dim,
-            inputs=[robot_wp, obs_wp, env_idx_wp, distance_wp, near_wp, *common, *extra],
-            stream=stream,
-            device=wp_device,
+            kernel=kernel, dim=dim, inputs=[*inputs, *extra], stream=stream, device=wp_device
         )
     return link_distance.view(batch_horizon, robot_mesh.num_links)
 

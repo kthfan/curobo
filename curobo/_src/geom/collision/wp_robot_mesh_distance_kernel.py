@@ -19,7 +19,16 @@ skipped by the scene check, report ``max_distance`` as well.
 Parallelization matches the collision kernels: one thread per ``(configuration, robot
 triangle)``, each folding its distance into its link's entry with an atomic minimum. The
 kernels are forward-only: there is no gradient.
+
+Cuboids and meshes take two passes. :func:`robot_vertex_bound_kernel` first writes the
+distance of the link's vertices to the scene, an upper bound on the link's distance. The exact
+kernels then start from that bound and skip every triangle that cannot come closer, which keeps
+large caps and dense meshes affordable: without it, every triangle would test every obstacle
+feature within ``max_distance``.
 """
+
+# Standard Library
+from typing import Any
 
 # Third Party
 import warp as wp
@@ -175,9 +184,125 @@ def deepest_vertex(
     return wp.min(wp.min(wp.min(s0, s1), s2), 0.0)
 
 
+@wp.func
+def triangle_centroid_radius(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3) -> wp.vec4:
+    """Centroid of a triangle and the largest distance from it to a vertex, as ``(c, r)``.
+
+    Every point of the triangle lies within ``r`` of the centroid, so an obstacle whose
+    distance to the centroid is ``d`` is at least ``d - r`` away from the triangle.
+    """
+    c = (a0 + a1 + a2) / 3.0
+    r = wp.max(wp.length(a0 - c), wp.max(wp.length(a1 - c), wp.length(a2 - c)))
+    return wp.vec4(c[0], c[1], c[2], r)
+
+
+@wp.func
+def aabb_dist_sq(lo0: wp.vec3, hi0: wp.vec3, lo1: wp.vec3, hi1: wp.vec3) -> wp.float32:
+    """Squared distance between two axis-aligned boxes, 0 where they overlap."""
+    gap = wp.vec3(
+        wp.max(wp.max(lo0[0] - hi1[0], lo1[0] - hi0[0]), 0.0),
+        wp.max(wp.max(lo0[1] - hi1[1], lo1[1] - hi0[1]), 0.0),
+        wp.max(wp.max(lo0[2] - hi1[2], lo1[2] - hi0[2]), 0.0),
+    )
+    return wp.dot(gap, gap)
+
+
+@wp.func
+def vertex_bound(
+    obs: CuboidDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    p: wp.vec3,
+    cap: wp.float32,
+) -> wp.float32:
+    """Signed distance from a link vertex to a cuboid, an upper bound on the link's distance."""
+    return compute_local_sdf(obs, env_idx, o, p)
+
+
+@wp.func
+def vertex_bound(  # noqa: F811 -- Warp overload for mesh obstacles.
+    obs: MeshDataWarp,
+    env_idx: wp.int32,
+    o: wp.int32,
+    p: wp.vec3,
+    cap: wp.float32,
+) -> wp.float32:
+    """Unsigned distance from a link vertex to a mesh surface, or ``cap`` when it is farther.
+
+    The unsigned distance bounds the link's distance from above with or without containment,
+    and skips the ray casts that decide the sign.
+    """
+    mesh_id = obs.mesh_ids[env_idx * obs.max_n + o]
+    query = wp.mesh_query_point_no_sign(mesh_id, p, cap)
+    if not query.result:
+        return cap
+    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+    return wp.length(closest - p)
+
+
 # =============================================================================
 # Kernels
 # =============================================================================
+
+
+@wp.kernel(enable_backward=False)
+def robot_vertex_bound_kernel(
+    robot: RobotMeshWarp,
+    obs: Any,
+    env_query_idx: wp.array(dtype=wp.int32),
+    link_distance: wp.array(dtype=wp.float32),
+    link_near: wp.array(dtype=wp.int32),
+    batch_horizon: wp.int32,
+    horizon: wp.int32,
+    max_distance: wp.float32,
+    use_multi_env: wp.uint8,
+):
+    """Lower each link's distance to the distance of its vertices to cuboids or meshes.
+
+    The distance from any point of a link to an obstacle bounds the link's distance from
+    above, so the exact kernels can start from it and skip the triangles that cannot come
+    closer. Run it for every cuboid and mesh set before the exact kernels.
+
+    Args:
+        robot: Robot collision triangles and per-link transforms.
+        obs: Cuboid or mesh obstacle set.
+        env_query_idx: Environment index per batch element.
+        link_distance: Output per (configuration, link), pre-filled with ``max_distance``.
+        link_near: Per (configuration, link) flag from ``robot_link_near_kernel``.
+        batch_horizon: Number of configurations (batch * horizon).
+        horizon: Time steps per batch element; maps a configuration to its batch index.
+        max_distance: Distance cap.
+        use_multi_env: If 1, look up the environment from ``env_query_idx``.
+    """
+    tid = wp.tid()
+    cfg_idx = tid / robot.total_tris
+    tri_idx = tid - cfg_idx * robot.total_tris
+    if cfg_idx >= batch_horizon:
+        return
+
+    link_idx = robot.tri_link[tri_idx]
+    if link_idx < 0:
+        return
+    row = cfg_idx * robot.num_links + link_idx
+    if link_near[row] == 0:
+        return
+
+    env_idx = wp.int32(0)
+    if use_multi_env == wp.uint8(1):
+        env_idx = env_query_idx[cfg_idx / horizon]
+
+    best = max_distance
+    n_obs = obs.n_per_env[env_idx]
+    for o in range(n_obs):
+        if not is_obs_enabled(obs, env_idx, o):
+            continue
+        inv_tf = load_obstacle_transform(obs, env_idx, o)
+        for k in range(3):
+            p = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + k])
+            best = wp.min(best, vertex_bound(obs, env_idx, o, wp.transform_point(inv_tf, p), best))
+
+    if best < max_distance:
+        wp.atomic_min(link_distance, row, best)
 
 
 @wp.kernel(enable_backward=False)
@@ -229,7 +354,8 @@ def robot_cuboid_distance_kernel(
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
 
-    best = max_distance
+    # The vertex bound, possibly already lowered by other triangles of the link.
+    best = link_distance[row]
     n_obs = obs.n_per_env[env_idx]
     for o in range(n_obs):
         if not is_obs_enabled(obs, env_idx, o):
@@ -239,16 +365,21 @@ def robot_cuboid_distance_kernel(
         a0 = wp.transform_point(inv_tf, v0_w)
         a1 = wp.transform_point(inv_tf, v1_w)
         a2 = wp.transform_point(inv_tf, v2_w)
-        half = wp.vec3(obs.dims[flat, 0] * 0.5, obs.dims[flat, 1] * 0.5, obs.dims[flat, 2] * 0.5)
 
+        # The box SDF changes no faster than the distance, so no point of the triangle, and
+        # hence neither a crossing's deepest vertex nor a gap, comes below ``lower``.
+        cr = triangle_centroid_radius(a0, a1, a2)
+        lower = compute_local_sdf(obs, env_idx, o, wp.vec3(cr[0], cr[1], cr[2])) - cr[3]
+        if lower >= best:
+            continue
+
+        half = wp.vec3(obs.dims[flat, 0] * 0.5, obs.dims[flat, 1] * 0.5, obs.dims[flat, 2] * 0.5)
         s0 = compute_local_sdf(obs, env_idx, o, a0)
         s1 = compute_local_sdf(obs, env_idx, o, a1)
         s2 = compute_local_sdf(obs, env_idx, o, a2)
         if triangle_box_overlap(a0, a1, a2, half):
             best = wp.min(best, deepest_vertex(s0, s1, s2))
-        elif wp.min(s0, wp.min(s1, s2)) - wp.length(a1 - a0) - wp.length(a2 - a0) < best:
-            # Skip the exact test when even the nearest vertex is too far for any point of
-            # the triangle to come closer than ``best``.
+        else:
             best = wp.min(best, wp.sqrt(triangle_box_dist_sq(a0, a1, a2, half, s0, s1, s2)))
 
     if best < max_distance:
@@ -306,7 +437,8 @@ def robot_mesh_distance_kernel(
     v1_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 1])
     v2_w = transform_point_link(robot.link_tf, row, robot.tri_verts[tri_idx * 3 + 2])
 
-    best = max_distance
+    # The vertex bound, possibly already lowered by other triangles of the link.
+    best = link_distance[row]
     n_obs = obs.n_per_env[env_idx]
     for o in range(n_obs):
         if not is_obs_enabled(obs, env_idx, o):
@@ -318,21 +450,40 @@ def robot_mesh_distance_kernel(
         a1 = wp.transform_point(inv_tf, v1_w)
         a2 = wp.transform_point(inv_tf, v2_w)
 
-        # Only obstacle triangles within ``best`` of this triangle's box can lower it.
-        best_sq = best * best
+        # A surface farther than ``r + best`` from the centroid can neither cross the triangle
+        # nor come closer than ``best``; only containment is left to check.
+        cr = triangle_centroid_radius(a0, a1, a2)
+        centroid = wp.vec3(cr[0], cr[1], cr[2])
+        near = wp.mesh_query_point_no_sign(mesh_id, centroid, cr[3] + wp.max(best, 0.0))
+        best_sq = wp.float32(0.0)
         crossing = wp.bool(False)
-        query = wp.mesh_query_aabb(
-            mesh_id, tri_aabb_lo(a0, a1, a2, best), tri_aabb_hi(a0, a1, a2, best)
-        )
-        obs_tri = wp.int32(0)
-        while wp.mesh_query_aabb_next(query, obs_tri):
-            b0 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 0)
-            b1 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 1)
-            b2 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 2)
-            if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
-                crossing = True
-                break
-            best_sq = wp.min(best_sq, triangle_triangle_dist_sq(a0, a1, a2, b0, b1, b2))
+        if near.result:
+            # The centroid is a point of the triangle: its distance to the surface bounds the
+            # triangle's, unless the triangle turns out to be inside.
+            closest = wp.mesh_eval_position(mesh_id, near.face, near.u, near.v)
+            reach = wp.min(wp.max(best, 0.0), wp.length(closest - centroid))
+            best_sq = reach * reach
+            lo = tri_aabb_lo(a0, a1, a2, 0.0)
+            hi = tri_aabb_hi(a0, a1, a2, 0.0)
+            # Only obstacle triangles within ``reach`` of this triangle's box can lower it.
+            query = wp.mesh_query_aabb(
+                mesh_id, tri_aabb_lo(a0, a1, a2, reach), tri_aabb_hi(a0, a1, a2, reach)
+            )
+            obs_tri = wp.int32(0)
+            while wp.mesh_query_aabb_next(query, obs_tri):
+                b0 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 0)
+                b1 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 1)
+                b2 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 2)
+                gap_sq = aabb_dist_sq(
+                    lo, hi, tri_aabb_lo(b0, b1, b2, 0.0), tri_aabb_hi(b0, b1, b2, 0.0)
+                )
+                if gap_sq == 0.0:
+                    if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
+                        crossing = True
+                        break
+                # Boxes farther apart than ``best`` hold no closer pair of points.
+                if gap_sq < best_sq:
+                    best_sq = wp.min(best_sq, triangle_triangle_dist_sq(a0, a1, a2, b0, b1, b2))
 
         if crossing:
             depth = wp.float32(0.0)
@@ -354,7 +505,8 @@ def robot_mesh_distance_kernel(
                 s2 = compute_local_sdf(obs, env_idx, o, a2)
                 best = wp.min(best, deepest_vertex(s0, s1, s2))
                 continue
-        best = wp.min(best, wp.sqrt(best_sq))
+        if near.result:
+            best = wp.min(best, wp.sqrt(best_sq))
 
     if best < max_distance:
         wp.atomic_min(link_distance, row, best)

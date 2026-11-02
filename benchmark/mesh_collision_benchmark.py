@@ -136,9 +136,23 @@ def scene_triangles(scene: SceneCfg) -> int:
     return sum(len(m.faces) for m in (scene.mesh or []))
 
 
-def time_ms(fn: Callable[[], object], repeats: int, warmup: int = 3) -> float:
-    """Median time of ``fn`` in milliseconds, measured with CUDA events."""
-    for _ in range(warmup):
+def time_ms(
+    fn: Callable[[], object], repeats: int, warmup: int = 3, budget_s: Optional[float] = None
+) -> float:
+    """Median time of ``fn`` in milliseconds, measured with CUDA events.
+
+    At least two warmup calls run, and the second (the first may load kernels) is timed.
+    When ``warmup + repeats`` calls of that length would exceed ``budget_s``, the rest of the
+    warmup is skipped and fewer calls are timed (at least 3), so slow rows stay bounded.
+    """
+    fn()
+    timer = CudaEventTimer().start()
+    fn()
+    elapsed_s = timer.stop()
+    calls = warmup + repeats if budget_s is None else int(budget_s / max(elapsed_s, 1.0e-6))
+    if calls < warmup + repeats:
+        warmup, repeats = 2, max(min(calls, repeats), 3)
+    for _ in range(warmup - 2):
         fn()
     times = []
     for _ in range(repeats):
@@ -186,8 +200,10 @@ def sphere_free_configs(solver: IKSolver, n: int) -> torch.Tensor:
 def kernel_setups(
     args: argparse.Namespace, device_cfg: DeviceCfg, scenes: Dict[str, SceneCfg]
 ) -> Iterator[Tuple[int, object, Dict[str, torch.Tensor], Dict[str, SceneData]]]:
-    """Per triangle budget: the robot mesh data, link transforms per configuration set and the
-    scenes, as ``(budget, robot_mesh, {(configs, batch): link_tf}, scene_data)``."""
+    """Yield the inputs of the kernel rows, one triangle budget at a time.
+
+    Each item is ``(budget, robot_mesh, {(configs, batch): link_tf}, scene_data)``.
+    """
     batch_sizes = args.kernel_batch_sizes
     n = max(batch_sizes)
     q_free = sphere_free_configs(sphere_ik_solver(device_cfg, scenes["cuboid"]), n)
@@ -242,7 +258,7 @@ def kernel_benchmark(
                             contact_link=contact,
                         )
 
-                    t = time_ms(query, args.repeats)
+                    t = time_ms(query, args.repeats, budget_s=args.row_budget_s)
                     rows.append(
                         {
                             "configs": q_name,
@@ -291,7 +307,7 @@ def distance_benchmark(
                         link_near=link_near,
                     )
 
-                check_ms = time_ms(check, args.repeats)
+                check_ms = time_ms(check, args.repeats, budget_s=args.row_budget_s)
                 for max_distance in args.max_distances:
 
                     def distance() -> torch.Tensor:
@@ -306,7 +322,7 @@ def distance_benchmark(
                             link_near=link_near,
                         )
 
-                    distance_ms = time_ms(distance, args.repeats)
+                    distance_ms = time_ms(distance, args.repeats, budget_s=args.row_budget_s)
                     clearance = distance().min(dim=-1).values
                     rows.append(
                         {
@@ -517,7 +533,7 @@ def self_collision_benchmark(
                             pair_near=near,
                         )
 
-                    t = time_ms(query, args.repeats)
+                    t = time_ms(query, args.repeats, budget_s=args.row_budget_s)
                     rows.append(
                         {
                             "configs": q_name,
@@ -567,6 +583,12 @@ def main() -> None:
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--row_budget_s",
+        type=float,
+        default=10.0,
+        help="Time budget per kernel row; slow rows are timed fewer times.",
+    )
     parser.add_argument("--kernel_batch_sizes", type=int, nargs="+", default=[32, 512, 4096])
     parser.add_argument("--triangle_budgets", type=int, nargs="+", default=[64, 256, 1024])
     parser.add_argument("--margins", type=float, nargs="+", default=[0.0, 0.01])

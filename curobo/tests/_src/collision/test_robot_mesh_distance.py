@@ -224,6 +224,47 @@ def test_cuboid_and_mesh_of_the_same_box_agree():
     assert torch.allclose(cuboid, mesh, atol=1.0e-5)
 
 
+def test_dense_mesh_agrees_with_the_cuboid():
+    """A box subdivided into 2 cm triangles gives the cuboid's distances.
+
+    Many obstacle triangles sit within the cap of each link triangle, so this exercises the
+    bound that lets the mesh kernel skip most of them.
+
+    ``wp.intersect_tri_tri`` compares unnormalized plane distances with a fixed epsilon, so
+    it reports small triangles a few millimeters away as crossing; there the mesh may only
+    report less than the cuboid.
+    """
+    dims = (0.3, 0.2, 0.1)
+    vertices, faces = trimesh.remesh.subdivide_to_size(
+        *(lambda b: (b.vertices, b.faces))(trimesh.creation.box(extents=dims)), 0.02
+    )
+    dense = SceneData.from_scene_cfg(
+        SceneCfg(mesh=[_mesh("dense", trimesh.Trimesh(vertices=vertices, faces=faces))]),
+        device_cfg=DEVICE_CFG,
+    )
+    tf = _random_transforms(4, 256, 2, -0.35, 0.35)
+    cuboid = _distance(_two_link_robot(), _cuboid_scene(dims), tf, max_distance=0.2)
+    mesh = _distance(_two_link_robot(), dense, tf, max_distance=0.2)
+    assert len(faces) > 1000
+    assert ((cuboid > 0) & (cuboid < 0.2)).sum() > 100 and (cuboid < 0).sum() > 10
+    snapped = (cuboid >= 0.0) & (cuboid < 0.01)
+    assert torch.allclose(cuboid[~snapped], mesh[~snapped], atol=1.0e-5)
+    assert torch.all(mesh[snapped] <= cuboid[snapped] + 1.0e-5)
+
+
+@pytest.mark.parametrize("scene_type", ["cuboid", "mesh"])
+def test_distance_below_the_cap_does_not_depend_on_the_cap(scene_type):
+    """A larger cap only reveals farther links; it never changes a distance below the cap."""
+    scene = EXACT_SCENES[scene_type]((0.3, 0.2, 0.1))
+    tf = _random_transforms(5, 256, 2, -0.35, 0.35)
+    small = _distance(_two_link_robot(), scene, tf, max_distance=0.05)
+    large = _distance(_two_link_robot(), scene, tf, max_distance=0.5)
+    below = large < 0.05
+    assert below.sum() > 50 and (~below).sum() > 50
+    assert torch.allclose(small[below], large[below], atol=1.0e-6)
+    assert torch.all(small[~below] == 0.05)
+
+
 @pytest.mark.parametrize("scene_type", ["cuboid", "mesh"])
 def test_penetration_is_the_deepest_vertex(scene_type):
     """The link's face at x = 0.12 is 3 cm inside the box face at x = 0.15."""
