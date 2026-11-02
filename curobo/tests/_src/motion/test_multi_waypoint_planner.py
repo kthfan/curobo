@@ -457,9 +457,13 @@ def cuda_device_cfg():
 
 @pytest.fixture(scope="module")
 def planner(cuda_device_cfg):
+    # Up to 10 x 10 edges per segment would each run trajectory optimization; keeping the 16
+    # nearest pairs still exercises the graph search, and takes the slowest test from 3-5 min
+    # to under one.
     config = MultiWaypointMotionPlannerCfg.create(
         robot="franka.yml",
         ik_return_seeds=10,
+        max_edges_per_layer_pair=16,
         device_cfg=cuda_device_cfg,
         num_ik_seeds=16,
         num_trajopt_seeds=2,
