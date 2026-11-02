@@ -79,6 +79,9 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   self-collision check and the clearance query. Only reachable where a link triangle's box
   straddles the obstacle triangle's plane, so tessellated curved or tilted surfaces, not
   axis-aligned faces.
+  Benchmark (T4, margin 0): mesh and dense-mesh colliding rates now equal the cuboid scene's
+  in every row (before: e.g. 17.11 % vs 16.97 %); with a sign-only plane reject first, the
+  dense-mesh check is as fast as before or faster (batch 4096, budget 256: 31.7 -> 30.0 ms).
 
 ## Open items
 
