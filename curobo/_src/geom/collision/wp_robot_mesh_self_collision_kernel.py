@@ -21,6 +21,7 @@ from curobo._src.geom.collision.wp_robot_mesh_kernel import (
     LINK_CULL_EPS,
     tri_aabb_hi,
     tri_aabb_lo,
+    triangles_intersect,
     triangles_within,
 )
 from curobo._src.geom.data.data_robot_mesh import RobotMeshWarp, transform_point_link
@@ -179,7 +180,7 @@ def robot_self_collision_kernel(
         b0 = wp.mesh_get_point(mesh_id, face * 3 + 0)
         b1 = wp.mesh_get_point(mesh_id, face * 3 + 1)
         b2 = wp.mesh_get_point(mesh_id, face * 3 + 2)
-        hit = wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0
+        hit = triangles_intersect(a0, a1, a2, b0, b1, b2)
         if not hit and margin_sq > 0.0:
             hit = triangles_within(a0, a1, a2, b0, b1, b2, margin_sq)
         if hit:

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 import trimesh
+import warp as wp
 
 # CuRobo
 import curobo._src.geom.data.data_robot_mesh as data_robot_mesh
@@ -16,6 +17,7 @@ from curobo._src.geom.collision.wp_robot_mesh_collision import (
     check_robot_mesh_collision,
     check_robot_mesh_self_collision,
 )
+from curobo._src.geom.collision.wp_robot_mesh_kernel import triangles_intersect
 from curobo._src.geom.data.data_robot_mesh import (
     RobotMeshData,
     decimate_mesh,
@@ -179,6 +181,145 @@ def test_mesh_containment_requires_the_flag(robot_mesh):
     tf = _link_transforms([0.0])
     assert _check(robot_mesh, scene, tf, check_containment=False)[0].tolist() == [0]
     assert _check(robot_mesh, scene, tf, check_containment=True)[0].tolist() == [1]
+
+
+@wp.kernel(enable_backward=False)
+def _triangles_intersect_kernel(
+    a: wp.array(dtype=wp.vec3), b: wp.array(dtype=wp.vec3), hit: wp.array(dtype=wp.int32)
+):
+    i = wp.tid()
+    if triangles_intersect(
+        a[3 * i], a[3 * i + 1], a[3 * i + 2], b[3 * i], b[3 * i + 1], b[3 * i + 2]
+    ):
+        hit[i] = 1
+
+
+def _intersect(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Run ``triangles_intersect`` on triangle pairs ``a[i], b[i]`` of shape ``[n, 3, 3]``."""
+    device = wp.device_from_torch(DEVICE_CFG.device)
+    n = a.shape[0]
+    hit = wp.zeros(n, dtype=wp.int32, device=device)
+    wp.launch(
+        _triangles_intersect_kernel,
+        dim=n,
+        inputs=[
+            wp.array(a.reshape(-1, 3).astype(np.float32), dtype=wp.vec3, device=device),
+            wp.array(b.reshape(-1, 3).astype(np.float32), dtype=wp.vec3, device=device),
+            hit,
+        ],
+        device=device,
+    )
+    return hit.numpy().astype(bool)
+
+
+def test_triangles_intersect_ignores_small_triangles_millimeters_away():
+    """A 2 cm obstacle triangle 7 mm from a link triangle does not intersect it.
+
+    ``wp.intersect_tri_tri`` reports a crossing here, because its epsilon applies to
+    unnormalized plane distances.
+    """
+    link = np.array(
+        [
+            [0.04657, 0.13545, -0.09712],
+            [-0.07687, 0.16387, -0.03423],
+            [-0.02679, 0.08042, -0.05724],
+        ]
+    )
+    obstacle = np.array(
+        [[-0.0375, 0.075, -0.05], [-0.046875, 0.08125, -0.05], [-0.0375, 0.0875, -0.05]]
+    )
+    assert not _intersect(link[None], obstacle[None])[0]
+    assert not _intersect(obstacle[None], link[None])[0]
+
+
+def test_triangles_intersect_does_not_depend_on_scale():
+    """Random pairs give the same answers at 1 m, 1 cm and 1 mm, in either order."""
+    rng = np.random.default_rng(0)
+    a = rng.uniform(-1.0, 1.0, size=(4000, 3, 3))
+    b = rng.uniform(-1.0, 1.0, size=(4000, 3, 3))
+    hit = _intersect(a, b)
+    assert 0.1 < hit.mean() < 0.9
+    for scale in (1.0e-2, 1.0e-3):
+        assert np.array_equal(_intersect(a * scale, b * scale), hit)
+    assert np.array_equal(_intersect(b, a), hit)
+
+
+def test_triangles_intersect_matches_the_distance_away_from_contact():
+    """Pairs at least 1 mm apart never intersect; pairs whose edge pierces the other do."""
+    rng = np.random.default_rng(1)
+    a = rng.uniform(-0.01, 0.01, size=(2000, 3, 3))
+    b = rng.uniform(-0.01, 0.01, size=(2000, 3, 3))
+    lift = np.zeros(3)
+    lift[2] = 0.021 + 0.001
+    # Lifting one triangle above the other's bounding slab separates them by at least 1 mm.
+    apart = _intersect(a, b + lift)
+    assert not apart.any()
+    # A vertical segment through the centroid of a horizontal triangle pierces it.
+    flat = rng.uniform(-0.01, 0.01, size=(2000, 3, 3))
+    flat[:, :, 2] = 0.0
+    centroid = flat.mean(axis=1)
+    spike = np.stack(
+        [centroid + [0, 0, -0.003], centroid + [0, 0, 0.003], centroid + [0.002, 0, 0.003]], axis=1
+    )
+    assert _intersect(flat, spike).all() and _intersect(spike, flat).all()
+
+
+def test_triangles_intersect_coplanar_and_degenerate_pairs():
+    tri = np.array([[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [0.0, 0.02, 0.0]])
+    overlapping = tri + [0.005, 0.005, 0.0]
+    shared_edge = np.array([[0.02, 0.0, 0.0], [0.0, 0.02, 0.0], [0.02, 0.02, 0.0]])
+    apart = tri + [0.03, 0.0, 0.0]
+    lifted = tri + [0.0, 0.0, 1.0e-4]
+    inside = tri * 0.2 + [0.002, 0.002, 0.0]
+    # A degenerate (collinear) triangle crossing the plane inside, and one beside it.
+    needle = np.array([[0.004, 0.004, -0.01], [0.004, 0.004, 0.01], [0.004, 0.004, 0.0]])
+    beside = needle + [0.03, 0.0, 0.0]
+    pairs = [overlapping, shared_edge, apart, lifted, inside, needle, beside]
+    expected = [True, True, False, False, True, True, False]
+    others = np.stack(pairs)
+    tris = np.repeat(tri[None], len(pairs), axis=0)
+    assert _intersect(tris, others).tolist() == expected
+    assert _intersect(others, tris).tolist() == expected
+
+
+def _rotation(rx: float, ry: float, rz: float) -> np.ndarray:
+    """Rotation matrix ``Rz @ Ry @ Rx`` for angles in radians."""
+    cx, sx, cy, sy, cz, sz = np.cos(rx), np.sin(rx), np.cos(ry), np.sin(ry), np.cos(rz), np.sin(rz)
+    rot_x = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    rot_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rot_z = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return rot_z @ rot_y @ rot_x
+
+
+def test_mesh_obstacle_with_small_triangles_keeps_millimeter_gaps():
+    """A corner of the turned link approaches a sphere tessellated into 1.3 cm triangles.
+
+    The corner lies on the line from the sphere's center through it, so the gap is measured
+    along that line; the facets sit at most 0.1 mm inside the sphere. 1 and 3 mm gaps are
+    free, a 1 mm overlap is not. ``wp.intersect_tri_tri`` reported the 1 mm gap as a
+    crossing. Link culling is disabled so that every triangle pair reaches the narrowphase.
+    """
+    robot_mesh = RobotMeshData.from_link_meshes(
+        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
+        link_name_to_idx_map={"l0": 0},
+        num_links=1,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+    )
+    robot_mesh.link_bounds[:, 3] = 1.0e3
+    radius = 0.3
+    sphere = trimesh.creation.icosphere(subdivisions=4, radius=radius)
+    scene = _mesh_scene("sphere", sphere)
+    rot = _rotation(0.3, 0.5, 0.7)
+    corner = rot @ np.array([-0.1, -0.1, -0.1])
+    direction = -corner / np.linalg.norm(corner)
+    tf = _link_transforms([0.0, 0.0, 0.0])
+    for i, gap in enumerate((0.003, 0.001, -0.001)):
+        center = direction * (radius + gap + np.linalg.norm(corner))
+        tf[i, 0, 0, :, :3] = torch.as_tensor(rot, dtype=torch.float32)
+        tf[i, 0, 0, :, 3] = torch.as_tensor(center, dtype=torch.float32)
+    coll, _ = _check(robot_mesh, scene, tf, check_containment=False)
+    assert coll.tolist() == [0, 0, 1]
 
 
 def _mesh_scene(name: str, tri_mesh: trimesh.Trimesh, pose=None) -> SceneData:

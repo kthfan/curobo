@@ -229,10 +229,6 @@ def test_dense_mesh_agrees_with_the_cuboid():
 
     Many obstacle triangles sit within the cap of each link triangle, so this exercises the
     bound that lets the mesh kernel skip most of them.
-
-    ``wp.intersect_tri_tri`` compares unnormalized plane distances with a fixed epsilon, so
-    it reports small triangles a few millimeters away as crossing; there the mesh may only
-    report less than the cuboid.
     """
     dims = (0.3, 0.2, 0.1)
     vertices, faces = trimesh.remesh.subdivide_to_size(
@@ -247,9 +243,7 @@ def test_dense_mesh_agrees_with_the_cuboid():
     mesh = _distance(_two_link_robot(), dense, tf, max_distance=0.2)
     assert len(faces) > 1000
     assert ((cuboid > 0) & (cuboid < 0.2)).sum() > 100 and (cuboid < 0).sum() > 10
-    snapped = (cuboid >= 0.0) & (cuboid < 0.01)
-    assert torch.allclose(cuboid[~snapped], mesh[~snapped], atol=1.0e-5)
-    assert torch.all(mesh[snapped] <= cuboid[snapped] + 1.0e-5)
+    assert torch.allclose(cuboid, mesh, atol=1.0e-5)
 
 
 @pytest.mark.parametrize("scene_type", ["cuboid", "mesh"])

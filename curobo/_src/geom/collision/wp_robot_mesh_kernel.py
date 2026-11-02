@@ -329,6 +329,93 @@ def segment_segment_dist_sq(
     return wp.dot(diff, diff)
 
 
+#: Squared distance below which a segment lying in a triangle's plane touches the triangle.
+COPLANAR_TOUCH_SQ = wp.constant(1.0e-14)
+
+
+@wp.func
+def point_in_triangle(x: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3, n: wp.vec3) -> wp.bool:
+    """Check whether ``x``, in the plane of triangle ``abc`` with normal ``n``, lies inside it.
+
+    The boundary counts as inside. Only signs are compared, so the test does not depend on the
+    triangle's size.
+    """
+    if wp.dot(wp.cross(b - a, x - a), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(c - b, x - b), n) < 0.0:
+        return False
+    if wp.dot(wp.cross(a - c, x - c), n) < 0.0:
+        return False
+    return True
+
+
+@wp.func
+def segment_hits_triangle(
+    p: wp.vec3,
+    q: wp.vec3,
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    n: wp.vec3,
+) -> wp.bool:
+    """Check whether segment ``pq`` touches triangle ``abc`` with normal ``n``.
+
+    The endpoints' signed volumes against the triangle's plane decide whether the segment
+    reaches the plane, and the crossing point is then tested against the triangle's edges. A
+    segment lying in the plane is tested in 2D: an endpoint inside, or an edge it touches.
+    A degenerate triangle has no inside and never reports a hit; its edges are tested
+    against the other triangle instead.
+    """
+    if wp.dot(n, n) <= 1.0e-30:
+        return False
+    dp = wp.dot(n, p - a)
+    dq = wp.dot(n, q - a)
+    if (dp > 0.0 and dq > 0.0) or (dp < 0.0 and dq < 0.0):
+        return False
+    if dp == 0.0 and dq == 0.0:
+        if point_in_triangle(p, a, b, c, n) or point_in_triangle(q, a, b, c, n):
+            return True
+        if segment_segment_dist_sq(p, q, a, b) <= COPLANAR_TOUCH_SQ:
+            return True
+        if segment_segment_dist_sq(p, q, b, c) <= COPLANAR_TOUCH_SQ:
+            return True
+        return segment_segment_dist_sq(p, q, c, a) <= COPLANAR_TOUCH_SQ
+    x = p + (q - p) * (dp / (dp - dq))
+    return point_in_triangle(x, a, b, c, n)
+
+
+@wp.func
+def triangles_intersect(
+    a0: wp.vec3,
+    a1: wp.vec3,
+    a2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+) -> wp.bool:
+    """Check whether two triangles intersect or touch.
+
+    Two triangles meet exactly when an edge of one touches the other: the ends of their common
+    segment lie on their boundaries. The test only compares signs of signed volumes, so,
+    unlike ``wp.intersect_tri_tri``, whose fixed epsilon on unnormalized plane distances
+    reports small triangles several millimeters apart as crossing, it does not depend on the
+    triangles' size.
+    """
+    na = wp.cross(a1 - a0, a2 - a0)
+    nb = wp.cross(b1 - b0, b2 - b0)
+    if segment_hits_triangle(a0, a1, b0, b1, b2, nb):
+        return True
+    if segment_hits_triangle(a1, a2, b0, b1, b2, nb):
+        return True
+    if segment_hits_triangle(a2, a0, b0, b1, b2, nb):
+        return True
+    if segment_hits_triangle(b0, b1, a0, a1, a2, na):
+        return True
+    if segment_hits_triangle(b1, b2, a0, a1, a2, na):
+        return True
+    return segment_hits_triangle(b2, b0, a0, a1, a2, na)
+
+
 @wp.func
 def triangles_within(
     a0: wp.vec3,
@@ -344,7 +431,7 @@ def triangles_within(
     The distance between two disjoint triangles is attained either between a vertex of one
     and the face interior of the other, or between an edge of each. Testing the 6
     vertex-face and 9 edge-edge pairs is therefore exact. Intersecting triangles must be
-    caught beforehand with ``wp.intersect_tri_tri``.
+    caught beforehand with :func:`triangles_intersect`.
     """
     if point_face_within(a0, b0, b1, b2, dist_sq):
         return True
@@ -461,7 +548,7 @@ def robot_mesh_collision_kernel(
             b2 = wp.mesh_get_point(mesh_id, obs_tri * 3 + 2)
 
             # Narrowphase: exact triangle-triangle predicate, then exact distance < margin.
-            if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
+            if triangles_intersect(a0, a1, a2, b0, b1, b2):
                 report_collision(in_collision, contact_link, cfg_idx, link_idx)
                 return
             if margin_sq > 0.0 and triangles_within(a0, a1, a2, b0, b1, b2, margin_sq):

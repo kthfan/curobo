@@ -43,6 +43,7 @@ from curobo._src.geom.collision.wp_robot_mesh_kernel import (
     tri_aabb_hi,
     tri_aabb_lo,
     triangle_box_overlap,
+    triangles_intersect,
 )
 from curobo._src.geom.data.data_cuboid import CuboidDataWarp
 from curobo._src.geom.data.data_mesh import MeshDataWarp
@@ -93,7 +94,7 @@ def triangle_triangle_dist_sq(
     The distance between two disjoint triangles is attained between a vertex of one and the
     face interior of the other, or between an edge of each, so the 6 vertex-face and 9
     edge-edge pairs give it exactly. Intersecting triangles must be caught beforehand with
-    ``wp.intersect_tri_tri``.
+    :func:`~curobo._src.geom.collision.wp_robot_mesh_kernel.triangles_intersect`.
     """
     d = point_face_dist_sq(a0, b0, b1, b2)
     d = wp.min(d, point_face_dist_sq(a1, b0, b1, b2))
@@ -493,7 +494,7 @@ def robot_mesh_distance_kernel(
                     lo, hi, tri_aabb_lo(b0, b1, b2, 0.0), tri_aabb_hi(b0, b1, b2, 0.0)
                 )
                 if gap_sq == 0.0:
-                    if wp.intersect_tri_tri(a0, a1, a2, b0, b1, b2) != 0:
+                    if triangles_intersect(a0, a1, a2, b0, b1, b2):
                         crossing = True
                         break
                 # Boxes farther apart than ``best`` hold no closer pair of points.

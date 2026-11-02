@@ -70,19 +70,21 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   per-row time budget (`--row_budget_s`); the whole `--part distance` sweep takes ~6 min.
   T4, budget 256, cap 0.1 m, 4096 sphere-free configs: cuboid 3.0 ms (check 0.72), mesh 5.6
   (1.9), dense mesh 73 (2.8), voxel 22 (6.5). Costs are in the concept doc's Cost section.
+- **Triangle intersection without `wp.intersect_tri_tri`.** Warp's Möller test zeroes plane
+  distances below `1e-6` computed with an unnormalized normal, so a vertex within
+  `1e-6 / (2 * area)` of a small triangle's plane counted as on it (2-5 mm for 2 cm
+  triangles): gaps of 0.7-7 mm were reported as crossings. `triangles_intersect` in
+  `wp_robot_mesh_kernel.py` (an edge of one triangle touching the other, signs of signed
+  volumes only, 2D test for in-plane segments) replaces it in the scene check, the
+  self-collision check and the clearance query. Only reachable where a link triangle's box
+  straddles the obstacle triangle's plane, so tessellated curved or tilted surfaces, not
+  axis-aligned faces.
 
 ## Open items
 
 ### Small, ready to do
 
-- [ ] **`wp.intersect_tri_tri` false crossings on small triangles.** Warp's Möller test
-  (`warp/native/intersect_tri.h`) zeroes plane distances below `EPSILON = 1e-6` computed with
-  an *unnormalized* normal, so a vertex within `1e-6 / (2 * area)` of the other triangle's
-  plane counts as on it: 2.5-5 mm for 2 cm triangles, more for smaller ones. Both the
-  collision check and the clearance query report such pairs as crossing (found on a box
-  subdivided to 2 cm: gaps of 0.7-7 mm flagged). Fix: own scale-invariant triangle-triangle
-  test (edge-pierces-triangle with signed volumes, plus the coplanar case) in
-  `wp_robot_mesh_kernel.py`. `test_dense_mesh_agrees_with_the_cuboid` tolerates it below 1 cm.
+None right now.
 
 ### Postponed (user's decision)
 
