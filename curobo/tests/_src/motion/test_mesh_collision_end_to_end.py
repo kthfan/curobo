@@ -181,7 +181,8 @@ def test_mesh_collision_distance_follows_the_box(
     result = _solve(sphere_ik_solver, cuda_device_cfg)
     assert result.success.any().item()
     solution = JointState.from_position(
-        result.js_solution.position[result.success].view(-1, 7)[:1]
+        result.js_solution.position[result.success][:1],
+        joint_names=result.js_solution.joint_names,
     )
     checker = mesh_ik_solver.scene_collision_checker
     distances = []
