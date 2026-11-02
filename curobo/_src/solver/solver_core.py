@@ -585,6 +585,46 @@ class SolverCore:
         names = [n for row in mesh_constraint.get_contact_link_names() for n in row]
         return _nest(names, leading_shape)
 
+    @profiler.record_function("solver_core/get_mesh_collision_distance")
+    def get_mesh_collision_distance(
+        self,
+        joint_state: JointState,
+        env_query_idx: Optional[torch.Tensor] = None,
+        max_distance: float = 0.1,
+    ) -> Tuple[torch.Tensor, Union[Optional[str], List]]:
+        """Signed clearance between the robot's collision meshes and the scene.
+
+        Positive values are the exact distance from the nearest link mesh to the nearest
+        cuboid or mesh obstacle (resolution-limited for voxels). When a link crosses an
+        obstacle the value is the signed distance of its deepest vertex inside it, or 0 when
+        no vertex is inside, which bounds the penetration depth from below. The mesh
+        collision ``margin`` is not subtracted. Runs on the auxiliary rollout, like
+        :meth:`get_mesh_collision_links`.
+
+        Args:
+            joint_state: Configurations with any leading shape, as for
+                :meth:`get_mesh_collision_links`.
+            env_query_idx: Environment index per configuration in the first dimension, for
+                solvers with several environments.
+            max_distance: Distance cap in meters. Configurations whose meshes are all farther
+                away report ``max_distance``; a larger cap is slower.
+
+        Returns:
+            Tuple of ``(distance, closest_link)``. ``distance`` is a tensor with the leading
+            shape of ``joint_state.position``, in meters. ``closest_link`` holds, in nested
+            lists of the same shape, the name of the link nearest to the scene, or ``None``
+            where every link is at least ``max_distance`` away.
+        """
+        mesh_constraint = self._auxiliary_mesh_constraint("mesh_collision", "mesh_collision_check")
+        state, leading_shape = self._auxiliary_kinematics(joint_state)
+        link_distance = mesh_constraint.compute_link_distances(
+            state, idxs_env_query=env_query_idx, max_distance=max_distance
+        )
+        distance, closest = link_distance.min(dim=-1)
+        closest = torch.where(distance < max_distance, closest, torch.full_like(closest, -1))
+        names = mesh_constraint.config.robot_mesh_data.contact_link_names(closest)
+        return distance.view(leading_shape), _nest(names, leading_shape)
+
     @profiler.record_function("solver_core/get_mesh_self_collision_pairs")
     def get_mesh_self_collision_pairs(
         self, joint_state: JointState

@@ -156,6 +156,55 @@ def test_mesh_collision_links_need_the_mesh_check(sphere_ik_solver, cuda_device_
         sphere_ik_solver.get_mesh_collision_links(result.js_solution)
 
 
+def test_mesh_collision_distance_matches_the_colliding_links(mesh_ik_solver, cuda_device_cfg):
+    """Rejected solutions put a gripper link into the box: no clearance, gripper nearest."""
+    result = _solve(mesh_ik_solver, cuda_device_cfg)
+    distance, closest = mesh_ik_solver.get_mesh_collision_distance(result.js_solution)
+    assert distance.shape == result.js_solution.position.shape[:-1]
+    assert (distance <= 0.0).all()
+    assert all(name in GRIPPER_LINKS for row in closest for name in row)
+
+    checker = mesh_ik_solver.scene_collision_checker
+    try:
+        checker.load_collision_model(palm_box(offset=(0.0, 1.5, 0.0)))
+        distance, closest = mesh_ik_solver.get_mesh_collision_distance(result.js_solution)
+        assert torch.all(distance == 0.1)
+        assert all(name is None for row in closest for name in row)
+    finally:
+        checker.load_collision_model(palm_box())
+
+
+def test_mesh_collision_distance_follows_the_box(
+    sphere_ik_solver, mesh_ik_solver, cuda_device_cfg
+):
+    """Lowering the box under the grasp pose by 2 cm adds 2 cm of clearance."""
+    result = _solve(sphere_ik_solver, cuda_device_cfg)
+    assert result.success.any().item()
+    solution = JointState.from_position(
+        result.js_solution.position[result.success].view(-1, 7)[:1]
+    )
+    checker = mesh_ik_solver.scene_collision_checker
+    distances = []
+    try:
+        for drop in (0.15, 0.17):
+            checker.load_collision_model(palm_box(offset=(0.0, 0.0, -drop)))
+            distance, closest = mesh_ik_solver.get_mesh_collision_distance(
+                solution, max_distance=0.3
+            )
+            assert closest[0] in GRIPPER_LINKS
+            distances.append(distance.item())
+    finally:
+        checker.load_collision_model(palm_box())
+    assert 0.0 < distances[0] < 0.3
+    assert distances[1] - distances[0] == pytest.approx(0.02, abs=1.0e-4)
+
+
+def test_mesh_collision_distance_needs_the_mesh_check(sphere_ik_solver, cuda_device_cfg):
+    result = _solve(sphere_ik_solver, cuda_device_cfg)
+    with pytest.raises(ValueError, match="mesh_collision_check"):
+        sphere_ik_solver.get_mesh_collision_distance(result.js_solution)
+
+
 # =============================================================================
 # Motion planner
 # =============================================================================

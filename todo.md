@@ -48,6 +48,21 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   is cached; runtime geometry is not. Writes are atomic; unreadable files are recomputed.
   CPU: Franka 0.80 s -> 3 ms, UR10e 1.13 s -> 3 ms; the deviation warning is still logged.
 
+## Done on `dev/mesh_followups` (not merged yet)
+
+- **Scene distance** (user's choices: negative estimate, scene only, cap parameter 0.1 m,
+  solver/planner method). `compute_robot_mesh_distance` in `wp_robot_mesh_collision.py`
+  (kernels in `wp_robot_mesh_distance_kernel.py`) returns the signed clearance per
+  (configuration, link), capped at `max_distance`; links farther away, without geometry or
+  ignored report the cap. Positive: exact for cuboids (vertex-box, corner-face, 36 edge-edge)
+  and meshes (BVH query inflated by the running best, 6 vertex-face + 9 edge-edge); voxels
+  sample like the collision kernel and subtract the sampling widening. Crossing: deepest
+  vertex SDF, at most 0 (0 for meshes when `check_containment` is off). Culling reuses
+  `robot_link_near_kernel` with `max_distance` as margin. `RobotMeshConstraint.
+  compute_link_distances` and `get_mesh_collision_distance` on the solver core, IK, TrajOpt,
+  MPC and both planners return `(distance, closest_link)`. Guide: "Measure the clearance to the
+  scene" in `docs/guides/mesh_collision.md`.
+
 ## Open items
 
 ### Small, ready to do
@@ -84,7 +99,8 @@ None right now.
 
 ## Future work
 
-- **Distance output**: signed clearance per configuration; a first step towards the next item.
+- **Self-collision distance**: the link-to-link counterpart of the scene distance below
+  (deferred by the user when the scene distance was built).
 - **Mesh check with gradient**: lets the optimizers follow the exact geometry; unblocks the mode
   and the graph planner benchmark above.
 - **Use the meshes to improve the spheres**: a tool that finds where meshes collide but spheres

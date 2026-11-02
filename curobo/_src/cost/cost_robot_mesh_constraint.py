@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 # Standard Library
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 # Third Party
 import torch
 
 # CuRobo
 from curobo._src.cost.cost_base import BaseCost
-from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_collision
+from curobo._src.geom.collision.wp_robot_mesh_collision import (
+    check_robot_mesh_collision,
+    compute_robot_mesh_distance,
+)
 from curobo._src.robot.kinematics.kinematics import KinematicsState
 from curobo._src.util.logging import log_and_raise
 
@@ -83,23 +86,10 @@ class RobotMeshConstraint(BaseCost):
             Constraint value of shape ``(batch, horizon)``: ``weight`` where the
             configuration collides, 0 otherwise.
         """
-        if state.link_transforms is None:
-            log_and_raise(
-                "state.link_transforms is None; construct Kinematics with "
-                "compute_link_transforms=True to use the mesh collision constraint"
-            )
-
-        link_transforms = state.link_transforms
+        link_transforms = self._link_transforms(state)
         batch, horizon = link_transforms.shape[0], link_transforms.shape[1]
         self.setup_batch_tensors(batch, horizon)
-
-        if idxs_env_query is None:
-            use_multi_env = False
-            idxs_env_query = torch.zeros(
-                batch, dtype=torch.int32, device=link_transforms.device
-            )
-        else:
-            use_multi_env = True
+        idxs_env_query, use_multi_env = self._env_query(batch, idxs_env_query)
 
         in_collision, _ = check_robot_mesh_collision(
             robot_mesh=self.config.robot_mesh_data,
@@ -116,6 +106,60 @@ class RobotMeshConstraint(BaseCost):
 
         cost = in_collision.view(batch, horizon, 1).to(dtype=link_transforms.dtype)
         return cost * self._weight[0]
+
+    def compute_link_distances(
+        self,
+        state: KinematicsState,
+        idxs_env_query: Optional[torch.Tensor] = None,
+        max_distance: float = 0.1,
+    ) -> torch.Tensor:
+        """Signed clearance between each link's mesh and the scene.
+
+        Uses the constraint's scene, robot meshes, ignored links and ``check_containment``,
+        but not its ``margin``: the result is the geometric distance. See
+        :func:`~curobo._src.geom.collision.wp_robot_mesh_collision.compute_robot_mesh_distance`
+        for the sign convention. The buffers are allocated per call, so this is not meant to
+        run inside a captured CUDA graph.
+
+        Args:
+            state: Kinematics state carrying ``link_transforms``.
+            idxs_env_query: Environment index per batch element.
+            max_distance: Distance cap in meters; farther links report it.
+
+        Returns:
+            Signed distance of shape ``(batch, horizon, num_links)`` in meters, indexed by
+            kinematic body index.
+        """
+        link_transforms = self._link_transforms(state)
+        batch, horizon = link_transforms.shape[0], link_transforms.shape[1]
+        idxs_env_query, use_multi_env = self._env_query(batch, idxs_env_query)
+        distance = compute_robot_mesh_distance(
+            robot_mesh=self.config.robot_mesh_data,
+            link_transforms=link_transforms,
+            scene=self.config.scene_collision_checker.data,
+            env_query_idx=idxs_env_query,
+            use_multi_env=use_multi_env,
+            max_distance=max_distance,
+            check_containment=self.config.check_containment,
+        )
+        return distance.view(batch, horizon, -1)
+
+    def _link_transforms(self, state: KinematicsState) -> torch.Tensor:
+        """The state's per-link transforms; raise when the kinematics did not compute them."""
+        if state.link_transforms is None:
+            log_and_raise(
+                "state.link_transforms is None; construct Kinematics with "
+                "compute_link_transforms=True to use the mesh collision constraint"
+            )
+        return state.link_transforms
+
+    def _env_query(
+        self, batch: int, idxs_env_query: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, bool]:
+        """Environment indices to query, and whether they select per-batch environments."""
+        if idxs_env_query is not None:
+            return idxs_env_query, True
+        return torch.zeros(batch, dtype=torch.int32, device=self.device_cfg.device), False
 
     def get_contact_links(self) -> torch.Tensor:
         """Return the contacting link index from the most recent :meth:`forward` call.

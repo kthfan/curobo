@@ -182,6 +182,31 @@ class TrajOptSolver:
         """
         return self.core.get_mesh_collision_links(joint_state, env_query_idx)
 
+    def get_mesh_collision_distance(
+        self,
+        joint_state: JointState,
+        env_query_idx: Optional[torch.Tensor] = None,
+        max_distance: float = 0.1,
+    ) -> Tuple[torch.Tensor, Union[Optional[str], List]]:
+        """Signed clearance between the robot's collision meshes and the scene.
+
+        Positive values are the exact distance to the nearest cuboid or mesh obstacle
+        (resolution-limited for voxels); a link crossing an obstacle reports the signed
+        distance of its deepest vertex inside it, or 0. Requires ``mesh_collision_check=True``.
+
+        Args:
+            joint_state: Configurations with any leading shape.
+            env_query_idx: Environment index per configuration in the first dimension.
+            max_distance: Distance cap in meters; farther configurations report it.
+
+        Returns:
+            Tuple of ``(distance, closest_link)``: a tensor with the leading shape of
+            ``joint_state.position``, and nested lists of the same shape holding the name of
+            the link nearest to the scene, or ``None`` where every link is at least
+            ``max_distance`` away.
+        """
+        return self.core.get_mesh_collision_distance(joint_state, env_query_idx, max_distance)
+
     def get_mesh_self_collision_pairs(
         self, joint_state: JointState
     ) -> Union[Optional[Tuple[str, str]], List]:

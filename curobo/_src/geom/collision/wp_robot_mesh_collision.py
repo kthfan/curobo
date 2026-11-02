@@ -1,23 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Launch wrapper for the exact robot-mesh collision constraint.
+"""Launch wrappers for the exact robot-mesh collision checks and clearance queries.
 
 Unlike the sphere collision path there is no autograd function here: the mesh constraint is
-a boolean gate, not a differentiable cost, so this is a plain function that launches one
-kernel per obstacle type present in the scene.
+a boolean gate, not a differentiable cost, and the clearance query is forward-only, so these
+are plain functions that launch one kernel per obstacle type present in the scene.
 """
 
 from __future__ import annotations
 
 # Standard Library
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 # Third Party
 import torch
 import warp as wp
 
 # CuRobo
+from curobo._src.geom.collision.wp_robot_mesh_distance_kernel import (
+    robot_cuboid_distance_kernel,
+    robot_mesh_distance_kernel,
+    robot_voxel_distance_kernel,
+)
 from curobo._src.geom.collision.wp_robot_mesh_kernel import (
     robot_cuboid_collision_kernel,
     robot_link_near_kernel,
@@ -28,11 +33,52 @@ from curobo._src.geom.collision.wp_robot_mesh_self_collision_kernel import (
     robot_pair_near_kernel,
     robot_self_collision_kernel,
 )
+from curobo._src.util.logging import log_and_raise
 from curobo._src.util.warp import get_warp_device_stream
 
 if TYPE_CHECKING:
     from curobo._src.geom.data.data_robot_mesh import RobotMeshData
     from curobo._src.geom.data.data_scene import SceneData
+
+
+def _link_culling(
+    robot_wp: object,
+    env_idx_wp: wp.array,
+    batch_horizon: int,
+    horizon: int,
+    margin_wp: wp.float32,
+    use_multi_env_wp: wp.uint8,
+    stream: object,
+    wp_device: object,
+) -> Callable[[object, torch.Tensor], wp.array]:
+    """Return a function that flags the links near the obstacles of one type.
+
+    The returned function launches ``robot_link_near_kernel`` for one obstacle set into one
+    row of the ``link_near`` scratch buffer; the per-triangle kernels skip the other links.
+    """
+    near_size = batch_horizon * robot_wp.num_links
+
+    def flag_near_links(obs_wp: object, link_near_row: torch.Tensor) -> wp.array:
+        near_wp = wp.from_torch(link_near_row, dtype=wp.int32)
+        wp.launch(
+            kernel=robot_link_near_kernel,
+            dim=near_size,
+            inputs=[
+                robot_wp,
+                obs_wp,
+                env_idx_wp,
+                near_wp,
+                batch_horizon,
+                horizon,
+                margin_wp,
+                use_multi_env_wp,
+            ],
+            stream=stream,
+            device=wp_device,
+        )
+        return near_wp
+
+    return flag_near_links
 
 
 def check_robot_mesh_collision(
@@ -96,30 +142,20 @@ def check_robot_mesh_collision(
     dim = batch_horizon * robot_mesh.total_tris
     use_multi_env_wp = wp.uint8(use_multi_env)
     margin_wp = wp.float32(margin)
+    flag_near_links = _link_culling(
+        robot_wp,
+        env_idx_wp,
+        batch_horizon,
+        horizon,
+        margin_wp,
+        use_multi_env_wp,
+        stream,
+        wp_device,
+    )
 
-    def flag_near_links(obs_wp: object, row: int) -> wp.array:
-        """Flag the links near obstacles of one type; the per-triangle kernel skips the rest."""
-        near_wp = wp.from_torch(link_near[row], dtype=wp.int32)
-        wp.launch(
-            kernel=robot_link_near_kernel,
-            dim=near_size,
-            inputs=[
-                robot_wp,
-                obs_wp,
-                env_idx_wp,
-                near_wp,
-                batch_horizon,
-                horizon,
-                margin_wp,
-                use_multi_env_wp,
-            ],
-            stream=stream,
-            device=wp_device,
-        )
-        return near_wp
     if scene.cuboids is not None:
         cuboids_wp = scene.cuboids.to_warp()
-        near_wp = flag_near_links(cuboids_wp, 0)
+        near_wp = flag_near_links(cuboids_wp, link_near[0])
         wp.launch(
             kernel=robot_cuboid_collision_kernel,
             dim=dim,
@@ -141,7 +177,7 @@ def check_robot_mesh_collision(
 
     if scene.meshes is not None:
         meshes_wp = scene.meshes.to_warp()
-        near_wp = flag_near_links(meshes_wp, 1)
+        near_wp = flag_near_links(meshes_wp, link_near[1])
         wp.launch(
             kernel=robot_mesh_collision_kernel,
             dim=dim,
@@ -164,7 +200,7 @@ def check_robot_mesh_collision(
 
     if scene.voxels is not None:
         voxels_wp = scene.voxels.to_warp()
-        near_wp = flag_near_links(voxels_wp, 2)
+        near_wp = flag_near_links(voxels_wp, link_near[2])
         wp.launch(
             kernel=robot_voxel_collision_kernel,
             dim=dim,
@@ -185,6 +221,99 @@ def check_robot_mesh_collision(
         )
 
     return in_collision, contact_link
+
+
+def compute_robot_mesh_distance(
+    robot_mesh: "RobotMeshData",
+    link_transforms: torch.Tensor,
+    scene: "SceneData",
+    env_query_idx: torch.Tensor,
+    use_multi_env: bool,
+    max_distance: float = 0.1,
+    check_containment: bool = True,
+    link_distance: Optional[torch.Tensor] = None,
+    link_near: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Signed clearance between each link's exact triangle geometry and the scene.
+
+    Positive values are the exact distance to the nearest cuboid or mesh obstacle
+    (resolution-limited for voxels). A link whose surface crosses an obstacle reports the
+    signed distance of its deepest vertex inside the obstacle, or 0 when no vertex is inside;
+    this bounds the penetration depth from below. Links farther than ``max_distance``, links
+    without geometry and links skipped by the scene check report ``max_distance``.
+
+    Args:
+        robot_mesh: Packed robot collision triangles in link-local frame.
+        link_transforms: Per-link transforms ``[batch, horizon, num_links, 3, 4]``.
+        scene: Scene holding cuboid, mesh and voxel obstacle data.
+        env_query_idx: Environment index per batch element.
+        use_multi_env: Whether to use batch-specific environments.
+        max_distance: Distance cap in meters. Larger values measure farther but cull fewer
+            links, so the query gets slower.
+        check_containment: If True, read the mesh obstacles' SDF at the link vertices, so that
+            penetration is negative and links fully inside a mesh obstacle are found. Set it
+            to False for open meshes, whose inside is not defined: crossings then report 0.
+        link_distance: Optional pre-allocated output ``[batch * horizon * num_links]`` float32
+            buffer.
+        link_near: Optional pre-allocated ``[3, batch * horizon * num_links]`` int32 scratch
+            buffer for the link-level culling, one row per obstacle type.
+
+    Returns:
+        Signed distance per configuration and link, ``[batch * horizon, num_links]``, in
+        meters, indexed by kinematic body index.
+    """
+    if max_distance <= 0.0:
+        log_and_raise(f"max_distance must be positive, got {max_distance}")
+    batch, horizon = link_transforms.shape[0], link_transforms.shape[1]
+    batch_horizon = batch * horizon
+    device = link_transforms.device
+    near_size = batch_horizon * robot_mesh.num_links
+
+    if link_distance is None:
+        link_distance = torch.empty(near_size, dtype=torch.float32, device=device)
+    link_distance.fill_(max_distance)
+    if link_near is None:
+        link_near = torch.zeros(3, near_size, dtype=torch.int32, device=device)
+    else:
+        link_near.zero_()
+
+    wp_device, stream = get_warp_device_stream(link_transforms)
+    robot_wp = robot_mesh.to_warp(link_transforms.detach())
+    env_idx_wp = wp.from_torch(env_query_idx.view(-1), dtype=wp.int32)
+    distance_wp = wp.from_torch(link_distance.view(-1), dtype=wp.float32)
+    use_multi_env_wp = wp.uint8(use_multi_env)
+    max_distance_wp = wp.float32(max_distance)
+    flag_near_links = _link_culling(
+        robot_wp,
+        env_idx_wp,
+        batch_horizon,
+        horizon,
+        max_distance_wp,
+        use_multi_env_wp,
+        stream,
+        wp_device,
+    )
+    dim = batch_horizon * robot_mesh.total_tris
+    common = [batch_horizon, horizon, max_distance_wp, use_multi_env_wp]
+
+    obstacle_sets = [
+        (scene.cuboids, robot_cuboid_distance_kernel, []),
+        (scene.meshes, robot_mesh_distance_kernel, [wp.uint8(check_containment)]),
+        (scene.voxels, robot_voxel_distance_kernel, []),
+    ]
+    for row, (obstacles, kernel, extra) in enumerate(obstacle_sets):
+        if obstacles is None:
+            continue
+        obs_wp = obstacles.to_warp()
+        near_wp = flag_near_links(obs_wp, link_near[row])
+        wp.launch(
+            kernel=kernel,
+            dim=dim,
+            inputs=[robot_wp, obs_wp, env_idx_wp, distance_wp, near_wp, *common, *extra],
+            stream=stream,
+            device=wp_device,
+        )
+    return link_distance.view(batch_horizon, robot_mesh.num_links)
 
 
 def check_robot_mesh_self_collision(

@@ -171,6 +171,39 @@ positions you pass. When several links collide at one configuration, one of them
 check runs separately from the solve, so it adds no cost to planning and leaves captured CUDA
 graphs untouched.
 
+## Measure the clearance to the scene
+
+`get_mesh_collision_distance` measures how far the robot's meshes are from the scene, for each
+configuration you pass, and names the link nearest to it:
+
+```python
+distance, closest = planner.get_mesh_collision_distance(
+    result.interpolated_trajectory, max_distance=0.1
+)
+# distance[batch, seed, step] is in meters; closest[batch][seed][step] is a link name, or
+# None where every link is at least max_distance away.
+print(f"closest approach: {distance.min().item():.3f} m")
+```
+
+The value is signed:
+
+- **Positive:** the distance between the nearest link mesh and the nearest obstacle. It is
+  exact for cuboids and meshes, and accurate to about a voxel for voxel grids.
+- **Zero:** a link's surface crosses an obstacle's surface, but none of its vertices is inside.
+- **Negative:** how deep the link's deepest vertex is inside an obstacle. This can be less
+  than the true penetration depth, never more.
+
+Configurations whose meshes are all farther than `max_distance` (default 0.1 m) report
+`max_distance`. A larger cap measures farther but is slower, because the check can skip fewer
+links. The value is the geometric distance: the `mesh_collision_margin` is not subtracted, so a
+configuration fails the mesh check where the distance is below the margin. Links ignored with
+`mesh_collision_ignored_link_names` are not measured. Negative values come from the inside of
+the obstacles, so for open mesh obstacles they can be wrong where the free space reads as
+inside (see the limitations below).
+
+Like `get_mesh_collision_links`, the method needs `mesh_collision_check=True` and runs
+separately from the solve. It has no gradient, so the optimizers do not use it.
+
 ## Fix solves that fail only with the mesh check
 
 A goal that the solver reaches without the mesh check can fail with it, mostly in tight
