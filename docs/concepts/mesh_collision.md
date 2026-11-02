@@ -164,3 +164,21 @@ cuboid scene, turning it on made IK with 100 problems about 9 % slower and `plan
 About 10 % of the configurations free of sphere collisions that the benchmark sampled had
 colliding link meshes, nearly all of them `panda_link5` against the hand, `panda_link7` or a
 finger: pairs the sphere check ignores.
+
+The clearance query (`get_mesh_collision_distance`) measures distances instead of testing for
+contact, so it does more work than the check. Time of one query with the default budget and the
+default cap of 0.1 m, for the same sphere-free configurations:
+
+| Configurations | Cuboid | Mesh, 24 triangles | Mesh, 192k triangles | Voxel |
+| --- | --- | --- | --- | --- |
+| 32 | 0.63 ms | 0.68 ms | 2.8 ms | 0.77 ms |
+| 512 | 0.80 ms | 1.2 ms | 15 ms | 3.2 ms |
+| 4096 | 3.0 ms | 5.6 ms | 73 ms | 22 ms |
+
+- The query first bounds each link by the distance of its vertices, then measures exactly only
+  the triangles that can come closer. Its cost grows with the cap, because every obstacle
+  feature within the cap of a link is a candidate: with a 0.3 m cap, 4096 configurations take
+  9.3 ms against cuboids, 45 ms against the 24-triangle mesh and 41 ms against the ESDF.
+- Dense meshes are the expensive case. Against the 192k-triangle mesh with a 0.3 m cap, the
+  query takes 36 ms for 32 configurations and 2.7 s for 4096. Keep the cap small there, or
+  query fewer configurations.

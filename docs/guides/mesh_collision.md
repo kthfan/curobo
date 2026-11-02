@@ -194,8 +194,8 @@ The value is signed:
   than the true penetration depth, never more.
 
 Configurations whose meshes are all farther than `max_distance` (default 0.1 m) report
-`max_distance`. A larger cap measures farther but is slower, because the check can skip fewer
-links. The value is the geometric distance: the `mesh_collision_margin` is not subtracted, so a
+`max_distance`. A larger cap measures farther but is slower, most of all against dense mesh
+obstacles; {ref}`mesh_collision_cost` lists measured costs. The value is the geometric distance: the `mesh_collision_margin` is not subtracted, so a
 configuration fails the mesh check where the distance is below the margin. Links ignored with
 `mesh_collision_ignored_link_names` are not measured. Negative values come from the inside of
 the obstacles, so for open mesh obstacles they can be wrong where the free space reads as

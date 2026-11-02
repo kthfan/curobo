@@ -64,9 +64,12 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   scene" in `docs/guides/mesh_collision.md`.
 - **Clearance query speed.** The first version cost up to 9700x the check (dense mesh, 0.3 m
   cap, batch 4096: 26 s); commit `c856809` wrongly said "about as much as the check".
-  `robot_vertex_bound_kernel` now seeds each link with its vertices' distance, and the exact
-  kernels skip triangles whose centroid bound is no closer (`f909f03`). The benchmark has a
-  per-row time budget (`--row_budget_s`).
+  `robot_vertex_bound_kernel` now seeds each link with its vertices' distance; the exact
+  kernels skip triangles whose centroid (or, for cuboids, bounding-box) bound is no closer, and
+  the cuboid kernel skips far box corners and edges (`f909f03`, `f7b8763`). The benchmark has a
+  per-row time budget (`--row_budget_s`); the whole `--part distance` sweep takes ~6 min.
+  T4, budget 256, cap 0.1 m, 4096 sphere-free configs: cuboid 3.0 ms (check 0.72), mesh 5.6
+  (1.9), dense mesh 73 (2.8), voxel 22 (6.5). Costs are in the concept doc's Cost section.
 
 ## Open items
 
@@ -104,6 +107,11 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
 - [ ] **MPC executes infeasible actions.** Handled on another branch; reference only.
 
 ### Later (P3)
+
+- [ ] **Clearance against dense meshes with a large cap** is still slow: 192k-triangle mesh,
+  0.3 m cap, 4096 configs: 2.7 s (check 2.8 ms). Each surviving link triangle traverses every
+  obstacle triangle in its box inflated by the running best (~0.2 m). Ideas: split long link
+  triangles before the query, or a tighter per-node bound in a custom BVH traversal.
 
 - [ ] Cheaper margin test on dense meshes (192k-triangle mesh with 1 cm margin: 2.7x slower).
 - [ ] Obstacles fully inside a link, and a link fully inside another link, are not detected
