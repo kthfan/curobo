@@ -62,12 +62,24 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   compute_link_distances` and `get_mesh_collision_distance` on the solver core, IK, TrajOpt,
   MPC and both planners return `(distance, closest_link)`. Guide: "Measure the clearance to the
   scene" in `docs/guides/mesh_collision.md`.
+- **Clearance query speed.** The first version cost up to 9700x the check (dense mesh, 0.3 m
+  cap, batch 4096: 26 s); commit `c856809` wrongly said "about as much as the check".
+  `robot_vertex_bound_kernel` now seeds each link with its vertices' distance, and the exact
+  kernels skip triangles whose centroid bound is no closer (`f909f03`). The benchmark has a
+  per-row time budget (`--row_budget_s`).
 
 ## Open items
 
 ### Small, ready to do
 
-None right now.
+- [ ] **`wp.intersect_tri_tri` false crossings on small triangles.** Warp's Möller test
+  (`warp/native/intersect_tri.h`) zeroes plane distances below `EPSILON = 1e-6` computed with
+  an *unnormalized* normal, so a vertex within `1e-6 / (2 * area)` of the other triangle's
+  plane counts as on it: 2.5-5 mm for 2 cm triangles, more for smaller ones. Both the
+  collision check and the clearance query report such pairs as crossing (found on a box
+  subdivided to 2 cm: gaps of 0.7-7 mm flagged). Fix: own scale-invariant triangle-triangle
+  test (edge-pierces-triangle with signed volumes, plus the coplanar case) in
+  `wp_robot_mesh_kernel.py`. `test_dense_mesh_agrees_with_the_cuboid` tolerates it below 1 cm.
 
 ### Postponed (user's decision)
 
