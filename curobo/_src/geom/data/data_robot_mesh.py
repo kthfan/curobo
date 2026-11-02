@@ -81,12 +81,15 @@ class RobotMeshWarp:
         total_tris: Total number of robot collision triangles.
         link_bounds: Link-local bounding sphere ``(x, y, z, radius)`` per body index; a
             negative radius marks a link without geometry. Shape: (num_links,).
+        link_scene_check: 1 where a link is tested against the scene, 0 where the scene
+            check skips it. Shape: (num_links,).
     """
 
     tri_verts: wp.array(dtype=wp.vec3)
     tri_link: wp.array(dtype=wp.int32)
     link_tf: wp.array2d(dtype=wp.float32)
     link_bounds: wp.array(dtype=wp.vec4)
+    link_scene_check: wp.array(dtype=wp.int32)
     num_links: wp.int32
     total_tris: wp.int32
 
@@ -469,6 +472,11 @@ class RobotMeshData:
     #: kernels skip a link whose sphere is far from every obstacle.
     link_bounds: Optional[torch.Tensor] = None
 
+    #: Per body index ``[num_links]`` (int32): 1 where the link is tested against the scene, 0
+    #: for links the scene check skips (``ignored_link_names`` of :meth:`from_link_meshes`).
+    #: The self-collision check tests every packed link regardless. All ones when not given.
+    link_scene_check: Optional[torch.Tensor] = None
+
     #: Body index pairs ``[num_pairs, 2]`` (int32) tested by the mesh self-collision check,
     #: set with :meth:`set_self_collision_pairs`. In each pair the first link has no more
     #: triangle slots than the second: the kernel iterates its triangles and queries the
@@ -493,6 +501,10 @@ class RobotMeshData:
                 # Packing fills a link's slots from the start, so active slots come first.
                 tris = self.tri_verts[span.start * 3 : (span.start + count) * 3].view(-1, 3, 3)
                 self._write_link_bounds(link_name, tris)
+        if self.link_scene_check is None:
+            self.link_scene_check = torch.ones(
+                self.num_links, dtype=torch.int32, device=self.tri_verts.device
+            )
 
     @property
     def body_idx_to_link_name(self) -> Dict[int, str]:
@@ -721,7 +733,7 @@ class RobotMeshData:
             kinematics: A :class:`~curobo._src.robot.kinematics.kinematics.Kinematics`
                 instance loaded with ``load_collision_meshes=True``.
             max_triangles_per_link: Per-link triangle budget. See :func:`decimate_mesh`.
-            ignored_link_names: Links to leave out of the mesh constraint entirely. See
+            ignored_link_names: Links the scene check skips. See
                 :meth:`from_link_meshes`.
             extra_link_triangles: Triangle slots to reserve per link. See
                 :meth:`from_link_meshes`.
@@ -765,11 +777,12 @@ class RobotMeshData:
             device_cfg: Device and dtype configuration.
             max_triangles_per_link: Per-link triangle budget, either a single value or a
                 per-link mapping. See :func:`resolve_triangle_budget`.
-            ignored_link_names: Links whose geometry is left out of the constraint entirely,
-                so they can never report a collision against any obstacle. Use this for links
-                that are in permanent contact with the scene by design, such as a base link
-                bolted to its mounting plate; an exact triangle test resolves such a flush,
-                coplanar contact as a collision even though penetration is zero.
+            ignored_link_names: Links that the scene check skips, so they can never report a
+                collision against an obstacle. Use this for links that are in permanent
+                contact with the scene by design, such as a base link bolted to its mounting
+                plate; an exact triangle test resolves such a flush, coplanar contact as a
+                collision even though penetration is zero. Their geometry is still packed and
+                checked against the other links by the self-collision check.
             extra_link_triangles: Triangle slots to reserve per link name, for geometry that
                 is only known at runtime such as a gripper or an attached object. The slots
                 start inactive and are filled with :meth:`update_link_mesh`. The reserved
@@ -793,8 +806,6 @@ class RobotMeshData:
         link_body_indices: List[int] = []
 
         for link_name in sorted(link_meshes.keys()):
-            if link_name in ignored:
-                continue
             if link_name not in link_name_to_idx_map:
                 log_warn(f"link '{link_name}' is not in the kinematic tree, skipping its mesh")
                 continue
@@ -821,8 +832,6 @@ class RobotMeshData:
         # Reserve inactive slots for links whose geometry only exists at runtime. They are
         # appended last so that the offsets of the static links stay stable.
         for link_name, count in sorted((extra_link_triangles or {}).items()):
-            if link_name in ignored:
-                continue
             if link_name in link_names:
                 log_and_raise(
                     f"link '{link_name}' has both a static collision mesh and a reservation in "
@@ -850,6 +859,10 @@ class RobotMeshData:
         tri_link = torch.as_tensor(
             tri_link_np, dtype=torch.int32, device=device_cfg.device
         ).contiguous()
+        link_scene_check = torch.ones(num_links, dtype=torch.int32, device=device_cfg.device)
+        for link_name in ignored:
+            if link_name in link_name_to_idx_map:
+                link_scene_check[link_name_to_idx_map[link_name]] = 0
 
         return cls(
             tri_verts=tri_verts,
@@ -860,6 +873,7 @@ class RobotMeshData:
             link_triangle_counts=link_triangle_counts,
             device_cfg=device_cfg,
             link_body_indices=link_body_indices,
+            link_scene_check=link_scene_check,
         )
 
     def to_warp(self, link_transforms: torch.Tensor) -> RobotMeshWarp:
@@ -887,4 +901,5 @@ class RobotMeshData:
         s.num_links = self.num_links
         s.total_tris = self.total_tris
         s.link_bounds = wp.from_torch(self.link_bounds, dtype=wp.vec4)
+        s.link_scene_check = wp.from_torch(self.link_scene_check, dtype=wp.int32)
         return s

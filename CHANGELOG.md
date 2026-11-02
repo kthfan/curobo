@@ -122,6 +122,10 @@
   steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
+- `mesh_collision_ignored_link_names` now only leaves links out of the mesh scene check.
+  Their meshes are loaded and still tested by the mesh self-collision check, so a base link
+  bolted to the table is still protected from the hand. Leave link pairs out of the
+  self-collision check with `mesh_self_collision_ignore`.
 - Decimate robot link meshes closer to their surface. Decimation now merges duplicate
   vertices, closes the mesh when it can, keeps open borders, and keeps the result closest
   to the original among several settings. Franka's links 2-5, decimated from 300 to the

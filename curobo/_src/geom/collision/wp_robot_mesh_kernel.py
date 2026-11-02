@@ -213,7 +213,8 @@ def robot_link_near_kernel(
         obs: Obstacle set of one type.
         env_query_idx: Environment index per batch element.
         link_near: Output flag per (configuration, link), pre-zeroed; 1 where the link must
-            be tested triangle by triangle.
+            be tested triangle by triangle. Links without geometry or skipped by the scene
+            check stay 0.
         batch_horizon: Number of configurations (batch * horizon).
         horizon: Time steps per batch element; maps a configuration to its batch index.
         margin: Clearance distance used by the per-triangle kernel.
@@ -226,7 +227,7 @@ def robot_link_near_kernel(
         return
 
     bound = robot.link_bounds[link_idx]
-    if bound[3] < 0.0:
+    if bound[3] < 0.0 or robot.link_scene_check[link_idx] == 0:
         return
     center = transform_point_link(robot.link_tf, tid, wp.vec3(bound[0], bound[1], bound[2]))
 

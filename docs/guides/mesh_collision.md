@@ -102,7 +102,10 @@ robot_cfg:
     mesh_collision_ignored_link_names: [panda_link0]
 ```
 
-Ignored links are skipped only by the mesh check; the collision spheres still apply to them.
+Ignored links are skipped only by the mesh scene check. The collision spheres still apply to
+them, and the mesh self-collision check (see below) still tests them against the other links,
+so a base link bolted to the table still cannot be hit by the hand. To leave a link pair out of
+the self-collision check, list it under `mesh_self_collision_ignore`.
 
 ## Let links touch the scene for a while
 
@@ -264,9 +267,7 @@ is_valid = checker.validate(joint_positions)
 ## Limitations
 
 - Self-collision with the meshes is opt-in (`mesh_self_collision_check`). A link fully inside
-  another link, crossing none of its triangles, is not detected. Links left out with
-  `mesh_collision_ignored_link_names` have no mesh, so they are not checked against other
-  links either.
+  another link, crossing none of its triangles, is not detected.
 - Trajectory optimization checks the optimized steps and every step of the interpolated
   trajectory. Both sample the motion, so an obstacle thinner than the distance a link moves
   between two samples (about 1 to 2 cm for the hand in typical plans) can be missed.

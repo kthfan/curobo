@@ -165,12 +165,13 @@ class KinematicsLoaderCfg:
     #: when a link has no collision geometry.
     load_collision_meshes: bool = False
 
-    #: Names of links to exclude from the exact-mesh collision constraint. Their collision
-    #: geometry is never loaded, so they can never report a mesh collision against any
-    #: obstacle. Sphere-based collision checking is unaffected. Use this for links that are
-    #: in permanent contact with the scene by design, such as a base link bolted to its
-    #: mounting plate: an exact triangle test resolves a flush, coplanar contact as a
-    #: collision even though the penetration depth is zero.
+    #: Names of links that the exact-mesh scene collision check skips, so they can never
+    #: report a mesh collision against an obstacle. Use this for links that are in permanent
+    #: contact with the scene by design, such as a base link bolted to its mounting plate: an
+    #: exact triangle test resolves a flush, coplanar contact as a collision even though the
+    #: penetration depth is zero. The mesh self-collision check still tests these links; leave
+    #: them out of it with :attr:`mesh_self_collision_ignore`. Sphere-based collision checking
+    #: is unaffected.
     mesh_collision_ignored_link_names: Optional[List[str]] = None
 
     #: Triangle slots to reserve per link for collision geometry that is only known at

@@ -190,8 +190,9 @@ class KinematicsLoader(KinematicsLoaderCfg):
 
         Returns:
             Mapping from link name to its link-local collision mesh. Links with no usable
-            geometry, and links listed in
-            :attr:`KinematicsLoaderCfg.mesh_collision_ignored_link_names`, are omitted.
+            geometry are omitted. Links in
+            :attr:`KinematicsLoaderCfg.mesh_collision_ignored_link_names` are loaded too: the
+            scene check skips them, the self-collision check does not.
         """
         ignored = set(self.mesh_collision_ignored_link_names or ())
         unknown = ignored.difference(self.collision_link_names)
@@ -202,8 +203,6 @@ class KinematicsLoader(KinematicsLoaderCfg):
             )
         link_meshes: Dict[str, Mesh] = {}
         for link_name in self.collision_link_names:
-            if link_name in ignored:
-                continue
             if link_name in self.extra_links:
                 # Virtual attachment frames (e.g. "attached_object") are not in the URDF and
                 # carry no static geometry. Attached objects stay sphere-based.

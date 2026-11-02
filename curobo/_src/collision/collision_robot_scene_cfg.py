@@ -122,8 +122,9 @@ class RobotSceneCollisionCfg:
             mesh_constraint_margin: Clearance the exact geometry must keep from obstacles.
             mesh_constraint_check_containment: Also flag links fully inside a mesh obstacle.
             max_triangles_per_link: Per-link triangle budget for the exact geometry.
-            mesh_constraint_ignored_links: Names of links excluded from mesh collision
-                checking entirely, such as a base link bolted to its mounting plate.
+            mesh_constraint_ignored_links: Names of links the mesh scene check skips, such as
+                a base link bolted to its mounting plate. The mesh self-collision check still
+                tests them.
             use_mesh_self_collision_constraint: Also check the robot's link meshes against
                 each other, for the pairs set by ``mesh_self_collision_ignore``.
             mesh_self_collision_margin: Clearance the link meshes must keep from each other.

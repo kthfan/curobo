@@ -39,12 +39,12 @@ class RobotMeshConstraintCfg(BaseCostCfg):
     #: :data:`DEFAULT_MAX_TRIANGLES_PER_LINK`.
     max_triangles_per_link: Union[None, int, Dict[str, int]] = None
 
-    #: Links excluded from mesh collision checking entirely, by name. Their geometry is not
-    #: packed, so they can never report a collision against any obstacle. Use this for links
-    #: in permanent contact with the scene by design, such as a base link bolted to its
-    #: mounting plate: an exact triangle test resolves a flush, coplanar contact as a
-    #: collision even though the penetration depth is zero. Only used when the robot config
-    #: does not set ``mesh_collision_ignored_link_names`` itself.
+    #: Links that this scene check skips, by name, so they can never report a collision
+    #: against an obstacle. Use this for links in permanent contact with the scene by design,
+    #: such as a base link bolted to its mounting plate: an exact triangle test resolves a
+    #: flush, coplanar contact as a collision even though the penetration depth is zero. The
+    #: mesh self-collision check still tests them. Only used when the robot config does not
+    #: set ``mesh_collision_ignored_link_names`` itself.
     ignored_link_names: List[str] = field(default_factory=list)
 
     #: SceneCollision instance providing the obstacle data.

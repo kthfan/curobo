@@ -163,7 +163,8 @@ class KinematicsParams:
     #: a gripper or an attached object. Exact-mesh counterpart of ``extra_collision_spheres``.
     extra_collision_meshes: Optional[Dict[str, int]] = None
 
-    #: Links excluded from the exact-mesh collision constraint entirely, by name.
+    #: Links that the exact-mesh scene check skips, by name. The mesh self-collision check
+    #: still tests them.
     mesh_collision_ignored_link_names: Optional[List[str]] = None
 
     #: Link pairs left out of the mesh self-collision check, as ``{link: [links]}``. Links in

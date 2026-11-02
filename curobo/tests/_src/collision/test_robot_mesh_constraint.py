@@ -10,7 +10,10 @@ import torch
 import trimesh
 
 # CuRobo
-from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_collision
+from curobo._src.geom.collision.wp_robot_mesh_collision import (
+    check_robot_mesh_collision,
+    check_robot_mesh_self_collision,
+)
 from curobo._src.geom.data.data_robot_mesh import (
     RobotMeshData,
     decimate_mesh,
@@ -643,8 +646,8 @@ def test_clear_link_mesh_is_not_undone_by_enable():
     assert _check(data, scene, tf)[0].tolist() == [0]
 
 
-def test_ignored_links_are_not_packed():
-    """An ignored link contributes no geometry, so it can never report a collision."""
+def test_ignored_links_are_packed_but_skipped_by_the_scene_check():
+    """An ignored link keeps its geometry, for the self-collision check, but no scene check."""
     link_meshes = {
         "a": _box_mesh("a", (0.1, 0.1, 0.1)),
         "b": _box_mesh("b", (0.1, 0.1, 0.1)),
@@ -657,13 +660,12 @@ def test_ignored_links_are_not_packed():
         max_triangles_per_link=0,
         ignored_link_names=["a"],
     )
-    assert data.link_names == ["b"]
-    assert data.total_tris == 12
-    assert set(data.tri_link.tolist()) == {5}
-    assert data.body_idx_to_link_name == {5: "b"}
+    assert data.link_names == ["a", "b"]
+    assert data.body_idx_to_link_name == {2: "a", 5: "b"}
+    assert data.link_scene_check.tolist() == [1, 1, 0, 1, 1, 1, 1, 1]
 
 
-def test_ignored_link_reports_no_collision():
+def test_ignored_link_reports_no_scene_collision():
     """A link flush against an obstacle is silent once ignored."""
     scene = SceneData.from_scene_cfg(
         SceneCfg(mesh=[_box_mesh("wall", (1.0, 1.0, 1.0))]),
@@ -677,26 +679,34 @@ def test_ignored_link_reports_no_collision():
         env_query_idx=torch.zeros(1, dtype=torch.int32, device=DEVICE_CFG.device),
         use_multi_env=False,
     )
-
-    checked = RobotMeshData.from_link_meshes(
-        link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
-        link_name_to_idx_map={"l0": 0},
-        num_links=1,
-        device_cfg=DEVICE_CFG,
-        max_triangles_per_link=0,
-    )
-    in_collision, _ = check_robot_mesh_collision(robot_mesh=checked, **kwargs)
-    assert in_collision[0].item() == 1
-
-    with pytest.raises(Exception):
-        RobotMeshData.from_link_meshes(
+    for ignored, expected in [([], 1), (["l0"], 0)]:
+        robot = RobotMeshData.from_link_meshes(
             link_meshes={"l0": _box_mesh("l0", (0.2, 0.2, 0.2))},
             link_name_to_idx_map={"l0": 0},
             num_links=1,
             device_cfg=DEVICE_CFG,
             max_triangles_per_link=0,
-            ignored_link_names=["l0"],
+            ignored_link_names=ignored,
         )
+        in_collision, _ = check_robot_mesh_collision(robot_mesh=robot, **kwargs)
+        assert in_collision[0].item() == expected
+
+
+def test_ignored_link_is_still_checked_for_self_collision():
+    robot = RobotMeshData.from_link_meshes(
+        link_meshes={
+            "a": _box_mesh("a", (0.1, 0.1, 0.1)),
+            "b": _box_mesh("b", (0.1, 0.1, 0.1)),
+        },
+        link_name_to_idx_map={"a": 0, "b": 1},
+        num_links=2,
+        device_cfg=DEVICE_CFG,
+        max_triangles_per_link=0,
+        ignored_link_names=["a"],
+    )
+    robot.set_self_collision_pairs([(0, 1)])
+    tf = _two_link_transforms(0.0, 0.05)
+    assert check_robot_mesh_self_collision(robot, tf)[0].tolist() == [1]
 
 
 # =============================================================================
