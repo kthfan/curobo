@@ -105,8 +105,11 @@ def test_load_collision_meshes_implies_load_meshes():
     assert cfg.load_meshes is True
 
 
-def test_ignored_links_are_not_loaded(cfg_with_collision_meshes):
-    """Links named in mesh_collision_ignored_link_names must carry no collision geometry."""
+def test_ignored_links_are_loaded_but_skipped_by_the_scene_check(cfg_with_collision_meshes):
+    """Links in mesh_collision_ignored_link_names keep their meshes, for self-collision.
+
+    Only the mesh scene check skips them.
+    """
     baseline = cfg_with_collision_meshes.kinematics_config.link_collision_meshes
     ignored = sorted(baseline.keys())[0]
 
@@ -115,8 +118,10 @@ def test_ignored_links_are_not_loaded(cfg_with_collision_meshes):
     robot_data["robot_cfg"]["kinematics"]["mesh_collision_ignored_link_names"] = [ignored]
     cfg = KinematicsCfg.from_robot_yaml_file(robot_data, ["panda_hand"])
 
-    meshes = cfg.kinematics_config.link_collision_meshes
-    assert ignored not in meshes
-    assert set(meshes.keys()) == set(baseline.keys()) - {ignored}
-    # Sphere-based collision checking must be untouched.
-    assert ignored in cfg.kinematics_config.link_name_to_idx_map
+    kinematics_config = cfg.kinematics_config
+    assert set(kinematics_config.link_collision_meshes.keys()) == set(baseline.keys())
+    mesh_data = kinematics_config.get_robot_mesh_data()
+    body = kinematics_config.link_name_to_idx_map[ignored]
+    assert ignored in mesh_data.link_names
+    assert mesh_data.link_scene_check[body].item() == 0
+    assert int(mesh_data.link_scene_check.sum().item()) == mesh_data.num_links - 1
