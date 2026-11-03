@@ -34,6 +34,11 @@ def main() -> None:
     parser.add_argument("--tolerance", type=float, default=0.005, help="Allowed gap in meters.")
     parser.add_argument("--max_new_spheres_per_link", type=int, default=16)
     parser.add_argument("--num_configs", type=int, default=2000)
+    parser.add_argument(
+        "--check_suggested_pairs",
+        action="store_true",
+        help="Also remove the suggested pairs from self_collision_ignore.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(runtime.cache_dir) / "examples" / "cover_link_meshes_with_spheres"
@@ -47,12 +52,20 @@ def main() -> None:
         tolerance=args.tolerance, max_new_spheres_per_link=args.max_new_spheres_per_link
     )
     after = coverage.analyze(tolerance=args.tolerance, num_configs=args.num_configs)
+    checked = after.suggested_checks if args.check_suggested_pairs else []
+    if checked:
+        coverage.remove_self_collision_ignore(checked)
+        after = coverage.analyze(tolerance=args.tolerance, num_configs=args.num_configs)
     coverage.save(output)
 
     report = f"# Sphere coverage of {args.robot}\n\n"
     report += "Added spheres: " + (
         ", ".join(f"{name} +{n}" for name, n in added.items()) or "none"
     )
+    if checked:
+        report += ".\n\nRemoved from `self_collision_ignore`: " + ", ".join(
+            f"{a} - {b}" for a, b in checked
+        )
     report += f".\n\nConfiguration written to `{output}`.\n\n" + after.to_markdown(before)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report)

@@ -67,6 +67,8 @@ class PairSphereCoverage:
     missed_ratio: float
     #: Fraction of configurations where the spheres overlap and the meshes do not.
     false_alarm_ratio: float
+    #: True when the two links' spheres overlap at the default joint configuration.
+    spheres_overlap_at_default: bool
 
 
 @dataclass
@@ -96,6 +98,24 @@ class SphereCoverageReport:
     default_config_collisions: List[Tuple[str, str]] = field(default_factory=list)
     #: Number of collision spheres per link.
     num_spheres: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def suggested_checks(self) -> List[Tuple[str, str]]:
+        """Ignored pairs worth handing to the sphere check, as ``(link_a, link_b)``.
+
+        These are pairs that ``self_collision_ignore`` excludes from the sphere check although
+        their meshes collide in some sampled configurations, and whose spheres do not overlap
+        at the default joint configuration. While ignored, only the mesh check sees their
+        collisions, so the optimizer does not keep the links apart. Pass them to
+        :meth:`SphereCoverage.remove_self_collision_ignore`.
+        """
+        return [
+            (p.link_a, p.link_b)
+            for p in self.pairs
+            if p.sphere_check_ignores
+            and p.mesh_collision_ratio > 0.0
+            and not p.spheres_overlap_at_default
+        ]
 
     def to_markdown(self, baseline: Optional["SphereCoverageReport"] = None) -> str:
         """Format the report as Markdown, next to ``baseline`` (e.g. before covering) if given.
@@ -188,15 +208,15 @@ class SphereCoverageReport:
                 f"| {pair_of(old, p, 'missed_ratio', pct)} "
                 f"| {pair_of(old, p, 'false_alarm_ratio', pct)} |"
             )
-        ignored = [p for p in self.pairs if p.sphere_check_ignores and p.missed_ratio > 0.0]
-        if ignored:
+        suggested = self.suggested_checks
+        if suggested:
             lines += [
                 "",
-                "Pairs the sphere check ignores (`self_collision_ignore`) whose meshes collide "
-                "are left to the mesh check. Remove a pair from the ignore list when its "
-                "spheres do not overlap at the default joint configuration, so the optimizer "
-                "keeps the links apart: "
-                + ", ".join(f"{p.link_a} - {p.link_b}" for p in ignored)
+                "Pairs the sphere check ignores (`self_collision_ignore`) although their meshes "
+                "collide are left to the mesh check, so the optimizer does not keep the links "
+                "apart. Their spheres do not overlap at the default joint configuration, so "
+                "they can be removed from the ignore list: "
+                + ", ".join(f"{a} - {b}" for a, b in suggested)
                 + ".",
             ]
         return "\n".join(lines) + "\n"
@@ -249,8 +269,8 @@ class SphereCoverage:
         self._spheres: Dict[str, List[Dict]] = copy.deepcopy(spheres)
         self._scene_buffer = kinematics.get("collision_sphere_buffer", 0.0) or 0.0
         self._self_buffer: Dict[str, float] = dict(kinematics.get("self_collision_buffer") or {})
-        self._self_ignore: Dict[str, List[str]] = dict(
-            kinematics.get("self_collision_ignore") or {}
+        self._self_ignore: Dict[str, List[str]] = copy.deepcopy(
+            dict(kinematics.get("self_collision_ignore") or {})
         )
 
         loaded = copy.deepcopy(self._config)
@@ -380,17 +400,37 @@ class SphereCoverage:
                 log_info(f"{name}: added {count} spheres, mesh now within {1000 * left:.1f} mm")
         return added
 
+    def remove_self_collision_ignore(self, pairs: List[Tuple[str, str]]) -> None:
+        """Hand link pairs back to the sphere self-collision check.
+
+        The pairs are removed from ``self_collision_ignore``, in both directions, for later
+        :meth:`analyze` calls and for :meth:`save`. See
+        :attr:`SphereCoverageReport.suggested_checks` for candidates.
+
+        Args:
+            pairs: Link pairs as ``(link_a, link_b)``.
+        """
+        for link_a, link_b in pairs:
+            for first, second in ((link_a, link_b), (link_b, link_a)):
+                if second in self._self_ignore.get(first, []):
+                    self._self_ignore[first] = [n for n in self._self_ignore[first] if n != second]
+            log_info(f"The sphere self-collision check now tests {link_a} - {link_b}")
+
     def save(self, output_path: str) -> None:
         """Write the robot configuration with the current collision spheres.
 
-        Everything else in the configuration is kept as loaded. The spheres are written
-        inline, also when the original configuration referenced a separate sphere file.
+        Everything else in the configuration is kept as loaded, except ``self_collision_ignore``
+        after :meth:`remove_self_collision_ignore`. The spheres are written inline, also when
+        the original configuration referenced a separate sphere file.
 
         Args:
             output_path: Path of the robot configuration file to write.
         """
         config = copy.deepcopy(self._config)
-        self._kinematics_data(config)["collision_spheres"] = copy.deepcopy(self._spheres)
+        kinematics = self._kinematics_data(config)
+        kinematics["collision_spheres"] = copy.deepcopy(self._spheres)
+        if "self_collision_ignore" in kinematics:
+            kinematics["self_collision_ignore"] = copy.deepcopy(self._self_ignore)
         folder = os.path.dirname(output_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
@@ -558,6 +598,7 @@ class SphereCoverage:
                             sphere_collision_ratio=float(spheres.float().mean()),
                             missed_ratio=float((hits & ~spheres).float().mean()),
                             false_alarm_ratio=float((spheres & ~hits).float().mean()),
+                            spheres_overlap_at_default=bool(sphere_hit[0]),
                         )
                     )
         finally:
