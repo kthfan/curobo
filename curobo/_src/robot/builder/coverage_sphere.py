@@ -25,6 +25,7 @@ from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_
 from curobo._src.geom.sphere_fit.wp_mesh_query import WarpMeshQuery
 from curobo._src.robot.kinematics.kinematics import Kinematics
 from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
+from curobo._src.robot.kinematics.kinematics_state import KinematicsState
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise, log_info, log_warn
@@ -350,6 +351,7 @@ class SphereCoverage:
         max_new_spheres_per_link: int = 16,
         min_radius: float = 0.005,
         num_candidates: int = 64,
+        link_names: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Add spheres where a link mesh sticks out of its spheres by more than ``tolerance``.
 
@@ -358,20 +360,34 @@ class SphereCoverage:
         mesh by at most ``tolerance``; the candidate that covers the most uncovered surface,
         weighted by how far it was uncovered, is kept. Existing spheres are not changed.
 
+        Links that no joint moves, such as the base link, are skipped unless named in
+        ``link_names``: the optimizer cannot steer them, and their spheres are often kept
+        small on purpose so they stay clear of the surface the robot is mounted on.
+
         Args:
             tolerance: Distance below which a mesh point counts as covered, and how far a new
                 sphere may stick out of the mesh, in meters.
             max_new_spheres_per_link: Most spheres added to one link.
             min_radius: Smallest radius of a new sphere, in meters.
             num_candidates: Uncovered surface points tried per added sphere.
+            link_names: Links to cover. Defaults to every link with a mesh that a joint moves.
 
         Returns:
             Number of spheres added per link.
         """
         if tolerance <= 0.0:
             log_and_raise(f"tolerance must be positive, got {tolerance}")
+        if link_names is None:
+            static = self._static_links()
+            if static:
+                log_info(f"Not covering links that no joint moves: {sorted(static)}")
+            link_names = [name for name in self._surfaces if name not in static]
+        unknown = set(link_names).difference(self._surfaces)
+        if unknown:
+            log_and_raise(f"No collision mesh and spheres to cover for links {sorted(unknown)}")
         added: Dict[str, int] = {}
-        for name, (points, normals) in self._surfaces.items():
+        for name in link_names:
+            points, normals = self._surfaces[name]
             buffer = self._scene_buffer_of(name)
             centers, radii = self._link_spheres(name, buffer)
             gap = self._gap(points, centers, radii)
@@ -522,6 +538,35 @@ class SphereCoverage:
         row, col = divmod(best, radius_grid.shape[0])
         return centers[row, col], float(radius_grid[col])
 
+    def _sample_kinematics(self, num_configs: int, seed: int) -> KinematicsState:
+        """Kinematics state of the default joint configuration followed by Halton samples.
+
+        Returns:
+            The state of ``num_configs + 1`` configurations, with link transforms.
+        """
+        kinematics = self._kinematics
+        limits = kinematics.get_joint_limits()
+        samples = SampleBuffer.create_halton_sample_buffer(
+            kinematics.get_dof(),
+            device_cfg=self.device_cfg,
+            low_bounds=limits.position_lower_limits,
+            up_bounds=limits.position_upper_limits,
+            seed=seed,
+            store_buffer=None,
+        ).get_samples(num_configs, bounded=True)
+        default = kinematics.default_joint_state.position.view(1, -1)
+        q = torch.cat([default, samples.to(default)])
+        return kinematics.compute_kinematics(
+            JointState.from_position(q.unsqueeze(1), joint_names=kinematics.joint_names)
+        )
+
+    def _static_links(self) -> List[str]:
+        """Links with a mesh whose pose relative to the base no joint changes."""
+        link_tf = self._sample_kinematics(64, seed=0).link_transforms.view(65, -1, 3, 4)
+        spread = (link_tf - link_tf[:1]).abs().amax(dim=(0, 2, 3))
+        name_to_idx = {v: k for k, v in self._mesh_data.body_idx_to_link_name.items()}
+        return [name for name in self._surfaces if float(spread[name_to_idx[name]]) < 1.0e-6]
+
     def _pair_ignored(self, link_a: str, link_b: str) -> bool:
         return link_b in self._self_ignore.get(link_a, []) or link_a in self._self_ignore.get(
             link_b, []
@@ -540,22 +585,8 @@ class SphereCoverage:
         data = self._mesh_data
         if data.self_collision_pairs is None:
             return [], 0.0, 0.0, []
-        kinematics = self._kinematics
-        limits = kinematics.get_joint_limits()
-        samples = SampleBuffer.create_halton_sample_buffer(
-            kinematics.get_dof(),
-            device_cfg=self.device_cfg,
-            low_bounds=limits.position_lower_limits,
-            up_bounds=limits.position_upper_limits,
-            seed=seed,
-            store_buffer=None,
-        ).get_samples(num_configs, bounded=True)
-        default = kinematics.default_joint_state.position.view(1, -1)
-        q = torch.cat([default, samples.to(default)])
-        state = kinematics.compute_kinematics(
-            JointState.from_position(q.unsqueeze(1), joint_names=kinematics.joint_names)
-        )
-        link_tf = state.link_transforms.view(q.shape[0], -1, 3, 4)
+        state = self._sample_kinematics(num_configs, seed)
+        link_tf = state.link_transforms.view(num_configs + 1, -1, 3, 4)
         names = data.body_idx_to_link_name
         name_to_idx = {v: k for k, v in names.items()}
 
@@ -565,7 +596,7 @@ class SphereCoverage:
             return centers @ tf[:, :, :3].transpose(1, 2) + tf[:, None, :, 3], radii
 
         all_pairs = data.self_collision_pairs.tolist()
-        mesh_any = torch.zeros(q.shape[0], dtype=torch.bool, device=q.device)
+        mesh_any = torch.zeros(num_configs + 1, dtype=torch.bool, device=link_tf.device)
         sphere_any = torch.zeros_like(mesh_any)
         results, at_default = [], []
         try:

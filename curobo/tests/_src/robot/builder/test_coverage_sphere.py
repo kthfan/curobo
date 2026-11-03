@@ -63,11 +63,13 @@ def test_cover_meshes_reduces_protrusion_with_spheres_inside_the_meshes(baseline
     after = coverage.analyze(tolerance=tolerance, num_configs=NUM_CONFIGS)
 
     assert added and all(1 <= n <= 4 for n in added.values())
+    assert "panda_link0" not in added
     before = {link.link_name: link for link in baseline.links}
-    for link in after.links:
+    moving = [link for link in after.links if link.link_name != "panda_link0"]
+    for link in moving:
         assert link.p95_protrusion <= before[link.link_name].p95_protrusion + 1.0e-6
-    assert sum(link.p95_protrusion for link in after.links) < 0.6 * sum(
-        link.p95_protrusion for link in baseline.links
+    assert sum(link.p95_protrusion for link in moving) < 0.6 * sum(
+        before[link.link_name].p95_protrusion for link in moving
     )
 
     # Every new sphere sticks out of its link mesh by at most the tolerance.
@@ -87,9 +89,16 @@ def test_cover_meshes_reduces_protrusion_with_spheres_inside_the_meshes(baseline
         assert torch.all(-sdf >= radii - tolerance - 1.0e-4)
 
 
-def test_cover_meshes_rejects_a_non_positive_tolerance():
+def test_cover_meshes_skips_the_base_unless_named_and_checks_its_arguments():
+    coverage = _coverage()
     with pytest.raises(ValueError):
-        _coverage().cover_meshes(tolerance=0.0)
+        coverage.cover_meshes(tolerance=0.0)
+    with pytest.raises(ValueError):
+        coverage.cover_meshes(link_names=["attached_object"])
+    # panda_link0 does not move, so only an explicit request covers it.
+    assert coverage.cover_meshes(link_names=["panda_link0"], max_new_spheres_per_link=1) == {
+        "panda_link0": 1
+    }
 
 
 def test_remove_self_collision_ignore_and_save_keep_the_rest_of_the_configuration(tmp_path):

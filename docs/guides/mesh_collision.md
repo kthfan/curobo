@@ -214,9 +214,8 @@ seed out of the collision; only the other seeds can succeed. To fix it:
 
 1. Find the link with `get_mesh_collision_links` (see the previous section). Many seeds failing
    on the same link point to that link's spheres.
-2. Cover that link better with spheres: add or enlarge spheres where its mesh sticks out of
-   them, in the robot YAML (see {ref}`tutorial_build_robot_model`). The optimizer then steers
-   the link away itself, which is the most effective fix.
+2. Cover that link better with spheres (see {ref}`mesh_collision_cover_spheres`). The
+   optimizer then steers the link away itself, which is the most effective fix.
 3. Raise `optimizer_collision_activation_distance` (default 0.01 m) on the solver config, for
    example to 0.02 m. The optimizer then keeps the spheres farther from obstacles, which also
    keeps the parts of the meshes outside the spheres clear. The success check is unchanged,
@@ -227,13 +226,71 @@ seed out of the collision; only the other seeds can succeed. To fix it:
 Avoid the robot YAML's `collision_sphere_buffer` for this: it enlarges the spheres for the
 success check and self-collision too, so it rejects more solutions instead of steering them.
 
+(mesh_collision_cover_spheres)=
+## Cover the link meshes with spheres
+
+{py:class}`~curobo.robot_builder.SphereCoverage` measures where a robot's link meshes stick out
+of its collision spheres, adds spheres there, and writes the robot YAML. The example script
+does all three and writes a report next to the configuration:
+
+```bash
+python -m curobo.examples.guides.cover_link_meshes_with_spheres --robot franka.yml
+```
+
+The same steps in Python:
+
+```python
+from curobo.robot_builder import SphereCoverage
+
+coverage = SphereCoverage("franka.yml")
+before = coverage.analyze()
+coverage.cover_meshes(tolerance=0.01)
+after = coverage.analyze()
+print(after.to_markdown(baseline=before))
+coverage.save("franka_covered.yml")
+```
+
+- **Links:** how far each link mesh sticks out of its own spheres, before and after. New
+  spheres keep the existing ones, sit inside the mesh and stick out of it by at most
+  `tolerance`. Links that no joint moves, such as the base, are left alone unless you name
+  them in `link_names`: their spheres are often kept small on purpose, clear of the surface
+  the robot is mounted on.
+- **Self-collision pairs:** on sampled joint configurations, how often each pair of link
+  meshes collides while its spheres do not (*missed*), and the reverse (*false alarm*). The
+  summary gives both for whole configurations: a missed configuration passes the sphere check
+  and fails only the mesh check.
+- **Sphere count:** every added sphere makes the sphere collision costs a little slower. Raise
+  `tolerance` or lower `max_new_spheres_per_link` to add fewer.
+
+`save` keeps everything else in the YAML as loaded, so the result can replace the original.
+
+Pairs listed in `self_collision_ignore` stay invisible to the sphere check, however well the
+spheres cover the meshes. The report lists ignored pairs whose meshes collide although their
+spheres do not overlap at the default joint configuration;
+{py:meth}`~curobo.robot_builder.SphereCoverage.remove_self_collision_ignore`, or the script's
+`--check_suggested_pairs`, hands them back to the sphere check. For Franka these are
+`panda_link5` with `panda_link7`, `panda_hand` and both fingers. On 2000 random configurations
+with a 1 cm tolerance:
+
+| | Missed | False alarm | Spheres |
+| --- | --- | --- | --- |
+| Shipped `franka.yml` | 8.2 % | 3.7 % | 61 |
+| Covered | 8.1 % | 5.3 % | 125 |
+| Covered, suggested pairs checked | 0.0 % | 9.6 % | 124 |
+
+Covering alone barely changes Franka's self-collision misses, because they come from the
+ignored pairs. It does bring every moving link's mesh within 1 cm of its spheres, which counts
+for the scene: the meshes of the shipped spheres stick out by up to 9 cm. The false alarms
+include the `self_collision_buffer` margins of the robot YAML.
+
 ## Check self-collision with the meshes
 
-The sphere self-collision check has to skip link pairs whose spheres overlap in every
-configuration, such as Franka's `panda_link5` with `panda_link7` and with `panda_hand`. Their
-meshes still collide when the wrist folds onto the forearm: in about 9 % of random Franka
-configurations for `panda_link5` and `panda_hand`. Pass `mesh_self_collision_check=True` to
-check the exact link meshes against each other as well:
+The sphere self-collision check skips the link pairs listed in `self_collision_ignore`, such
+as Franka's `panda_link5` with `panda_link7` and with `panda_hand`. Their meshes still collide
+when the wrist folds onto the forearm: in about 6 and 7 % of random Franka configurations.
+{ref}`mesh_collision_cover_spheres` shows how to hand such pairs back to the sphere check.
+Pass `mesh_self_collision_check=True` to check the exact link meshes against each other as
+well:
 
 ```python
 MotionPlannerCfg.create(
