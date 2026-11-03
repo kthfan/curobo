@@ -270,7 +270,7 @@ class SphereCoverage:
                 configuration folder, or the loaded dictionary.
             device_cfg: Device configuration. Defaults to CUDA:0.
             num_surface_samples: Points sampled on each link mesh to measure coverage.
-            seed: Seed of the surface samples.
+            seed: Seed of the surface samples and of the candidates of :meth:`cover_meshes`.
         """
         self.device_cfg = device_cfg or DeviceCfg()
         if isinstance(robot_config, str) and not os.path.exists(robot_config):
@@ -296,6 +296,7 @@ class SphereCoverage:
         )
         self._mesh_data = self._kinematics.config.kinematics_config.get_robot_mesh_data()
         rng = np.random.default_rng(seed)
+        self._generator = torch.Generator(device=self.device_cfg.device).manual_seed(seed)
         self._surfaces: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._queries: Dict[str, WarpMeshQuery] = {}
         for name, mesh in self._kinematics.get_robot_collision_link_meshes().items():
@@ -529,7 +530,8 @@ class SphereCoverage:
         """
         idx = torch.nonzero(uncovered).view(-1)
         worst = idx[torch.argsort(gap[idx], descending=True)[: num_candidates // 2]]
-        others = idx[torch.randperm(idx.numel(), device=idx.device)[: num_candidates // 2]]
+        order = torch.randperm(idx.numel(), device=idx.device, generator=self._generator)
+        others = idx[order[: num_candidates // 2]]
         idx = torch.unique(torch.cat([worst, others]))
         base = points[idx]
         direction = torch.cat([-normals[idx], normals[idx]])

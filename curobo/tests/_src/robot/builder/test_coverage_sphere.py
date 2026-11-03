@@ -126,6 +126,13 @@ def test_remove_self_collision_ignore_and_save_keep_the_rest_of_the_configuratio
     assert reloaded.analyze(num_configs=NUM_CONFIGS).num_spheres == report.num_spheres
 
 
+def test_cover_meshes_is_reproducible():
+    first, second = _coverage(), _coverage()
+    first.cover_meshes(max_new_spheres_per_link=2)
+    second.cover_meshes(max_new_spheres_per_link=2)
+    assert first.collision_spheres == second.collision_spheres
+
+
 def test_report_markdown_compares_with_a_baseline(baseline):
     text = baseline.to_markdown()
     assert "## Links" in text and "## Self-collision pairs" in text and "->" not in text
