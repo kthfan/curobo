@@ -65,6 +65,8 @@ class PairSphereCoverage:
     sphere_collision_ratio: float
     #: Fraction of configurations where the meshes collide and the spheres do not.
     missed_ratio: float
+    #: Fraction of configurations where the spheres overlap and the meshes do not.
+    false_alarm_ratio: float
 
 
 @dataclass
@@ -78,12 +80,17 @@ class SphereCoverageReport:
     #: Per-link surface coverage, for links that have a mesh.
     links: List[LinkSphereCoverage]
     #: Per-pair self-collision statistics, for the pairs the mesh self-collision check tests
-    #: and whose meshes collided at least once.
+    #: whose meshes collided at least once, or whose spheres did while the sphere check
+    #: tests the pair.
     pairs: List[PairSphereCoverage]
     #: Fraction of configurations where some link meshes collide while the sphere
     #: self-collision check, with its ignore list, reports nothing: the solver accepts them
     #: and only the mesh check rejects them.
     missed_config_ratio: float
+    #: Fraction of configurations where the sphere self-collision check reports a collision
+    #: while no pair of link meshes collides: spheres that are larger than the meshes make the
+    #: solver avoid configurations that are free.
+    false_alarm_config_ratio: float
     #: Pairs checked by the sphere check whose spheres overlap at the default joint
     #: configuration, as ``(link_a, link_b)``.
     default_config_collisions: List[Tuple[str, str]] = field(default_factory=list)
@@ -123,6 +130,13 @@ class SphereCoverageReport:
                 if baseline
                 else f"{pct(self.missed_config_ratio)} %."
             ),
+            "- Configurations the sphere check rejects while the link meshes are free: "
+            + (
+                f"{pct(baseline.false_alarm_config_ratio)} % -> "
+                f"{pct(self.false_alarm_config_ratio)} %."
+                if baseline
+                else f"{pct(self.false_alarm_config_ratio)} %."
+            ),
             "- Collision spheres: "
             + (
                 f"{sum(baseline.num_spheres.values())} -> {sum(self.num_spheres.values())}."
@@ -156,11 +170,13 @@ class SphereCoverageReport:
             "",
             "## Self-collision pairs",
             "",
-            "Pairs whose meshes collided in a sampled configuration. *Missed*: the meshes "
-            "collide and the spheres do not.",
+            "Pairs whose meshes, or whose spheres where the sphere check tests the pair, "
+            "collided in a sampled configuration. *Missed*: the meshes "
+            "collide and the spheres do not. *False alarm*: the spheres overlap and the meshes "
+            "do not.",
             "",
-            "| pair | sphere check | mesh (%) | spheres (%) | missed (%) |",
-            "|---|---|---|---|---|",
+            "| pair | sphere check | mesh (%) | spheres (%) | missed (%) | false alarm (%) |",
+            "|---|---|---|---|---|---|",
         ]
         for p in self.pairs:
             old = old_pairs.get((p.link_a, p.link_b))
@@ -169,7 +185,8 @@ class SphereCoverageReport:
                 f"| {p.link_a} - {p.link_b} | {status} "
                 f"| {pct(p.mesh_collision_ratio)} "
                 f"| {pair_of(old, p, 'sphere_collision_ratio', pct)} "
-                f"| {pair_of(old, p, 'missed_ratio', pct)} |"
+                f"| {pair_of(old, p, 'missed_ratio', pct)} "
+                f"| {pair_of(old, p, 'false_alarm_ratio', pct)} |"
             )
         ignored = [p for p in self.pairs if p.sphere_check_ignores and p.missed_ratio > 0.0]
         if ignored:
@@ -295,13 +312,14 @@ class SphereCoverage:
                     uncovered_ratio=float((gap > tolerance).float().mean()),
                 )
             )
-        pairs, missed, at_default = self._sample_self_collision(num_configs, seed)
+        pairs, missed, false_alarm, at_default = self._sample_self_collision(num_configs, seed)
         return SphereCoverageReport(
             tolerance=tolerance,
             num_configs=num_configs,
             links=links,
             pairs=pairs,
             missed_config_ratio=missed,
+            false_alarm_config_ratio=false_alarm,
             default_config_collisions=at_default,
             num_spheres={name: len(self._link_spheres(name, 0.0)[1]) for name in self._spheres},
         )
@@ -435,8 +453,8 @@ class SphereCoverage:
         Candidates are the farthest uncovered points plus a random sample of the others, each
         stepped inward along its normal, and outward too in case the normal is flipped. A
         candidate radius is kept while the sphere sticks out of the mesh by at most
-        ``tolerance``, i.e. its center stays at least ``radius - tolerance`` from the
-        surface; the first radius that fails ends the search for that candidate.
+        ``tolerance``: its center lies inside the mesh, at least ``radius - tolerance`` deep.
+        The first radius that fails ends the search for that candidate.
         """
         idx = torch.nonzero(uncovered).view(-1)
         worst = idx[torch.argsort(gap[idx], descending=True)[: num_candidates // 2]]
@@ -447,8 +465,8 @@ class SphereCoverage:
         base = torch.cat([base, base])
         # Candidate centers [num_candidates, num_radii, 3].
         centers = base[:, None, :] + direction[:, None, :] * radius_grid[None, :, None]
-        closest, _ = self._queries[name].query_closest_point(centers.reshape(-1, 3))
-        depth = torch.linalg.norm(closest - centers.reshape(-1, 3), dim=-1).view(centers.shape[:2])
+        sdf, _ = self._queries[name].query_sdf(centers.reshape(-1, 3))
+        depth = -sdf.view(centers.shape[:2])
         fits = (depth >= radius_grid[None, :] - tolerance).int().cumprod(dim=1).bool()
         if not fits.any():
             return None, 0.0
@@ -471,17 +489,17 @@ class SphereCoverage:
 
     def _sample_self_collision(
         self, num_configs: int, seed: int
-    ) -> Tuple[List[PairSphereCoverage], float, List[Tuple[str, str]]]:
+    ) -> Tuple[List[PairSphereCoverage], float, float, List[Tuple[str, str]]]:
         """Test mesh and sphere self-collision per pair on the default and sampled configs.
 
         Returns:
-            Per-pair statistics over the samples, the fraction of samples the sphere check
-            accepts while the meshes collide, and the checked pairs whose spheres overlap at
-            the default configuration.
+            Per-pair statistics over the samples, the fractions of samples the sphere check
+            accepts while the meshes collide and rejects while they are free, and the checked
+            pairs whose spheres overlap at the default configuration.
         """
         data = self._mesh_data
         if data.self_collision_pairs is None:
-            return [], 0.0, []
+            return [], 0.0, 0.0, []
         kinematics = self._kinematics
         limits = kinematics.get_joint_limits()
         samples = SampleBuffer.create_halton_sample_buffer(
@@ -530,7 +548,7 @@ class SphereCoverage:
                     if bool(sphere_hit[0]):
                         at_default.append((name_a, name_b))
                 hits, spheres = mesh_hit[1:], sphere_hit[1:]
-                if hits.any():
+                if hits.any() or (spheres.any() and not ignored):
                     results.append(
                         PairSphereCoverage(
                             link_a=name_a,
@@ -539,11 +557,13 @@ class SphereCoverage:
                             mesh_collision_ratio=float(hits.float().mean()),
                             sphere_collision_ratio=float(spheres.float().mean()),
                             missed_ratio=float((hits & ~spheres).float().mean()),
+                            false_alarm_ratio=float((spheres & ~hits).float().mean()),
                         )
                     )
         finally:
             data.set_self_collision_pairs(all_pairs)
         missed = (mesh_any & ~sphere_any)[1:]
+        false_alarm = (sphere_any & ~mesh_any)[1:]
         if bool(mesh_any[0]):
             log_warn("link meshes collide at the default joint configuration")
-        return results, float(missed.float().mean()), at_default
+        return results, float(missed.float().mean()), float(false_alarm.float().mean()), at_default
