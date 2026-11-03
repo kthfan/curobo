@@ -232,7 +232,7 @@ class SphereCoverage:
 
         coverage = SphereCoverage("franka.yml")
         before = coverage.analyze()
-        coverage.cover_meshes(tolerance=0.005)
+        coverage.cover_meshes()
         after = coverage.analyze()
         print(after.to_markdown(baseline=before))
         coverage.save("franka_covered.yml")
@@ -301,7 +301,7 @@ class SphereCoverage:
         return self._spheres
 
     def analyze(
-        self, tolerance: float = 0.005, num_configs: int = 2000, seed: int = 345
+        self, tolerance: float = 0.01, num_configs: int = 2000, seed: int = 345
     ) -> SphereCoverageReport:
         """Measure how well the current spheres cover the link meshes.
 
@@ -346,7 +346,7 @@ class SphereCoverage:
 
     def cover_meshes(
         self,
-        tolerance: float = 0.005,
+        tolerance: float = 0.01,
         max_new_spheres_per_link: int = 16,
         min_radius: float = 0.005,
         num_candidates: int = 64,

@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--robot", default="franka.yml", help="Robot configuration file.")
     parser.add_argument("--output", default=None, help="Robot configuration to write.")
     parser.add_argument("--report", default=None, help="Markdown report to write.")
-    parser.add_argument("--tolerance", type=float, default=0.005, help="Allowed gap in meters.")
+    parser.add_argument("--tolerance", type=float, default=0.01, help="Allowed gap in meters.")
     parser.add_argument("--max_new_spheres_per_link", type=int, default=16)
     parser.add_argument("--num_configs", type=int, default=2000)
     parser.add_argument(

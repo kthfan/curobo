@@ -46,7 +46,7 @@ Example:
         >>>
         >>> coverage = SphereCoverage("franka.yml")
         >>> before = coverage.analyze()
-        >>> coverage.cover_meshes(tolerance=0.005)
+        >>> coverage.cover_meshes()
         >>> print(coverage.analyze().to_markdown(baseline=before))
         >>> coverage.save("franka_covered.yml")
 
