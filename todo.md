@@ -83,6 +83,22 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   in every row (before: e.g. 17.11 % vs 16.97 %); with a sign-only plane reject first, the
   dense-mesh check is as fast as before or faster (batch 4096, budget 256: 31.7 -> 30.0 ms).
 
+- **Cover the link meshes with spheres** (user's choice: report and YAML). `SphereCoverage`
+  in `curobo/_src/robot/builder/coverage_sphere.py`, public in `curobo.robot_builder`;
+  example `curobo/examples/guides/cover_link_meshes_with_spheres.py`; guide section
+  "Cover the link meshes with spheres". `analyze()`: per link, how far the mesh sticks out of
+  its spheres; per mesh self-collision pair and per configuration, missed (meshes collide,
+  spheres do not) and false alarms. `cover_meshes()` keeps the spheres and greedily adds
+  spheres inside the mesh (signed distance: center at least `r - tolerance` deep), default
+  tolerance 1 cm and 16 per link, skips links no joint moves. `suggested_checks` /
+  `remove_self_collision_ignore()` / `--check_suggested_pairs` hand ignored pairs back to the
+  sphere check. `save()` replaces only the spheres (and the edited ignore list).
+  Franka (2000 configs): missed 8.2 % -> 8.1 % covered, 0.0 % with the four `panda_link5`
+  pairs checked; false alarms 3.7 -> 3.9 / 8.6 %; spheres 61 -> 108; every moving link
+  within 1 cm (was up to 90 mm). UR10e: missed 1.9 -> 0.8 %, spheres 20 -> 93;
+  `upper_arm_link` and `forearm_link` stay at p95 24 / 15 mm with 16 new spheres each.
+  Not measured yet: solver success and time with the covered YAML.
+
 ## Open items
 
 ### Small, ready to do

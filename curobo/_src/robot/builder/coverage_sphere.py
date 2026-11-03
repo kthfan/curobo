@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import trimesh
+import yaml
 
 # CuRobo
 from curobo._src.geom.collision.wp_robot_mesh_collision import check_robot_mesh_self_collision
@@ -30,7 +31,20 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise, log_info, log_warn
 from curobo._src.util.sampling.sample_buffer import SampleBuffer
-from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml, write_yaml
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
+
+
+class _ConfigDumper(yaml.SafeDumper):
+    """YAML dumper that keeps key order and writes lists of scalars inline."""
+
+
+def _represent_list(dumper: yaml.SafeDumper, data: list) -> yaml.Node:
+    inline = all(not isinstance(v, (dict, list, tuple)) for v in data)
+    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=inline)
+
+
+_ConfigDumper.add_representer(list, _represent_list)
+_ConfigDumper.add_representer(tuple, _represent_list)
 
 
 @dataclass
@@ -450,7 +464,8 @@ class SphereCoverage:
         folder = os.path.dirname(output_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        write_yaml(config, output_path)
+        with open(output_path, "w") as file:
+            yaml.dump(config, file, Dumper=_ConfigDumper, sort_keys=False)
         log_info(f"Saved robot configuration to {output_path}")
 
     # ------------------------------------------------------------------------------------

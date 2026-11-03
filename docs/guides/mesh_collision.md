@@ -275,8 +275,8 @@ with a 1 cm tolerance:
 | | Missed | False alarm | Spheres |
 | --- | --- | --- | --- |
 | Shipped `franka.yml` | 8.2 % | 3.7 % | 61 |
-| Covered | 8.1 % | 5.3 % | 125 |
-| Covered, suggested pairs checked | 0.0 % | 9.6 % | 124 |
+| Covered | 8.1 % | 3.9 % | 108 |
+| Covered, suggested pairs checked | 0.0 % | 8.6 % | 108 |
 
 Covering alone barely changes Franka's self-collision misses, because they come from the
 ignored pairs. It does bring every moving link's mesh within 1 cm of its spheres, which counts
