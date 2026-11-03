@@ -40,6 +40,16 @@ Example:
         >>> if result["has_collision"]:
         ...     print(f"Found {result['num_colliding_pairs']} colliding pairs")
 
+    Covering the link meshes with spheres, for the exact mesh collision check::
+
+        >>> from curobo.robot_builder import SphereCoverage
+        >>>
+        >>> coverage = SphereCoverage("franka.yml")
+        >>> before = coverage.analyze()
+        >>> coverage.cover_meshes(tolerance=0.005)
+        >>> print(coverage.analyze().to_markdown(baseline=before))
+        >>> coverage.save("franka_covered.yml")
+
     Exporting to XRDF format::
 
         >>> config = builder.build()
@@ -48,6 +58,7 @@ Example:
 """
 
 from curobo._src.robot.builder.builder_robot import RobotBuilder
+from curobo._src.robot.builder.coverage_sphere import SphereCoverage, SphereCoverageReport
 from curobo._src.robot.builder.debugger_robot import RobotDebugger
 
-__all__ = ["RobotBuilder", "RobotDebugger"]
+__all__ = ["RobotBuilder", "RobotDebugger", "SphereCoverage", "SphereCoverageReport"]
