@@ -94,9 +94,10 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   `remove_self_collision_ignore()` / `--check_suggested_pairs` hand ignored pairs back to the
   sphere check. `save()` replaces only the spheres (and the edited ignore list).
   Franka (2000 configs): missed 8.2 % -> 8.1 % covered, 0.0 % with the four `panda_link5`
-  pairs checked; false alarms 3.7 -> 3.9 / 8.6 %; spheres 61 -> 108; every moving link
-  within 1 cm (was up to 90 mm). UR10e: missed 1.9 -> 0.8 %, spheres 20 -> 93;
-  `upper_arm_link` and `forearm_link` stay at p95 24 / 15 mm with 16 new spheres each.
+  pairs checked; false alarms 3.7 -> 4.0 / 8.5 %; spheres 61 -> 111; every moving link
+  within 1 cm (was up to 90 mm). UR10e: missed 1.9 -> 0.2 %, false alarms 4.0 -> 8.4 %,
+  spheres 20 -> 90; `upper_arm_link` and `forearm_link` stay at p95 24 / 16 mm with 16 new
+  spheres each.
   Not measured yet: solver success and time with the covered YAML.
 
 ## Open items
