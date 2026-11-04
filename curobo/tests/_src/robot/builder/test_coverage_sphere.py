@@ -155,7 +155,8 @@ def test_cover_meshes_keeps_clear_of_links_only_the_sphere_check_tests():
 
     old = {(p.link_a, p.link_b): p for p in before.pairs}
     sphere_only = [p for p in after.pairs if not p.mesh_check_tests]
-    assert any({p.link_a, p.link_b} == {"forearm_link", "wrist_1_link"} for p in sphere_only)
+    tested = [set(pair) for pair in coverage._sphere_checked_pairs()]
+    assert {"forearm_link", "wrist_1_link"} in tested
     for p in sphere_only:
         previous = old.get((p.link_a, p.link_b))
         assert (
