@@ -73,7 +73,11 @@ class PairSphereCoverage:
     link_b: str
     #: True when ``self_collision_ignore`` excludes the pair from the sphere check.
     sphere_check_ignores: bool
-    #: Fraction of configurations where the two link meshes collide.
+    #: True when the mesh self-collision check tests the pair. It skips links that a single
+    #: joint connects and links in one rigid body, which touch by design.
+    mesh_check_tests: bool
+    #: Fraction of configurations where the two link meshes collide; 0 when the mesh check
+    #: does not test the pair.
     mesh_collision_ratio: float
     #: Fraction of configurations where the two links' spheres overlap, self-collision
     #: buffers included, whether or not the sphere check ignores the pair.
@@ -208,7 +212,8 @@ class SphereCoverageReport:
             "Pairs whose meshes, or whose spheres where the sphere check tests the pair, "
             "collided in a sampled configuration. *Missed*: the meshes "
             "collide and the spheres do not. *False alarm*: the spheres overlap and the meshes "
-            "do not.",
+            "do not. The mesh check does not test links that a joint connects; spheres of "
+            "such a pair that the sphere check tests only reject configurations.",
             "",
             "| pair | sphere check | mesh (%) | spheres (%) | missed (%) | false alarm (%) |",
             "|---|---|---|---|---|---|",
@@ -216,9 +221,10 @@ class SphereCoverageReport:
         for p in self.pairs:
             old = old_pairs.get((p.link_a, p.link_b))
             status = "ignored" if p.sphere_check_ignores else "checked"
+            mesh = pct(p.mesh_collision_ratio) if p.mesh_check_tests else "not tested"
             lines.append(
                 f"| {p.link_a} - {p.link_b} | {status} "
-                f"| {pct(p.mesh_collision_ratio)} "
+                f"| {mesh} "
                 f"| {pair_of(old, p, 'sphere_collision_ratio', pct)} "
                 f"| {pair_of(old, p, 'missed_ratio', pct)} "
                 f"| {pair_of(old, p, 'false_alarm_ratio', pct)} |"
@@ -287,6 +293,14 @@ class SphereCoverage:
         self._self_ignore: Dict[str, List[str]] = copy.deepcopy(
             dict(kinematics.get("self_collision_ignore") or {})
         )
+        self._collision_links: List[str] = list(kinematics.get("collision_link_names") or [])
+        named = set(self._self_ignore).union(*self._self_ignore.values())
+        unknown = sorted(named.difference(self._collision_links))
+        if unknown:
+            log_warn(
+                f"self_collision_ignore names links that are not collision links: {unknown}. "
+                "Pairs with a misspelled link stay checked by the sphere check."
+            )
 
         loaded = copy.deepcopy(self._config)
         self._kinematics_data(loaded)["load_collision_meshes"] = True
@@ -407,13 +421,22 @@ class SphereCoverage:
             centers, radii = self._link_spheres(name, buffer)
             gap = self._gap(points, centers, radii)
             radius_grid = self._radius_grid(points, max(min_radius, tolerance))
+            guard = self._guard_spheres(name, buffer)
             count = 0
             while count < max_new_spheres_per_link:
                 uncovered = gap > tolerance
                 if not uncovered.any():
                     break
                 center, radius = self._best_sphere(
-                    name, points, normals, gap, uncovered, radius_grid, tolerance, num_candidates
+                    name,
+                    points,
+                    normals,
+                    gap,
+                    uncovered,
+                    radius_grid,
+                    tolerance,
+                    num_candidates,
+                    guard,
                 )
                 if center is None:
                     break
@@ -519,14 +542,16 @@ class SphereCoverage:
         radius_grid: torch.Tensor,
         tolerance: float,
         num_candidates: int,
+        guard: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], float]:
         """Pick the new sphere that covers the most uncovered surface.
 
         Candidates are the farthest uncovered points plus a random sample of the others, each
         stepped inward along its normal, and outward too in case the normal is flipped. A
         candidate radius is kept while the sphere sticks out of the mesh by at most
-        ``tolerance``: its center lies inside the mesh, at least ``radius - tolerance`` deep.
-        The first radius that fails ends the search for that candidate.
+        ``tolerance``: its center lies inside the mesh, at least ``radius - tolerance`` deep,
+        and it overlaps none of the ``guard`` spheres (see :meth:`_guard_spheres`). The first
+        radius that fails ends the search for that candidate.
         """
         idx = torch.nonzero(uncovered).view(-1)
         worst = idx[torch.argsort(gap[idx], descending=True)[: num_candidates // 2]]
@@ -540,7 +565,12 @@ class SphereCoverage:
         centers = base[:, None, :] + direction[:, None, :] * radius_grid[None, :, None]
         sdf, _ = self._queries[name].query_sdf(centers.reshape(-1, 3))
         depth = -sdf.view(centers.shape[:2])
-        fits = (depth >= radius_grid[None, :] - tolerance).int().cumprod(dim=1).bool()
+        fits = depth >= radius_grid[None, :] - tolerance
+        if guard is not None:
+            clearance = torch.cdist(centers.reshape(-1, 3), guard[:, :3]) - guard[None, :, 3]
+            clearance = clearance.min(dim=-1).values.view(centers.shape[:2])
+            fits &= clearance > radius_grid[None, :]
+        fits = fits.int().cumprod(dim=1).bool()
         if not fits.any():
             return None, 0.0
         # Weighted surface each candidate sphere covers, among the uncovered points.
@@ -589,43 +619,100 @@ class SphereCoverage:
             link_b, []
         )
 
+    def _sphere_checked_pairs(self) -> List[Tuple[str, str]]:
+        """Pairs of collision links with spheres that the sphere self-collision check tests."""
+        links = [
+            n
+            for n in self._collision_links
+            if self._link_spheres(n, self._self_buffer.get(n, 0.0))[1].numel() > 0
+        ]
+        return [
+            (a, b)
+            for i, a in enumerate(links)
+            for b in links[i + 1 :]
+            if not self._pair_ignored(a, b)
+        ]
+
+    def _mesh_tested_pairs(self) -> List[Tuple[int, int]]:
+        """Body index pairs that the mesh self-collision check tests."""
+        pairs = self._mesh_data.self_collision_pairs
+        return [] if pairs is None else [tuple(p) for p in pairs.tolist()]
+
+    def _world_self_spheres(
+        self, name: str, link_tf: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """World centers ``[configs, n, 3]`` and self-collision radii ``[n]`` of a link."""
+        centers, radii = self._link_spheres(name, self._self_buffer.get(name, 0.0))
+        tf = link_tf[:, self._body_index(name)]
+        return centers @ tf[:, :, :3].transpose(1, 2) + tf[:, None, :, 3], radii
+
+    def _body_index(self, name: str) -> int:
+        return self._kinematics.config.kinematics_config.link_name_to_idx_map[name]
+
+    def _guard_spheres(self, name: str, scene_buffer: float) -> Optional[torch.Tensor]:
+        """Spheres a new sphere of ``name`` must never overlap, in the link's frame.
+
+        These are the spheres of links that the sphere check tests against ``name`` while the
+        mesh check does not, e.g. links that a joint connects: any overlap there only rejects
+        configurations. They are taken over the default and sampled configurations and
+        returned as ``[n, 4]`` (center, self-collision radius minus this link's scene buffer
+        plus its self-collision buffer, so that a candidate's scene radius can be compared).
+        """
+        names = self._mesh_data.body_idx_to_link_name
+        mesh_pairs = {frozenset((names[a], names[b])) for a, b in self._mesh_tested_pairs()}
+        partners = [
+            b if a == name else a
+            for a, b in self._sphere_checked_pairs()
+            if name in (a, b) and frozenset((a, b)) not in mesh_pairs
+        ]
+        if not partners:
+            return None
+        link_tf = self._sample_kinematics(256, seed=1).link_transforms.view(257, -1, 3, 4)
+        own = link_tf[:, self._body_index(name)]
+        guard = []
+        offset = self._self_buffer.get(name, 0.0) - scene_buffer
+        for partner in partners:
+            centers, radii = self._world_self_spheres(partner, link_tf)
+            local = (centers - own[:, None, :, 3]) @ own[:, :, :3]
+            r = (radii + offset).expand(local.shape[0], -1)
+            guard.append(torch.cat([local, r[..., None]], dim=-1).reshape(-1, 4))
+        return torch.cat(guard)
+
     def _sample_self_collision(
         self, num_configs: int, seed: int
     ) -> Tuple[List[PairSphereCoverage], float, float, List[Tuple[str, str]]]:
         """Test mesh and sphere self-collision per pair on the default and sampled configs.
 
+        Pairs are those the mesh check tests and those the sphere check tests.
+
         Returns:
             Per-pair statistics over the samples, the fractions of samples the sphere check
-            accepts while the meshes collide and rejects while they are free, and the checked
-            pairs whose spheres overlap at the default configuration.
+            accepts while the meshes collide and rejects while they are free, and the pairs
+            the sphere check tests whose spheres overlap at the default configuration.
         """
         data = self._mesh_data
-        if data.self_collision_pairs is None:
-            return [], 0.0, 0.0, []
         state = self._sample_kinematics(num_configs, seed)
         link_tf = state.link_transforms.view(num_configs + 1, -1, 3, 4)
         names = data.body_idx_to_link_name
-        name_to_idx = {v: k for k, v in names.items()}
-
-        def world_spheres(name: str) -> Tuple[torch.Tensor, torch.Tensor]:
-            centers, radii = self._link_spheres(name, self._self_buffer.get(name, 0.0))
-            tf = link_tf[:, name_to_idx[name]]
-            return centers @ tf[:, :, :3].transpose(1, 2) + tf[:, None, :, 3], radii
-
-        all_pairs = data.self_collision_pairs.tolist()
+        mesh_pairs = self._mesh_tested_pairs()
+        mesh_by_name = {frozenset((names[a], names[b])): (a, b) for a, b in mesh_pairs}
+        pairs = [(names[a], names[b]) for a, b in mesh_pairs]
+        pairs += [p for p in self._sphere_checked_pairs() if frozenset(p) not in mesh_by_name]
         mesh_any = torch.zeros(num_configs + 1, dtype=torch.bool, device=link_tf.device)
         sphere_any = torch.zeros_like(mesh_any)
         results, at_default = [], []
         try:
-            for a, b in all_pairs:
-                name_a, name_b = names[a], names[b]
-                data.set_self_collision_pairs([(a, b)])
-                mesh_hit, _ = check_robot_mesh_self_collision(data, state.link_transforms)
-                mesh_hit = mesh_hit.bool()
-                sphere_hit = torch.zeros_like(mesh_hit)
+            for name_a, name_b in pairs:
+                body_pair = mesh_by_name.get(frozenset((name_a, name_b)))
+                mesh_hit = torch.zeros_like(mesh_any)
+                if body_pair is not None:
+                    data.set_self_collision_pairs([body_pair])
+                    mesh_hit = check_robot_mesh_self_collision(data, state.link_transforms)[0]
+                    mesh_hit = mesh_hit.bool()
+                sphere_hit = torch.zeros_like(mesh_any)
                 if name_a in self._spheres and name_b in self._spheres:
-                    ca, ra = world_spheres(name_a)
-                    cb, rb = world_spheres(name_b)
+                    ca, ra = self._world_self_spheres(name_a, link_tf)
+                    cb, rb = self._world_self_spheres(name_b, link_tf)
                     if ra.numel() > 0 and rb.numel() > 0:
                         overlap = torch.cdist(ca, cb) - ra[None, :, None] - rb[None, None, :]
                         sphere_hit = overlap.flatten(1).min(dim=1).values < 0.0
@@ -642,6 +729,7 @@ class SphereCoverage:
                             link_a=name_a,
                             link_b=name_b,
                             sphere_check_ignores=ignored,
+                            mesh_check_tests=body_pair is not None,
                             mesh_collision_ratio=float(hits.float().mean()),
                             sphere_collision_ratio=float(spheres.float().mean()),
                             missed_ratio=float((hits & ~spheres).float().mean()),
@@ -650,7 +738,8 @@ class SphereCoverage:
                         )
                     )
         finally:
-            data.set_self_collision_pairs(all_pairs)
+            if mesh_pairs:
+                data.set_self_collision_pairs(mesh_pairs)
         missed = (mesh_any & ~sphere_any)[1:]
         false_alarm = (sphere_any & ~mesh_any)[1:]
         if bool(mesh_any[0]):

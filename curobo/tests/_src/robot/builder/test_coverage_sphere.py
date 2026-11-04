@@ -139,3 +139,27 @@ def test_report_markdown_compares_with_a_baseline(baseline):
     compared = baseline.to_markdown(baseline=baseline)
     assert "->" in compared
     assert np.isclose(baseline.tolerance, 0.01)
+
+
+def test_cover_meshes_keeps_clear_of_links_only_the_sphere_check_tests():
+    """New spheres add no overlaps on pairs that only the sphere check tests.
+
+    UR10e's ignore list misspells forearm_link, so the sphere check tests the joint-connected
+    forearm_link - wrist_1_link pair, which the mesh check skips. Overlaps there only reject
+    configurations.
+    """
+    coverage = SphereCoverage("ur10e.yml", num_surface_samples=NUM_SURFACE_SAMPLES)
+    before = coverage.analyze(num_configs=NUM_CONFIGS)
+    coverage.cover_meshes(max_new_spheres_per_link=4)
+    after = coverage.analyze(num_configs=NUM_CONFIGS)
+
+    old = {(p.link_a, p.link_b): p for p in before.pairs}
+    sphere_only = [p for p in after.pairs if not p.mesh_check_tests]
+    assert any({p.link_a, p.link_b} == {"forearm_link", "wrist_1_link"} for p in sphere_only)
+    for p in sphere_only:
+        previous = old.get((p.link_a, p.link_b))
+        assert (
+            p.sphere_collision_ratio
+            <= (previous.sphere_collision_ratio if previous else 0.0) + 0.02
+        )
+    assert after.default_config_collisions == before.default_config_collisions
