@@ -98,7 +98,16 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   within 1 cm (was up to 90 mm). UR10e: missed 1.9 -> 0.2 %, false alarms 4.0 -> 8.4 %,
   spheres 20 -> 90; `upper_arm_link` and `forearm_link` stay at p95 24 / 16 mm with 16 new
   spheres each.
-  Not measured yet: solver success and time with the covered YAML.
+  Solver benchmark (`benchmark/sphere_coverage_benchmark.py`: table + 40 random boxes, 300
+  goals whose meshes are free but within 3 cm of the scene, mesh checks on; T4):
+  Franka 61 -> 111 spheres: IK 95.0 -> 93.0 %, plan 96.7 -> 90.0 % (83.3 % with the four
+  pairs checked), sphere-feasible IK solutions colliding as meshes 6.3 -> 3.9 % (0.0 %
+  checked), IK batch 100 604 -> 1169 ms, MPC step 64 -> 109 ms. UR10e 20 -> 94 spheres: IK
+  88.3 -> 85.7 %, plan 80.0 -> 76.7 %, colliding 5.6 -> 0.0 %, IK 245 -> 945 ms, MPC 35 -> 88
+  ms. Covering does what it measures but, with many seeds, the mesh check only cost 0.3-0.7
+  points of IK success before; the larger spheres cost success near obstacles and time.
+  Found on the way: `ur10e.yml` `self_collision_ignore` misspells `forearm_link` as
+  `forarm_link`, so the joint-connected forearm_link - wrist_1_link pair is sphere-checked.
 
 ## Open items
 
