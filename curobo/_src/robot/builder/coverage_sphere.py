@@ -11,6 +11,7 @@ robot configuration file, adds spheres that cover them, and writes the configura
 
 # Standard Library
 import copy
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
@@ -32,6 +33,9 @@ from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise, log_info, log_warn
 from curobo._src.util.sampling.sample_buffer import SampleBuffer
 from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
+
+#: Distance new spheres keep from the spheres of links only the sphere check tests, in meters.
+GUARD_MARGIN = 0.001
 
 
 class _ConfigDumper(yaml.SafeDumper):
@@ -444,7 +448,7 @@ class SphereCoverage:
                 self._spheres[name].append(
                     {
                         "center": [round(float(c), 4) for c in center],
-                        "radius": round(float(radius) - buffer, 4),
+                        "radius": math.floor((float(radius) - buffer) * 1.0e4) / 1.0e4,
                     }
                 )
                 count += 1
@@ -569,7 +573,8 @@ class SphereCoverage:
         if guard is not None:
             clearance = torch.cdist(centers.reshape(-1, 3), guard[:, :3]) - guard[None, :, 3]
             clearance = clearance.min(dim=-1).values.view(centers.shape[:2])
-            fits &= clearance > radius_grid[None, :]
+            # Keep a margin so that rounding the stored sphere cannot close the gap.
+            fits &= clearance > radius_grid[None, :] + GUARD_MARGIN
         fits = fits.int().cumprod(dim=1).bool()
         if not fits.any():
             return None, 0.0
