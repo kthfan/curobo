@@ -11,6 +11,7 @@ import torch
 from curobo._src.solver import solver_core_cfg
 from curobo._src.solver.solver_core_cfg import (
     MESH_COLLISION_CONSTRAINT_WEIGHT,
+    disable_sphere_collision_success,
     enable_mesh_collision,
     enable_mesh_self_collision,
     resolve_robot_config,
@@ -19,6 +20,7 @@ from curobo._src.solver.solver_core_cfg import (
     uses_mesh_collision,
     uses_mesh_self_collision,
 )
+from curobo._src.solver.solver_ik_cfg import IKSolverCfg
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
 from curobo._src.util_file import get_task_configs_path, join_path, load_yaml
@@ -70,6 +72,28 @@ def test_enable_mesh_collision_keeps_existing_settings(metrics_base_dict):
 def test_enable_mesh_collision_rejects_negative_margin(metrics_base_dict):
     with pytest.raises(Exception):
         enable_mesh_collision(metrics_base_dict, margin=-0.01)
+
+
+def test_mesh_only_success_replaces_the_scene_spheres(metrics_base_dict):
+    enabled = enable_mesh_collision(metrics_base_dict)
+    success = disable_sphere_collision_success(enabled)
+    constraints = success["rollout"]["constraint_cfg"]
+    assert "scene_collision_cfg" not in constraints and "mesh_collision_cfg" in constraints
+    # Without the mesh self-collision check the spheres still decide self-collision.
+    assert "self_collision_cfg" in constraints
+    assert "scene_collision_cfg" in enabled["rollout"]["constraint_cfg"]
+
+
+def test_mesh_only_success_replaces_both_sphere_checks(metrics_base_dict):
+    enabled = enable_mesh_self_collision(enable_mesh_collision(metrics_base_dict))
+    constraints = disable_sphere_collision_success(enabled)["rollout"]["constraint_cfg"]
+    assert "scene_collision_cfg" not in constraints and "self_collision_cfg" not in constraints
+    assert "cspace_cfg" in constraints
+
+
+def test_mesh_only_success_needs_a_mesh_check(metrics_base_dict):
+    with pytest.raises(ValueError):
+        disable_sphere_collision_success(metrics_base_dict)
 
 
 class _FakeRobotCfg:
@@ -177,3 +201,46 @@ def test_resolve_accepts_robot_cfg_with_meshes(cuda_device_cfg):
         cuda_device_cfg, robot=robot_config, mesh_collision_check=True
     )
     assert resolved_robot is robot_config
+
+
+def _constraints(rollout_config) -> set:
+    cfg = rollout_config.constraint_cfg
+    return {
+        name
+        for name in ("scene_collision_cfg", "self_collision_cfg", "mesh_collision_cfg")
+        if getattr(cfg, name) is not None
+    }
+
+
+def test_mesh_only_success_keeps_the_spheres_for_sampling(cuda_device_cfg):
+    """The metrics rollout drops the scene spheres; the auxiliary rollout keeps them."""
+    config = IKSolverCfg.create(
+        robot="franka.yml",
+        scene_model="collision_table.yml",
+        mesh_collision_check=True,
+        mesh_only_success=True,
+        device_cfg=cuda_device_cfg,
+        use_cuda_graph=False,
+    )
+    core = config.core_cfg
+    assert _constraints(core.metrics_rollout_config) == {
+        "self_collision_cfg",
+        "mesh_collision_cfg",
+    }
+    assert _constraints(core.auxiliary_rollout_config) == {
+        "scene_collision_cfg",
+        "self_collision_cfg",
+        "mesh_collision_cfg",
+    }
+
+
+def test_default_keeps_one_rollout_config(cuda_device_cfg):
+    config = IKSolverCfg.create(
+        robot="franka.yml",
+        scene_model="collision_table.yml",
+        mesh_collision_check=True,
+        device_cfg=cuda_device_cfg,
+        use_cuda_graph=False,
+    )
+    assert config.core_cfg.auxiliary_rollout_config is None
+    assert "scene_collision_cfg" in _constraints(config.core_cfg.metrics_rollout_config)

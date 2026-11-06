@@ -27,6 +27,7 @@ from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.types.tool_pose import GoalToolPose
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 
 #: Links whose spheres are disabled, leaving the mesh check as their only collision test.
 GRIPPER_LINKS = ["panda_hand", "panda_leftfinger", "panda_rightfinger"]
@@ -204,6 +205,79 @@ def test_mesh_collision_distance_needs_the_mesh_check(sphere_ik_solver, cuda_dev
     result = _solve(sphere_ik_solver, cuda_device_cfg)
     with pytest.raises(ValueError, match="mesh_collision_check"):
         sphere_ik_solver.get_mesh_collision_distance(result.js_solution)
+
+
+# =============================================================================
+# Mesh-only success
+# =============================================================================
+
+#: Scene sphere inflation that makes the spheres reach the lowered box while the meshes do not.
+INFLATED_SPHERE_BUFFER = 0.05
+
+#: Lowers the palm box so its top is 13.5 cm below the hand frame, about 2 cm below the
+#: fingertips: the meshes are clear, the inflated gripper spheres are not.
+LOWERED_BOX = (0.0, 0.0, -0.10)
+
+
+def _inflated_franka() -> dict:
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    robot["robot_cfg"]["kinematics"]["collision_sphere_buffer"] = INFLATED_SPHERE_BUFFER
+    return robot
+
+
+def _inflated_ik(device_cfg: DeviceCfg, mesh_only_success: bool) -> IKSolver:
+    config = IKSolverCfg.create(
+        robot=_inflated_franka(),
+        scene_model=palm_box(LOWERED_BOX),
+        mesh_collision_check=True,
+        mesh_only_success=mesh_only_success,
+        device_cfg=device_cfg,
+        num_seeds=32,
+        use_cuda_graph=False,
+    )
+    return IKSolver(config)
+
+
+def test_spheres_reject_a_goal_whose_meshes_are_clear(cuda_device_cfg):
+    result = _solve(_inflated_ik(cuda_device_cfg, mesh_only_success=False), cuda_device_cfg)
+    assert not result.success.any().item()
+
+
+def test_mesh_only_success_accepts_a_goal_whose_meshes_are_clear(cuda_device_cfg):
+    solver = _inflated_ik(cuda_device_cfg, mesh_only_success=True)
+    result = _solve(solver, cuda_device_cfg)
+    assert result.success.all().item()
+    distance, _ = solver.get_mesh_collision_distance(result.js_solution)
+    assert torch.all(distance > 0.0)
+
+
+def test_mesh_only_success_still_samples_with_the_spheres(cuda_device_cfg):
+    """sample_configs keeps rejecting configurations whose spheres collide."""
+    solver = _inflated_ik(cuda_device_cfg, mesh_only_success=True)
+    reference = _inflated_ik(cuda_device_cfg, mesh_only_success=False)
+    for s in (solver, reference):
+        s.reset_seed()
+    samples = solver.sample_configs(64)
+    assert torch.equal(samples, reference.sample_configs(64))
+
+
+def test_mesh_only_success_plan_pose_reaches_a_goal_whose_meshes_are_clear(cuda_device_cfg):
+    goal_scene = palm_box(LOWERED_BOX)
+    plans = {}
+    for mesh_only_success in (False, True):
+        config = MotionPlannerCfg.create(
+            robot=_inflated_franka(),
+            scene_model=goal_scene,
+            mesh_collision_check=True,
+            mesh_only_success=mesh_only_success,
+            device_cfg=cuda_device_cfg,
+            num_ik_seeds=32,
+            num_trajopt_seeds=4,
+            use_cuda_graph=False,
+        )
+        plans[mesh_only_success] = _plan(MotionPlanner(config), cuda_device_cfg)
+    assert plans[False] is None or not plans[False].success.any().item()
+    assert plans[True] is not None and plans[True].success.any().item()
 
 
 # =============================================================================

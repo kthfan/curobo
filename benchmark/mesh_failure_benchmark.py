@@ -54,6 +54,7 @@ from sphere_coverage_benchmark import (
 from curobo._src.motion.motion_planner import MotionPlanner
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 from curobo._src.solver.solver_ik import IKSolver
+from curobo._src.solver.solver_ik_cfg import IKSolverCfg
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose
@@ -144,17 +145,32 @@ def trajectory_failure(result: object) -> Dict[str, object]:
     }
 
 
-def classify_plans(robot: Dict, scene, goals: GoalToolPose, args) -> Dict[str, object]:
-    """``plan_pose`` success and failure stages over ``--num_plans`` goals, in percent."""
+def mode_options(mesh_only_success: bool, margin: float) -> Dict[str, object]:
+    """Solver options with both exact mesh checks at ``margin``."""
+    return {
+        "mesh_collision_check": True,
+        "mesh_self_collision_check": True,
+        "mesh_collision_margin": margin,
+        "mesh_self_collision_margin": margin,
+        "mesh_only_success": mesh_only_success,
+    }
+
+
+def make_planner(robot: Dict, scene, args, **options) -> MotionPlanner:
+    """Motion planner with the given mesh options."""
     config = MotionPlannerCfg.create(
         robot=robot,
         scene_model=scene,
-        mesh_collision_check=True,
-        mesh_self_collision_check=True,
         device_cfg=DeviceCfg(),
         use_cuda_graph=bool(args.cuda_graph),
+        **options,
     )
-    planner = MotionPlanner(config)
+    return MotionPlanner(config)
+
+
+def classify_plans(robot: Dict, scene, goals: GoalToolPose, args) -> Dict[str, object]:
+    """``plan_pose`` success and failure stages over ``--num_plans`` goals, in percent."""
+    planner = make_planner(robot, scene, args, **mode_options(False, 0.0))
     # Keep every trajectory seed, so the result still holds the metrics of all of them; the
     # planner succeeds when any seed does, as with the single best one.
     trajopt = planner.trajopt_solver
@@ -197,6 +213,57 @@ def classify_plans(robot: Dict, scene, goals: GoalToolPose, args) -> Dict[str, o
     return out
 
 
+def bench_mode(
+    robot: Dict, scene, goals: GoalToolPose, mesh_only_success: bool, margin: float, args
+) -> Dict[str, float]:
+    """IK and ``plan_pose`` success and time with the mesh checks at ``margin``."""
+    options = mode_options(mesh_only_success, margin)
+    config = IKSolverCfg.create(
+        robot=robot,
+        scene_model=scene,
+        device_cfg=DeviceCfg(),
+        use_cuda_graph=bool(args.cuda_graph),
+        max_batch_size=args.ik_batch,
+        **options,
+    )
+    solver = IKSolver(config)
+    success, times = [], []
+    for start in range(0, goals.position.shape[0] - args.ik_batch + 1, args.ik_batch):
+        solver.reset_seed()
+        t0 = time.perf_counter()
+        result = solver.solve_pose(goal_tool_poses=goal_slice(goals, start, start + args.ik_batch))
+        torch.cuda.synchronize()
+        times.append(1000.0 * (time.perf_counter() - t0))
+        success.append(result.success.view(args.ik_batch, -1).any(dim=-1).float().mean().item())
+    del solver
+    torch.cuda.empty_cache()
+    planner = make_planner(robot, scene, args, **options)
+    planner.warmup(enable_graph=True, num_warmup_iterations=2)
+    start_state = JointState.from_position(
+        planner.default_joint_state.position.clone().unsqueeze(0),
+        joint_names=planner.joint_names,
+    )
+    plan_success, plan_times = [], []
+    for i in range(args.num_plans):
+        t0 = time.perf_counter()
+        result = planner.plan_pose(
+            goal_tool_poses=goal_slice(goals, i, i + 1), current_state=start_state
+        )
+        torch.cuda.synchronize()
+        plan_times.append(1000.0 * (time.perf_counter() - t0))
+        plan_success.append(float(result is not None and result.success.any().item()))
+    del planner
+    torch.cuda.empty_cache()
+    return {
+        "mesh_only_success": mesh_only_success,
+        "margin_mm": 1000.0 * margin,
+        "ik_success_%": 100.0 * float(np.mean(success)),
+        "ik_ms": float(np.mean(times[1:] if len(times) > 1 else times)),
+        "plan_success_%": 100.0 * float(np.mean(plan_success)),
+        "plan_ms": float(np.mean(plan_times)),
+    }
+
+
 def main() -> None:
     """Sample the goals, then break down IK and plan failures for every robot file."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -209,6 +276,14 @@ def main() -> None:
     parser.add_argument("--num_plans", type=int, default=60)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--cuda_graph", type=int, default=1)
+    parser.add_argument(
+        "--margins",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.005, 0.01],
+        help="Mesh margins at which IK and plan_pose run with mesh_only_success off and on.",
+    )
+    parser.add_argument("--skip_breakdown", action="store_true")
     parser.add_argument("--save_path", default=None)
     args = parser.parse_args()
 
@@ -232,6 +307,29 @@ def main() -> None:
             f"{1000 * clearance.median():.1f} mm",
             flush=True,
         )
+        modes = []
+        for margin in args.margins:
+            for mesh_only_success in (False, True):
+                modes.append(bench_mode(robot, scene, goals, mesh_only_success, margin, args))
+                print(f"{name} mode: {modes[-1]}", flush=True)
+        lines += [
+            f"### {name}: mesh_only_success",
+            "",
+            f"Both mesh checks on; {goals.position.shape[0]} IK goals, {args.num_plans} plans.",
+            "",
+            "| mesh_only_success | margin (mm) | IK success (%) | IK (ms) | plan success (%) | "
+            "plan (ms) |",
+            "|---|---|---|---|---|---|",
+        ]
+        lines += [
+            f"| {m['mesh_only_success']} | {m['margin_mm']:.0f} | {m['ik_success_%']:.1f} | "
+            f"{m['ik_ms']:.0f} | {m['plan_success_%']:.1f} | {m['plan_ms']:.0f} |"
+            for m in modes
+        ]
+        lines.append("")
+        if args.skip_breakdown:
+            rows.append({"robot": name, "modes": modes})
+            continue
         solver = make_ik(robot, scene, mesh=False, batch=args.ik_batch, args=args)
         ik = classify_ik(solver, checker, goals, args.ik_batch)
         print(f"{name} IK: {ik}", flush=True)
@@ -239,7 +337,7 @@ def main() -> None:
         torch.cuda.empty_cache()
         plan = classify_plans(robot, scene, goals, args)
         print(f"{name} plan_pose: {plan}", flush=True)
-        rows.append({"robot": name, "ik": ik, "plan": plan})
+        rows.append({"robot": name, "ik": ik, "plan": plan, "modes": modes})
         lines += [
             f"### {name}",
             "",

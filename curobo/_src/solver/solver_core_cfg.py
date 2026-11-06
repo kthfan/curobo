@@ -54,6 +54,11 @@ class SolverCoreCfg:
     random_seed: int = 123
     #: Whether to store debug information (disables CUDA graphs).
     store_debug: bool = False
+    #: Configuration for the auxiliary rollout, which samples collision-free configurations
+    #: and answers the mesh collision queries. ``None`` uses :attr:`metrics_rollout_config`.
+    #: It differs when the metrics rollout leaves out the sphere collision constraints
+    #: (``mesh_only_success``): sampling still rejects configurations with the spheres.
+    auxiliary_rollout_config: Optional[RobotRolloutCfg] = None
 
     def __post_init__(self):
         if len(self.optimizer_configs) == 0:
@@ -273,6 +278,39 @@ def enable_mesh_self_collision(metrics_rollout_dict: Dict, margin: float = 0.0) 
     return metrics_rollout_dict
 
 
+def disable_sphere_collision_success(metrics_rollout_dict: Dict) -> Dict:
+    """Return a copy of a metrics rollout dict whose success the exact meshes decide.
+
+    The sphere scene collision constraint is removed when the dict holds the exact mesh
+    collision constraint, and the sphere self-collision constraint when it holds the mesh
+    self-collision constraint. The optimizers keep their sphere collision costs, so the
+    spheres still steer the robot.
+
+    Args:
+        metrics_rollout_dict: Resolved metrics rollout YAML dict. Not modified.
+
+    Returns:
+        New metrics rollout dict.
+
+    Raises:
+        ValueError: If the dict holds neither mesh constraint: nothing would check collisions.
+    """
+    scene = uses_mesh_collision(metrics_rollout_dict)
+    self_collision = uses_mesh_self_collision(metrics_rollout_dict)
+    if not (scene or self_collision):
+        log_and_raise(
+            "mesh_only_success needs mesh_collision_check or mesh_self_collision_check: "
+            "without them nothing would check collisions"
+        )
+    metrics_rollout_dict = deepcopy(metrics_rollout_dict)
+    constraint_cfg = metrics_rollout_dict["rollout"]["constraint_cfg"]
+    if scene:
+        constraint_cfg.pop("scene_collision_cfg", None)
+    if self_collision:
+        constraint_cfg.pop("self_collision_cfg", None)
+    return metrics_rollout_dict
+
+
 def resolve_robot_config(
     robot: Union[str, Dict[str, Any], RobotCfg],
     device_cfg: DeviceCfg,
@@ -415,6 +453,7 @@ def create_solver_core_cfg(
         RobotStateTransitionCfg
     ] = RobotStateTransitionCfg,
     cost_manager_config_instance_type: Type[RobotCostManagerCfg] = RobotCostManagerCfg,
+    mesh_only_success: bool = False,
 ) -> SolverCoreCfg:
     """Build a SolverCoreCfg from resolved YAML dicts.
 
@@ -439,6 +478,10 @@ def create_solver_core_cfg(
             (keyed by solver_name).
         transition_model_config_instance_type: Transition model config class.
         cost_manager_config_instance_type: Cost manager config class.
+        mesh_only_success: Let the exact mesh constraints of the metrics rollout decide
+            success instead of the sphere collision constraints; see
+            :func:`disable_sphere_collision_success`. The auxiliary rollout keeps the full
+            metrics rollout, so :meth:`SolverCore.sample_configs` still uses the spheres.
 
     Returns:
         Configured SolverCoreCfg.
@@ -476,14 +519,24 @@ def create_solver_core_cfg(
         self_collision_check,
     )
 
-    metrics_rollout_config = create_metrics_rollout_config(
-        metrics_rollout_dict,
-        transition_model_dict,
-        robot_config,
-        device_cfg,
-        transition_model_config_instance_type,
-        cost_manager_config_instance_type,
-    )
+    def metrics_config(rollout_dict: Dict) -> RobotRolloutCfg:
+        return create_metrics_rollout_config(
+            rollout_dict,
+            transition_model_dict,
+            robot_config,
+            device_cfg,
+            transition_model_config_instance_type,
+            cost_manager_config_instance_type,
+        )
+
+    auxiliary_rollout_config = None
+    if mesh_only_success:
+        metrics_rollout_config = metrics_config(
+            disable_sphere_collision_success(metrics_rollout_dict)
+        )
+        auxiliary_rollout_config = metrics_config(metrics_rollout_dict)
+    else:
+        metrics_rollout_config = metrics_config(metrics_rollout_dict)
 
     return SolverCoreCfg(
         metrics_rollout_config=metrics_rollout_config,
@@ -494,4 +547,5 @@ def create_solver_core_cfg(
         use_cuda_graph=use_cuda_graph,
         random_seed=random_seed,
         store_debug=store_debug,
+        auxiliary_rollout_config=auxiliary_rollout_config,
     )

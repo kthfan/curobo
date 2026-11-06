@@ -56,6 +56,7 @@ class MotionPlannerCfg:
         mesh_collision_margin: float = 0.0,
         mesh_self_collision_check: bool = False,
         mesh_self_collision_margin: float = 0.0,
+        mesh_only_success: bool = False,
         device_cfg: DeviceCfg = DeviceCfg(),
         num_ik_seeds: Optional[int] = None,
         num_trajopt_seeds: Optional[int] = None,
@@ -131,6 +132,13 @@ class MotionPlannerCfg:
                 in the robot YAML.
             mesh_self_collision_margin: Clearance in meters the link meshes must keep from
                 each other when ``mesh_self_collision_check`` is True.
+            mesh_only_success: Let the exact mesh checks decide whether IK and TrajOpt
+                solutions succeed, instead of the sphere collision checks they replace: scene
+                spheres when ``mesh_collision_check`` is True, self-collision spheres when
+                ``mesh_self_collision_check`` is True. The spheres still steer the optimizers,
+                and graph planner validation stays sphere-based. Solutions may have spheres
+                overlapping obstacles; set the mesh margins to keep a clearance. Needs at
+                least one of the two mesh checks.
             device_cfg: Tensor device and dtype configuration.
             num_ik_seeds: Number of IK seeds evaluated per problem. ``None``
                 uses 32 when ``max_batch_size`` is 1 and 16 for larger batch
@@ -257,6 +265,7 @@ class MotionPlannerCfg:
             mesh_collision_margin=mesh_collision_margin,
             mesh_self_collision_check=mesh_self_collision_check,
             mesh_self_collision_margin=mesh_self_collision_margin,
+            mesh_only_success=mesh_only_success,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,
@@ -286,6 +295,7 @@ class MotionPlannerCfg:
             mesh_collision_margin=mesh_collision_margin,
             mesh_self_collision_check=mesh_self_collision_check,
             mesh_self_collision_margin=mesh_self_collision_margin,
+            mesh_only_success=mesh_only_success,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
             max_batch_size=max_batch_size,

@@ -137,6 +137,7 @@ class MPCSolverCfg:
         mesh_collision_margin: float = 0.0,
         mesh_self_collision_check: bool = False,
         mesh_self_collision_margin: float = 0.0,
+        mesh_only_success: bool = False,
         device_cfg: DeviceCfg = DeviceCfg(),
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
@@ -189,6 +190,12 @@ class MPCSolverCfg:
                 in the robot YAML.
             mesh_self_collision_margin: Clearance in meters the link meshes must keep from
                 each other when ``mesh_self_collision_check`` is True.
+            mesh_only_success: Let the exact mesh checks decide success instead of the
+                sphere collision checks they replace: scene spheres when
+                ``mesh_collision_check`` is True, self-collision spheres when
+                ``mesh_self_collision_check`` is True. The spheres still steer the optimizer.
+                Solutions may then have spheres overlapping obstacles; set the mesh margins to
+                keep a clearance. Needs at least one of the two mesh checks.
             device_cfg: Device configuration.
             position_tolerance: Position tolerance for success.
             orientation_tolerance: Orientation tolerance for success.
@@ -283,6 +290,7 @@ class MPCSolverCfg:
             override_optimizer_num_iters=override_optimizer_num_iters,
             transition_model_config_instance_type=transition_model_config_instance_type,
             cost_manager_config_instance_type=cost_manager_config_instance_type,
+            mesh_only_success=mesh_only_success,
         )
 
         return MPCSolverCfg(

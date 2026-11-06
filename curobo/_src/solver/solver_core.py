@@ -133,9 +133,12 @@ class SolverCore:
         )
         self.metrics_rollout.rollout_instance_name = "metrics_rollout"
 
-        self.auxiliary_rollout = RobotRollout(
-            self.config.metrics_rollout_config, self.scene_collision_checker
-        )
+        # With mesh_only_success the auxiliary rollout keeps the sphere collision constraints,
+        # so sampling still rejects configurations with the spheres.
+        auxiliary_config = self.config.auxiliary_rollout_config
+        if auxiliary_config is None:
+            auxiliary_config = self.config.metrics_rollout_config
+        self.auxiliary_rollout = RobotRollout(auxiliary_config, self.scene_collision_checker)
         self.auxiliary_rollout.rollout_instance_name = "auxiliary_rollout"
 
         # 3. Optimizers
