@@ -298,20 +298,20 @@ class SphereCoverage:
             dict(kinematics.get("self_collision_ignore") or {})
         )
         self._collision_links: List[str] = list(kinematics.get("collision_link_names") or [])
-        named = set(self._self_ignore).union(*self._self_ignore.values())
-        unknown = sorted(named.difference(self._collision_links))
-        if unknown:
-            log_warn(
-                f"self_collision_ignore names links that are not collision links: {unknown}. "
-                "Pairs with a misspelled link stay checked by the sphere check."
-            )
 
         loaded = copy.deepcopy(self._config)
         self._kinematics_data(loaded)["load_collision_meshes"] = True
-        self._kinematics = Kinematics(
-            KinematicsCfg.from_robot_yaml_file(loaded, device_cfg=self.device_cfg),
-            compute_link_transforms=True,
-        )
+        kinematics_cfg = KinematicsCfg.from_robot_yaml_file(loaded, device_cfg=self.device_cfg)
+        self._kinematics = Kinematics(kinematics_cfg, compute_link_transforms=True)
+        links = set(kinematics_cfg.kinematics_parser.get_link_names_from_urdf())
+        links.update(self._collision_links)
+        named = set(self._self_ignore).union(*self._self_ignore.values())
+        unknown = sorted(named.difference(links))
+        if unknown:
+            log_warn(
+                f"self_collision_ignore names links the robot does not have: {unknown}. "
+                "The sphere check still tests the pairs meant with a misspelled name."
+            )
         self._mesh_data = self._kinematics.config.kinematics_config.get_robot_mesh_data()
         rng = np.random.default_rng(seed)
         self._generator = torch.Generator(device=self.device_cfg.device).manual_seed(seed)

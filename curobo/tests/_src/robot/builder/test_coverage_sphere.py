@@ -144,23 +144,35 @@ def test_report_markdown_compares_with_a_baseline(baseline):
 def test_cover_meshes_keeps_clear_of_links_only_the_sphere_check_tests():
     """New spheres add no overlaps on pairs that only the sphere check tests.
 
-    UR10e's ignore list misspells forearm_link, so the sphere check tests the joint-connected
-    forearm_link - wrist_1_link pair, which the mesh check skips. Overlaps there only reject
-    configurations.
+    With forearm_link dropped from UR10e's ignore list, the sphere check tests the
+    joint-connected forearm_link - wrist_1_link pair, which the mesh check skips. Overlaps
+    there only reject configurations.
     """
-    coverage = SphereCoverage("ur10e.yml", num_surface_samples=NUM_SURFACE_SAMPLES)
+    robot = load_yaml(join_path(get_robot_configs_path(), "ur10e.yml"))
+    del robot["robot_cfg"]["kinematics"]["self_collision_ignore"]["forearm_link"]
+    coverage = SphereCoverage(robot, num_surface_samples=NUM_SURFACE_SAMPLES)
     before = coverage.analyze(num_configs=NUM_CONFIGS)
     coverage.cover_meshes(max_new_spheres_per_link=4)
     after = coverage.analyze(num_configs=NUM_CONFIGS)
 
-    old = {(p.link_a, p.link_b): p for p in before.pairs}
-    sphere_only = [p for p in after.pairs if not p.mesh_check_tests]
     tested = [set(pair) for pair in coverage._sphere_checked_pairs()]
     assert {"forearm_link", "wrist_1_link"} in tested
-    for p in sphere_only:
+    old = {(p.link_a, p.link_b): p for p in before.pairs}
+    for p in after.pairs:
+        if p.mesh_check_tests:
+            continue
         previous = old.get((p.link_a, p.link_b))
         assert (
             p.sphere_collision_ratio
             <= (previous.sphere_collision_ratio if previous else 0.0) + 0.02
         )
     assert after.default_config_collisions == before.default_config_collisions
+
+
+def test_a_misspelled_ignore_entry_is_reported(caplog):
+    robot = load_yaml(join_path(get_robot_configs_path(), "ur10e.yml"))
+    ignore = robot["robot_cfg"]["kinematics"]["self_collision_ignore"]
+    ignore["forarm_link"] = ignore.pop("forearm_link")
+    with caplog.at_level("WARNING"):
+        SphereCoverage(robot, num_surface_samples=NUM_SURFACE_SAMPLES)
+    assert "forarm_link" in caplog.text and "camera_mount" not in caplog.text

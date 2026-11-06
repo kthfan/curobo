@@ -106,8 +106,10 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   88.3 -> 85.7 %, plan 80.0 -> 76.7 %, colliding 5.6 -> 0.0 %, IK 245 -> 945 ms, MPC 35 -> 88
   ms. Covering does what it measures but, with many seeds, the mesh check only cost 0.3-0.7
   points of IK success before; the larger spheres cost success near obstacles and time.
-  Found on the way: `ur10e.yml` `self_collision_ignore` misspells `forearm_link` as
-  `forarm_link`, so the joint-connected forearm_link - wrist_1_link pair is sphere-checked.
+  Found on the way and fixed (user's decision): `ur10e.yml` and `dual_ur10e.yml`
+  `self_collision_ignore` misspelled `forearm_link` as `forarm_link`, so the joint-connected
+  forearm_link - wrist_1_link pair was sphere-checked. `SphereCoverage` warns about such names.
+  The covered YAMLs are not adopted (user's decision: keep the tool as a diagnostic).
 
 ## Open items
 
