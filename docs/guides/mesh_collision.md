@@ -215,7 +215,8 @@ seed out of the collision; only the other seeds can succeed. To fix it:
 1. Find the link with `get_mesh_collision_links` (see the previous section). Many seeds failing
    on the same link point to that link's spheres.
 2. Cover that link better with spheres (see {ref}`mesh_collision_cover_spheres`). The
-   optimizer then steers the link away itself, which is the most effective fix.
+   optimizer then steers the link away itself, but every added sphere makes the sphere
+   collision costs slower.
 3. Raise `optimizer_collision_activation_distance` (default 0.01 m) on the solver config, for
    example to 0.02 m. The optimizer then keeps the spheres farther from obstacles, which also
    keeps the parts of the meshes outside the spheres clear. The success check is unchanged,
@@ -223,8 +224,53 @@ seed out of the collision; only the other seeds can succeed. To fix it:
 4. Give the solver more chances: raise `num_ik_seeds`, `num_trajopt_seeds` or the
    `max_attempts` of `plan_pose`. This helps when only some seeds end in a mesh-only collision.
 
+When the solves fail because the spheres collide while the meshes are clear, the opposite
+case, let the meshes decide success instead (see {ref}`mesh_collision_mesh_only_success`).
+
 Avoid the robot YAML's `collision_sphere_buffer` for this: it enlarges the spheres for the
 success check and self-collision too, so it rejects more solutions instead of steering them.
+
+(mesh_collision_mesh_only_success)=
+## Let the meshes decide success
+
+Spheres are larger than the meshes they cover, so in tight spaces they also reject solutions
+whose meshes are clear. With both mesh checks on, this is the more common failure: in a
+cluttered scene, with goals whose meshes come within 3 cm of an obstacle, the spheres alone
+rejected 3 % of Franka's and 9 % of UR10e's IK goals, against at most 0.7 % that only the meshes
+rejected. Pass `mesh_only_success=True` to let the mesh checks decide success instead of the
+sphere checks they replace:
+
+```python
+MotionPlannerCfg.create(
+    robot="franka.yml",
+    scene_model="collision_table.yml",
+    mesh_collision_check=True,
+    mesh_self_collision_check=True,
+    mesh_only_success=True,
+)
+```
+
+- The scene spheres stop deciding success when `mesh_collision_check` is on, the
+  self-collision spheres when `mesh_self_collision_check` is on. With neither, the option
+  raises an error. It exists on the same `create` methods as the mesh checks.
+- The spheres still steer the optimizers, `sample_configs` still rejects configurations with
+  the spheres, and graph planner validation stays sphere-based.
+- A solution may have spheres overlapping obstacles, and the margin the spheres kept around the
+  meshes is gone. Set `mesh_collision_margin` and `mesh_self_collision_margin` to the clearance
+  your application needs.
+
+Success with both mesh checks on, 300 IK goals and 60 plans in a table with 40 random boxes
+(one NVIDIA Tesla T4, `benchmark/mesh_failure_benchmark.py`):
+
+| Robot | Mesh margin | IK, spheres decide | IK, meshes decide | `plan_pose`, spheres decide | `plan_pose`, meshes decide |
+| --- | --- | --- | --- | --- | --- |
+| Franka | 0 | 95.0 % | 98.3 % | 98.3 % | 98.3 % |
+| Franka | 5 mm | 90.0 % | 90.0 % | 93.3 % | 95.0 % |
+| UR10e | 0 | 89.0 % | 94.7 % | 81.7 % | 91.7 % |
+| UR10e | 5 mm | 83.3 % | 86.0 % | 71.7 % | 68.3 % |
+
+A margin rejects the goals that come closer than it, so it lowers success in both modes and
+leaves less for the option to recover.
 
 (mesh_collision_cover_spheres)=
 ## Cover the link meshes with spheres

@@ -111,6 +111,19 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
   forearm_link - wrist_1_link pair was sphere-checked. `SphereCoverage` warns about such names.
   The covered YAMLs are not adopted (user's decision: keep the tool as a diagnostic).
 
+- **Failure breakdown and `mesh_only_success`** (user's choices: sampling keeps the spheres,
+  graph planner unchanged, margin default 0). `benchmark/mesh_failure_benchmark.py`: in the
+  cluttered scene with goals within 3 cm, IK failures that only the spheres cause: Franka 3.0 %,
+  UR10e 9.0 %; that only the meshes cause: at most 0.7 %. `mesh_only_success` on the IK,
+  TrajOpt, MPC and planner `create` methods drops the sphere collision constraints the mesh
+  checks replace from the metrics (and interpolated) rollouts; `SolverCoreCfg.
+  auxiliary_rollout_config` keeps them for `sample_configs` and the mesh queries. Margin 0:
+  Franka IK 95.0 -> 98.3 %, UR10e IK 89.0 -> 94.7 %, UR10e plan 81.7 -> 91.7 %. A Franka IK
+  row took 877 vs 580 ms; only two timed batches, not confirmed. Guide section "Let the meshes
+  decide success". Found: the kinematics loader subtracts `collision_sphere_buffer` from an
+  unused copy of `self_collision_buffer`, so the buffer also grows the self-collision spheres
+  (the guide describes it that way); asked the user whether it is a bug.
+
 ## Open items
 
 ### Small, ready to do
@@ -132,10 +145,8 @@ None right now.
 
 ### Blocked on decisions
 
-- [ ] **"Inflated spheres for gradients, exact meshes for checking" mode.** Drop the sphere
-  scene check (and possibly the sphere self-collision check, now that mesh self-collision
-  exists) from the metrics rollouts. Decide only after evaluating the gradient mesh check.
-  Warn about links with spheres but no mesh, or document it.
+- [ ] **Links with spheres but no mesh under `mesh_only_success`**: their spheres no longer
+  decide success; warn or document. Also: graph planner validation stays sphere-based.
 - [ ] **Graph planner ignores meshes** (benchmark). Scheduled after the mode above.
 - [ ] **MPC executes infeasible actions.** Handled on another branch; reference only.
 
