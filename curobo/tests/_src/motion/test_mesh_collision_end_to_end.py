@@ -211,17 +211,21 @@ def test_mesh_collision_distance_needs_the_mesh_check(sphere_ik_solver, cuda_dev
 # Mesh-only success
 # =============================================================================
 
-#: Scene sphere inflation that makes the spheres reach the lowered box while the meshes do not.
-INFLATED_SPHERE_BUFFER = 0.05
+#: Growth of the gripper sphere radii that makes them reach the lowered box while the meshes
+#: do not. (``collision_sphere_buffer`` would also grow the self-collision spheres.)
+GRIPPER_SPHERE_GROWTH = 0.04
 
-#: Lowers the palm box so its top is 13.5 cm below the hand frame, about 2 cm below the
-#: fingertips: the meshes are clear, the inflated gripper spheres are not.
+#: Lowers the palm box so its top is 13.5 cm below the hand frame, 2.3 cm below the
+#: fingertips: the meshes are clear, the grown gripper spheres are not.
 LOWERED_BOX = (0.0, 0.0, -0.10)
 
 
 def _inflated_franka() -> dict:
     robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
-    robot["robot_cfg"]["kinematics"]["collision_sphere_buffer"] = INFLATED_SPHERE_BUFFER
+    spheres = robot["robot_cfg"]["kinematics"]["collision_spheres"]
+    for link_name in GRIPPER_LINKS:
+        for sphere in spheres[link_name]:
+            sphere["radius"] += GRIPPER_SPHERE_GROWTH
     return robot
 
 
