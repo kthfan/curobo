@@ -155,6 +155,16 @@ def classify_plans(robot: Dict, scene, goals: GoalToolPose, args) -> Dict[str, o
         use_cuda_graph=bool(args.cuda_graph),
     )
     planner = MotionPlanner(config)
+    # Keep every trajectory seed, so the result still holds the metrics of all of them; the
+    # planner succeeds when any seed does, as with the single best one.
+    trajopt = planner.trajopt_solver
+    solve_pose = trajopt.solve_pose
+
+    def solve_pose_all_seeds(*solve_args, **solve_kwargs):
+        solve_kwargs.setdefault("return_seeds", trajopt.config.num_seeds)
+        return solve_pose(*solve_args, **solve_kwargs)
+
+    trajopt.solve_pose = solve_pose_all_seeds
     planner.warmup(enable_graph=True, num_warmup_iterations=2)
     start = JointState.from_position(
         planner.default_joint_state.position.clone().unsqueeze(0),
