@@ -262,7 +262,10 @@ def test_mesh_only_success_still_samples_with_the_spheres(cuda_device_cfg):
     for s in (solver, reference):
         s.reset_seed()
     samples = solver.sample_configs(64)
-    assert torch.equal(samples, reference.sample_configs(64))
+    reference_samples = reference.sample_configs(64)
+    # The same candidates pass; their values may differ by one float32 rounding step.
+    assert samples.shape == reference_samples.shape
+    torch.testing.assert_close(samples, reference_samples, atol=1.0e-6, rtol=0.0)
 
 
 def test_mesh_only_success_plan_pose_reaches_a_goal_whose_meshes_are_clear(cuda_device_cfg):
