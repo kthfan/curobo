@@ -212,40 +212,39 @@ none remain, planning fails with the status
 of the segment that ends at the waypoint depends on the previous waypoint's solution, so the
 segment's trajectory optimization checks it instead.
 
-## Check path criteria with trajectory tolerances
+## Check path criteria with path tolerances
 
-Tool pose criteria can also shape the path: the non-terminal weights of
+Tool pose criteria can also shape the path: the path projectors of
 {py:meth}`ToolPoseCriteria.linear_motion <curobo.types.ToolPoseCriteria.linear_motion>`
 pull every step toward the line along the goal z axis. By default only the final pose is
 checked for success, so a path that drifts from the line still succeeds. To also check the
-steps before the last one, set a trajectory tolerance:
+steps before the last one, give the criteria a path tolerance and enforce it:
 
 ```python
+import math
+from dataclasses import replace
+
 from curobo import MotionPlanner, MotionPlannerCfg
 from curobo.types import ToolPoseCriteria
 
-planner = MotionPlanner(
-    MotionPlannerCfg.create(
-        robot="franka.yml",
-        position_tolerance_traj=0.005,  # m
-        orientation_tolerance_traj=0.05,  # rad
-    )
-)
+planner = MotionPlanner(MotionPlannerCfg.create(robot="franka.yml"))
 frame = planner.tool_frames[0]
-planner.update_tool_pose_criteria({frame: ToolPoseCriteria.linear_motion("z")})
+criteria = replace(
+    ToolPoseCriteria.linear_motion("z"),
+    # (position in m, rotation as the chord 2 * sin(angle / 2))
+    path_tolerance=(0.005, 2.0 * math.sin(0.05 / 2.0)),
+    enforce_path_tolerance=True,
+)
+planner.update_tool_pose_criteria({frame: criteria})
 result = planner.plan_pose(goal_tool_poses, current_state)
 ```
 
-`TrajectoryOptimizerCfg.create` accepts the same two arguments. A trajectory then succeeds only
-if every step stays within the tolerances on the axes the non-terminal weights constrain; 0
-(the default) turns the check off.
+A trajectory then succeeds only if every step stays within the path tolerance on the axes the
+path projectors keep. Use a path tolerance with criteria whose path projectors drop the axes of
+free motion, such as `linear_motion`. `track_pose` keeps every axis, so its path error is the
+distance to the goal, and an enforced path tolerance would reject almost every path.
 
-The error of a step is weighted by the non-terminal weights. Use the tolerances with criteria
-whose non-terminal weights are 0 on the axes of free motion, such as `linear_motion`.
-`track_position_and_orientation` weights every axis, so its non-terminal error is the scaled
-distance to the goal, and a trajectory tolerance would reject almost every path.
-
-Bounds and trajectory tolerances can be combined. Prefer bounds for one-sided limits, limits
+Bounds and path tolerances can be combined. Prefer bounds for one-sided limits, limits
 relative to the start or the robot base, and limits on the tool's tilt, yaw, or roll.
 
 ## Handle errors

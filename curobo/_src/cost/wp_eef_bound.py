@@ -10,9 +10,9 @@ on every step except the last of the horizon. Goal-anchored slots are evaluated 
 of the set and the goal with the lowest total cost is kept.
 
 Gradients are exact and written in cuRobo's convention: position gradient in the base frame,
-and orientation gradient ``q ⊗ (0, 2ω)`` (wxyz) where ``ω`` is the base-frame angular gradient,
-so that the kinematics backward (``0.5 * vec(q⁻¹ ⊗ dq)``) recovers ``ω``. All quaternions here
-are wxyz.
+and orientation gradient ``(0, 2ω) ⊗ q`` (wxyz) where ``ω`` is the base-frame angular gradient,
+so that the kinematics backward (``0.5 * vec(dq ⊗ q⁻¹)``, the left perturbation of the base-frame
+joint axes) recovers ``ω``. All quaternions here are wxyz.
 """
 
 from __future__ import annotations
@@ -304,7 +304,7 @@ def eef_bound_cost_kernel(
     out_cost[tid] = w * total
     out_position_gradient[tid] = w * grad_pos
     out_quaternion_gradient[tid] = w * _quat_mul(
-        c_quat, wp.vec4(0.0, 2.0 * omega[0], 2.0 * omega[1], 2.0 * omega[2])
+        wp.vec4(0.0, 2.0 * omega[0], 2.0 * omega[1], 2.0 * omega[2]), c_quat
     )
 
 

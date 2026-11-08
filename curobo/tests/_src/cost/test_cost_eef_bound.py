@@ -209,14 +209,14 @@ class Problem:
 
 
 def world_omega(quaternion, quaternion_grad):
-    """Angular gradient as the kinematics backward reads it: 0.5 * vec(q⁻¹ ⊗ dq)."""
+    """Angular gradient as the kinematics backward reads it: 0.5 * vec(dq ⊗ q⁻¹)."""
     w, x, y, z = quaternion.unbind(-1)
     dw, dx, dy, dz = quaternion_grad.unbind(-1)
     return 0.5 * torch.stack(
         [
-            -x * dw + w * dx + z * dy - y * dz,
-            -y * dw - z * dx + w * dy + x * dz,
-            -z * dw + y * dx - x * dy + w * dz,
+            -x * dw + w * dx - z * dy + y * dz,
+            -y * dw + z * dx + w * dy - x * dz,
+            -z * dw - y * dx + x * dy + w * dz,
         ],
         dim=-1,
     )

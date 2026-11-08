@@ -7,9 +7,11 @@ interpolation settings, finetune passes, and the factory method
 :meth:`TrajOptSolverCfg.create` that builds the full config from YAML paths
 or dictionaries.
 """
+
 from __future__ import annotations
 
 # Standard Library
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -20,13 +22,15 @@ from curobo._src.solver.solver_core_cfg import (
     create_solver_core_cfg,
     resolve_yaml_configs,
 )
+from curobo._src.trajectory.trajectory_interpolation import TrajInterpolationType
 from curobo._src.transition.robot_state_transition_cfg import (
     RobotStateTransitionCfg,
 )
+from curobo._src.types.control_space import ControlSpace
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
+from curobo._src.types.spline_layout import SplineLayout, validate_trajopt_knots
 from curobo._src.util.logging import log_and_raise
-from curobo._src.util.trajectory import TrajInterpolationType
 
 
 @dataclass
@@ -53,20 +57,9 @@ class TrajOptSolverCfg:
     #: Orientation error threshold (radians) for the final end-effector
     #: pose.
     orientation_tolerance: float = 0.05
-    #: Position error threshold (meters) for non-terminal trajectory steps.
-    #: When ``> 0``, the solver validates that all non-terminal steps stay
-    #: within this threshold.  Mirrors cuRoboV1's
-    #: ``position_threshold_traj``.  Set to ``0.0`` to skip trajectory-level
-    #: position checking (default, backward-compatible).
-    position_tolerance_traj: float = 0.0
-    #: Orientation error threshold (radians) for non-terminal trajectory
-    #: steps.  When ``> 0``, the solver validates that all non-terminal
-    #: steps stay within this threshold.  Mirrors cuRoboV1's
-    #: ``rotation_threshold_traj``.  Set to ``0.0`` to skip (default).
-    orientation_tolerance_traj: float = 0.0
     #: Distance threshold at which the collision cost activates during
     #: optimization.
-    optimizer_collision_activation_distance: float = 0.01
+    optimizer_collision_activation_distance: float = 0.0025
     #: Weight scale factor applied to the tool-pose cost at non-terminal
     #: time steps. 0.0 means only the final time step incurs pose cost.
     non_terminal_tool_pose_weight_factor: float = 0.0
@@ -89,6 +82,40 @@ class TrajOptSolverCfg:
     #: values can significantly increase GPU memory usage because position,
     #: velocity, acceleration, and jerk are allocated for each batched seed trajectory.
     interpolation_buffer_size: int = 1000
+
+    #: Optimize timing for every candidate before final validation and selection by duration.
+    enable_timeopt: bool = True
+    #: Compute torque and enforce effort limits, including fixed-path timeopt.
+    enable_inverse_dynamics: bool = True
+    #: Maximum initial optimization iterations before returning or refining a candidate.
+    initial_max_iters: int = 100
+    #: Initial iterations between native and dense success checks.
+    initial_check_interval: int = 50
+
+    @property
+    def spline_layout(self) -> SplineLayout:
+        """Configured control count, native horizon, and reference padding."""
+        return self.metrics_rollout_config.transition_model_cfg.spline_layout
+
+    @property
+    def num_knots(self) -> int:
+        """Number of optimized B-spline controls."""
+        return self.spline_layout.num_knots
+
+    @property
+    def native_horizon(self) -> int:
+        """Number of native rollout states before dense output interpolation."""
+        return self.metrics_rollout_config.transition_model_cfg.native_horizon
+
+    @property
+    def minimum_interpolation_buffer_size(self) -> int:
+        """Dense state capacity needed at the configured maximum native timestep."""
+        if (
+            self.metrics_rollout_config.transition_model_cfg.control_space
+            not in ControlSpace.bspline_types()
+        ):
+            return self.native_horizon
+        return self.spline_layout.dense_horizon(self.maximum_trajectory_dt, self.interpolation_dt)
 
     # Convenience accessors into core_cfg
     @property
@@ -143,11 +170,9 @@ class TrajOptSolverCfg:
         num_seeds: int = 4,
         position_tolerance: float = 0.005,
         orientation_tolerance: float = 0.05,
-        position_tolerance_traj: float = 0.0,
-        orientation_tolerance_traj: float = 0.0,
         use_cuda_graph: bool = True,
         random_seed: int = 123,
-        optimizer_collision_activation_distance: float = 0.01,
+        optimizer_collision_activation_distance: float = 0.0025,
         store_debug: bool = False,
         minimum_trajectory_dt: float = 0.002,
         maximum_trajectory_dt: float = 0.2,
@@ -163,11 +188,23 @@ class TrajOptSolverCfg:
         multi_env: bool = False,
         max_goalset: int = 1,
         interpolation_dt: float = 0.025,
-        interpolation_buffer_size: int = 1000,
+        interpolation_buffer_size: Optional[int] = None,
+        enable_timeopt: bool = True,
+        initial_max_iters: Optional[int] = None,
+        initial_check_interval: int = 50,
+        num_knots: Optional[int] = None,
+        enable_inverse_dynamics: bool = True,
     ) -> TrajOptSolverCfg:
         """Create TrajOptSolverCfg from flexible inputs.
 
         Args:
+            enable_inverse_dynamics: False disables torque computation and effort limits
+                in optimization, validation, and timeopt; derivative limits remain active.
+            num_knots: Fixed B-spline control count in [12, 1024]. None preserves the
+                transition configuration, which defaults to 16. More knots generally
+                increase motion duration and may increase planning time, but can
+                reduce waypoint tracking error. Choose the count based on the
+                required waypoint tracking tolerance and obstacle density.
             robot: Robot configuration - path to YAML, dict, or RobotCfg object.
             optimizer_configs: List of optimizer configs - paths or dicts.
             metrics_rollout: Metrics rollout config - path or dict.
@@ -197,11 +234,6 @@ class TrajOptSolverCfg:
             num_seeds: Number of optimization seeds.
             position_tolerance: Position tolerance for success.
             orientation_tolerance: Orientation tolerance for success.
-            position_tolerance_traj: Position tolerance in meters for every step before the
-                last one, measured on the axes constrained by the non-terminal tool pose
-                criteria (for example ``ToolPoseCriteria.linear_motion``). 0 disables the check.
-            orientation_tolerance_traj: Orientation tolerance in radians for the same steps and
-                axes. 0 disables the check.
             use_cuda_graph: Enable CUDA graph capture for solver rollouts
                 and optimizers. Defaults to True and should be left enabled
                 for normal integration/runtime code. cuRobo manages graph
@@ -226,37 +258,75 @@ class TrajOptSolverCfg:
             interpolation_dt: Time step in seconds for the dense interpolated
                 trajectory. Larger values produce fewer waypoints.
             interpolation_buffer_size: Maximum number of dense trajectory
-                waypoints to preallocate. Larger values can significantly
+                waypoints to preallocate. None sizes the buffer from the spline layout
+                and configured dt bounds, with a minimum of 1000. Larger values can significantly
                 increase GPU memory usage because state buffers are allocated
                 for every batched seed trajectory.
+            enable_timeopt: Apply fixed-path velocity, acceleration, jerk, and
+                torque timeopt to every seed before final selection. Enabled by default;
+                requires cubic B-splines.
+            initial_max_iters: Initial iteration budget; explicit solve-time
+                ``initial_iters`` overrides it. Must be a multiple of the final
+                optimizer's CUDA graph block size. Defaults to 100, or the explicit
+                final-optimizer iteration override when supplied. Does not change finetuning.
+            initial_check_interval: Iterations between initial success checks.
+                Use a multiple of the final optimizer's CUDA graph block size.
 
         Returns:
             Configured TrajOptSolverCfg instance.
         """
         if interpolation_dt <= 0.0:
             log_and_raise("interpolation_dt must be greater than zero")
-        if interpolation_buffer_size <= 0:
+        if interpolation_buffer_size is not None and interpolation_buffer_size <= 0:
             log_and_raise("interpolation_buffer_size must be greater than zero")
+        for name, value in (
+            ("initial_max_iters", initial_max_iters),
+            ("initial_check_interval", initial_check_interval),
+        ):
+            if name == "initial_max_iters" and value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                log_and_raise(f"{name} must be positive integers")
+
+        if num_knots is not None:
+            validate_trajopt_knots(num_knots)
 
         num_envs = max_batch_size if multi_env else 1
 
         # 1. Resolve YAML paths
-        robot_config, optimizer_dicts, metrics_rollout_dict, transition_model_dict, scene_model_dict = (
-            resolve_yaml_configs(
-                robot,
-                optimizer_configs,
-                metrics_rollout,
-                transition_model,
-                scene_model,
-                device_cfg,
-                load_collision_spheres=load_collision_spheres,
-                mesh_collision_check=mesh_collision_check,
-                mesh_collision_margin=mesh_collision_margin,
-                mesh_self_collision_check=mesh_self_collision_check,
-                mesh_self_collision_margin=mesh_self_collision_margin,
-                num_envs=num_envs,
-            )
+        (
+            robot_config,
+            optimizer_dicts,
+            metrics_rollout_dict,
+            transition_model_dict,
+            scene_model_dict,
+        ) = resolve_yaml_configs(
+            robot,
+            optimizer_configs,
+            metrics_rollout,
+            transition_model,
+            scene_model,
+            device_cfg,
+            load_collision_spheres=load_collision_spheres,
+            mesh_collision_check=mesh_collision_check,
+            mesh_collision_margin=mesh_collision_margin,
+            mesh_self_collision_check=mesh_self_collision_check,
+            mesh_self_collision_margin=mesh_self_collision_margin,
+            num_envs=num_envs,
         )
+
+        if not enable_inverse_dynamics:
+            transition_model_dict = deepcopy(transition_model_dict)
+            transition_model_dict["transition_model_cfg"]["compute_inverse_dynamics"] = False
+        transition = transition_model_dict["transition_model_cfg"]
+        if num_knots is not None:
+            if transition["control_space"] not in {
+                space.name for space in ControlSpace.bspline_types()
+            }:
+                log_and_raise("num_knots requires a B-spline transition model")
+            transition["n_knots"] = num_knots
+        if transition["control_space"] in {space.name for space in ControlSpace.bspline_types()}:
+            validate_trajopt_knots(transition["n_knots"])
 
         # 2. Determine interpolation type from transition model
         if transition_model_dict["transition_model_cfg"]["control_space"] == "POSITION":
@@ -284,6 +354,22 @@ class TrajOptSolverCfg:
             mesh_only_success=mesh_only_success,
         )
 
+        if initial_max_iters is None:
+            initial_max_iters = (override_optimizer_num_iters or {}).get(
+                core_cfg.optimizer_configs[-1].solver_name
+            )
+            if initial_max_iters is None:
+                initial_max_iters = 100
+
+        if interpolation_buffer_size is None:
+            model = core_cfg.metrics_rollout_config.transition_model_cfg
+            minimum_capacity = (
+                model.spline_layout.dense_horizon(maximum_trajectory_dt, interpolation_dt)
+                if model.control_space in ControlSpace.bspline_types()
+                else model.native_horizon
+            )
+            interpolation_buffer_size = max(1000, minimum_capacity)
+
         return TrajOptSolverCfg(
             core_cfg=core_cfg,
             robot_config=robot_config,
@@ -293,8 +379,6 @@ class TrajOptSolverCfg:
             num_seeds=num_seeds,
             position_tolerance=position_tolerance,
             orientation_tolerance=orientation_tolerance,
-            position_tolerance_traj=position_tolerance_traj,
-            orientation_tolerance_traj=orientation_tolerance_traj,
             optimizer_collision_activation_distance=optimizer_collision_activation_distance,
             self_collision_check=self_collision_check,
             minimum_trajectory_dt=minimum_trajectory_dt,
@@ -302,4 +386,8 @@ class TrajOptSolverCfg:
             interpolation_dt=interpolation_dt,
             interpolation_type=interpolation_type,
             interpolation_buffer_size=interpolation_buffer_size,
+            enable_timeopt=enable_timeopt,
+            enable_inverse_dynamics=enable_inverse_dynamics,
+            initial_max_iters=initial_max_iters,
+            initial_check_interval=initial_check_interval,
         )

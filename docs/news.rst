@@ -1,6 +1,12 @@
 
 Updates
 =======
+- November 4, 2026 (v0.9.0): cuRoboV2-Fast, Cartesian waypoint planning,
+  GPU bidirectional RRT, torque-limited TimeOpt, C++ deployment, and robot
+  pose calibration. With a 3 kg payload, cuRoboV2-Fast achieves 4.4 ms mean
+  planning time on RTX 5090, 14.7× faster than cuRoboV2. A stereo-camera-based
+  YAM deployment achieves 5.93 s mean completed pick-and-drop cycles,
+  34.6% shorter than cuRoboV2. See :doc:`technical_reports` for details.
 - October 27, 2026: Add exact robot-mesh collision checking, a multi-waypoint motion planner,
   and tool pose bounds that keep a tool frame within position and orientation limits during
   motion.

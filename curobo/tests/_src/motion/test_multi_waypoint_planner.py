@@ -15,6 +15,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from curobo._src.cost.tool_pose_bound import ToolPoseBound
+from curobo._src.cost.tool_pose_criteria import PoseErrorFrame, ToolPoseCriteria
+
 # CuRobo
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
 from curobo._src.motion.multi_waypoint_planner import MultiWaypointMotionPlanner
@@ -24,8 +27,6 @@ from curobo._src.motion.multi_waypoint_planner_cfg import (
 )
 from curobo._src.motion.multi_waypoint_planner_result import MultiWaypointPlanResult
 from curobo._src.motion.trajectory_stitching import stitch_jointstate_trajectories
-from curobo._src.cost.tool_pose_bound import ToolPoseBound
-from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose
@@ -68,8 +69,14 @@ class TestPublicExports:
     def test_public_module_reexports(self):
         from curobo.multi_waypoint_planner import (
             MultiWaypointMotionPlanner as PubPlanner,
+        )
+        from curobo.multi_waypoint_planner import (
             MultiWaypointMotionPlannerCfg as PubCfg,
+        )
+        from curobo.multi_waypoint_planner import (
             MultiWaypointPlanResult as PubResult,
+        )
+        from curobo.multi_waypoint_planner import (
             SegmentPlanCfg as PubSegment,
         )
 
@@ -173,17 +180,18 @@ class TestCriteriaMerge:
 
         merged = planner._merge_two_criteria(a, b)
 
-        assert merged.terminal_pose_axes_weight_factor.tolist() == [1, 1, 1, 1, 1, 1]
+        assert torch.diagonal(merged.terminal_position_projector).tolist() == [1, 1, 1]
+        assert torch.diagonal(merged.terminal_rotation_projector).tolist() == [1, 1, 1]
         # min-ignoring-zero keeps the non-zero tolerance from each side.
-        assert merged.terminal_pose_convergence_tolerance.tolist() == pytest.approx([0.01, 0.05])
-        assert bool(merged.project_distance_to_goal.bool().item()) is True
+        assert merged.terminal_tolerance.tolist() == pytest.approx([0.01, 0.05])
+        assert int(merged.error_frame.item()) == int(PoseErrorFrame.GOAL)
 
     def test_merge_min_tol_picks_stricter(self):
         planner = _stub_planner(waypoint_constraint_merge_mode="max_weights_min_tols")
         a = _cpu_criteria([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], terminal_tol=(0.02, 0.03))
         b = _cpu_criteria([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], terminal_tol=(0.01, 0.05))
         merged = planner._merge_two_criteria(a, b)
-        assert merged.terminal_pose_convergence_tolerance.tolist() == pytest.approx([0.01, 0.03])
+        assert merged.terminal_tolerance.tolist() == pytest.approx([0.01, 0.03])
 
 
 class TestBuildWaypointCriteria:
@@ -200,9 +208,9 @@ class TestBuildWaypointCriteria:
         assert wp[0] is c0
         assert wp[3] is c2
         # Interior waypoint 1 merges segments 0 and 1.
-        assert wp[1]["ee"].terminal_pose_axes_weight_factor.tolist()[:3] == [1, 1, 0]
+        assert torch.diagonal(wp[1]["ee"].terminal_position_projector).tolist() == [1, 1, 0]
         # Interior waypoint 2 merges segments 1 and 2.
-        assert wp[2]["ee"].terminal_pose_axes_weight_factor.tolist()[:3] == [0, 1, 1]
+        assert torch.diagonal(wp[2]["ee"].terminal_position_projector).tolist() == [0, 1, 1]
 
     def test_unsupported_merge_mode_raises(self):
         planner = _stub_planner(waypoint_constraint_merge_mode="bogus")

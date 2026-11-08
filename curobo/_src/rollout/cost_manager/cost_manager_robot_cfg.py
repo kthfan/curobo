@@ -16,13 +16,15 @@ from typing import TYPE_CHECKING, Dict, Optional
 from curobo._src.cost.cost_cspace_cfg import CSpaceCostCfg
 from curobo._src.cost.cost_cspace_dist_cfg import CSpaceDistCostCfg
 from curobo._src.cost.cost_eef_bound_cfg import EEFBoundCostCfg
-from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
-from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
-from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
 from curobo._src.cost.cost_robot_mesh_constraint_cfg import RobotMeshConstraintCfg
 from curobo._src.cost.cost_robot_mesh_self_collision_cfg import (
     RobotMeshSelfCollisionConstraintCfg,
 )
+from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
+from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
+from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
+from curobo._src.cost.cost_tool_relative_transform_cfg import ToolRelativeTransformCostCfg
+from curobo._src.cost.cost_tool_velocity_limit_cfg import ToolVelocityLimitCostCfg
 from curobo._src.types.device_cfg import DeviceCfg
 
 if TYPE_CHECKING:
@@ -66,6 +68,12 @@ class RobotCostManagerCfg:
     #: Tool (end-effector) pose tracking cost configuration. None
     #: disables pose-based objectives.
     tool_pose_cfg: Optional[ToolPoseCostCfg] = None
+    #: Relative transforms between one fixed reference tool frame and the
+    #: rollout's other tool frames. None disables relative-transform costs.
+    tool_relative_transform_cfg: Optional[ToolRelativeTransformCostCfg] = None
+    #: Projected world-frame tool speed limits. None disables tool velocity
+    #: limits and avoids computing tool Jacobians.
+    tool_velocity_limit_cfg: Optional[ToolVelocityLimitCostCfg] = None
 
     # Tool pose bounds
     #: Cost keeping tool frames inside their :class:`ToolPoseBound` limits, set at runtime
@@ -104,6 +112,8 @@ class RobotCostManagerCfg:
             "eef_bound_cfg": EEFBoundCostCfg,
             "mesh_collision_cfg": RobotMeshConstraintCfg,
             "mesh_self_collision_cfg": RobotMeshSelfCollisionConstraintCfg,
+            "tool_relative_transform_cfg": ToolRelativeTransformCostCfg,
+            "tool_velocity_limit_cfg": ToolVelocityLimitCostCfg,
         }
         data = {}
         for k, cfg_class in cost_key_map.items():
@@ -116,6 +126,11 @@ class RobotCostManagerCfg:
             data["mesh_collision_cfg"].scene_collision_checker = scene_collision_checker
 
         return RobotCostManagerCfg(**data)
+
+    @property
+    def requires_tool_jacobians(self) -> bool:
+        """Return whether this manager needs tool Jacobians from kinematics."""
+        return self.tool_velocity_limit_cfg is not None
 
     def update_collision_activation_distance(self, distance: float):
         if self.scene_collision_cfg is not None:

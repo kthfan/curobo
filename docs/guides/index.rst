@@ -15,6 +15,14 @@ Writing Optimization Problems
    custom_cost
    custom_optimization
 
+C++ Deployment
+--------------
+
+.. toctree::
+   :maxdepth: 1
+
+   export_cpp_runtime
+
 Motion Planning
 ---------------
 

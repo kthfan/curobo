@@ -155,10 +155,11 @@ class MultiWaypointMotionPlanner:
     ) -> ToolPoseCriteria:
         """Merge two criteria so the shared waypoint satisfies both segments.
 
-        Axis weight factors are combined by ``max`` (the stronger constraint
-        wins) and convergence tolerances by ``min`` ignoring zeros (zero means
-        "unset", so a non-zero tolerance from either side is preserved and the
-        stricter of two non-zero tolerances is kept).
+        Projectors are combined by the union of their ranges (an axis constrained by either
+        side stays constrained), axis scales by ``max`` over the axes both sides constrain,
+        tolerances by ``min`` ignoring zeros (zero means "unset", so a non-zero tolerance
+        from either side is preserved and the stricter of two non-zero tolerances is kept),
+        and the enforce flags and the goal error frame by ``or``.
         """
 
         def min_tol(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -166,28 +167,43 @@ class MultiWaypointMotionPlanner:
             y_or_x = torch.where(y > 0, y, x)
             return torch.minimum(x_or_y, y_or_x)
 
-        proj = (
-            a.project_distance_to_goal.bool() | b.project_distance_to_goal.bool()
-        ).to(torch.uint8)
-        return ToolPoseCriteria(
-            terminal_pose_axes_weight_factor=torch.maximum(
-                a.terminal_pose_axes_weight_factor, b.terminal_pose_axes_weight_factor
-            ),
-            non_terminal_pose_axes_weight_factor=torch.maximum(
-                a.non_terminal_pose_axes_weight_factor,
-                b.non_terminal_pose_axes_weight_factor,
-            ),
-            terminal_pose_convergence_tolerance=min_tol(
-                a.terminal_pose_convergence_tolerance,
-                b.terminal_pose_convergence_tolerance,
-            ),
-            non_terminal_pose_convergence_tolerance=min_tol(
-                a.non_terminal_pose_convergence_tolerance,
-                b.non_terminal_pose_convergence_tolerance,
-            ),
-            project_distance_to_goal=proj,
-            device_cfg=a.device_cfg,
-        )
+        def union_projector(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            eigenvalues, eigenvectors = torch.linalg.eigh(x + y)
+            basis = eigenvectors * (eigenvalues > 0.5).to(eigenvectors.dtype)
+            return basis @ basis.transpose(-1, -2)
+
+        def merge_scale(
+            x_scale: torch.Tensor,
+            y_scale: torch.Tensor,
+            x_projector: torch.Tensor,
+            y_projector: torch.Tensor,
+        ) -> torch.Tensor:
+            x_on = torch.diagonal(x_projector) > 0.5
+            y_on = torch.diagonal(y_projector) > 0.5
+            return torch.where(
+                x_on & y_on,
+                torch.maximum(x_scale, y_scale),
+                torch.where(x_on, x_scale, torch.where(y_on, y_scale, torch.ones_like(x_scale))),
+            )
+
+        values = {}
+        for prefix in ("terminal", "path"):
+            for kind in ("position", "rotation"):
+                projector = f"{prefix}_{kind}_projector"
+                scale = f"{prefix}_{kind}_axis_scale"
+                values[projector] = union_projector(getattr(a, projector), getattr(b, projector))
+                values[scale] = merge_scale(
+                    getattr(a, scale),
+                    getattr(b, scale),
+                    getattr(a, projector),
+                    getattr(b, projector),
+                )
+            tolerance = f"{prefix}_tolerance"
+            enforce = f"enforce_{prefix}_tolerance"
+            values[tolerance] = min_tol(getattr(a, tolerance), getattr(b, tolerance))
+            values[enforce] = torch.maximum(getattr(a, enforce), getattr(b, enforce))
+        values["error_frame"] = torch.maximum(a.error_frame, b.error_frame)
+        return ToolPoseCriteria(device_cfg=a.device_cfg, **values)
 
     def _merge_criteria_dicts(
         self,

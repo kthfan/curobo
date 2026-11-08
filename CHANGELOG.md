@@ -2,10 +2,127 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Changelog
 
-
 ## Latest Commit
 
 ### New Features
+- Improve RRT growth sampling to have signifcantly higher chance of finding a path.
+- Add flag to disable inverse dynamics during motion planning.
+- Add exact robot-mesh collision checking. `mesh_collision_check=True` on
+  `MotionPlannerCfg.create`, `InverseKinematicsCfg.create`,
+  `TrajectoryOptimizerCfg.create`, and `ModelPredictiveControlCfg.create`
+  loads the URDF collision meshes and rejects solutions whose meshes touch
+  the scene; `mesh_collision_margin` sets the clearance. The optimizers still
+  avoid obstacles with the collision spheres. Robot YAMLs can set
+  `max_triangles_per_link`, `mesh_collision_ignored_link_names`, and
+  `extra_collision_meshes`, and `RobotCollisionCheckerCfg.load_from_config`
+  accepts `use_mesh_constraint`.
+- Extend the exact mesh collision check. Trajectory optimization also checks
+  every step of the interpolated trajectory. `AttachmentManager` writes an
+  attached object's mesh into the link's reserved triangle slots and clears it
+  on detach (`franka.yml` reserves 256 for `attached_object`), and
+  `clear_link_mesh` / `enable_link_mesh` manage runtime geometry.
+  `disable_link_collision` / `enable_link_collision` toggle the link meshes
+  too, so `plan_grasp` works with the mesh check. Scene and link-mesh updates
+  are tested to reach captured CUDA graphs.
+- Add `get_mesh_collision_links` to the IK, trajectory optimization and MPC
+  solvers and the motion planners. It names the link whose collision mesh
+  touches the scene, per configuration, e.g. per step of a failed trajectory.
+- Add an exact self-collision check between the robot's link meshes.
+  `mesh_self_collision_check=True` (and `mesh_self_collision_margin`) on the same
+  `create` methods rejects solutions in which two link meshes collide, including
+  pairs the sphere check must ignore because their spheres always overlap, such
+  as Franka's link5 with link7 and the hand. Links in one rigid body and links
+  one joint apart are skipped, plus a `mesh_self_collision_ignore` list in the
+  robot YAML; `RobotBuilder.compute_mesh_collision_matrix` derives that list.
+  `get_mesh_self_collision_pairs` names a colliding pair, and
+  `RobotCollisionCheckerCfg.load_from_config` accepts
+  `use_mesh_self_collision_constraint`.
+- Speed up the mesh collision check by skipping links whose bounding sphere is
+  clear of every obstacle: 2x to 12x faster for 4096 configurations,
+  depending on the scene type.
+- Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
+  plans one trajectory through an ordered list of Cartesian waypoints with
+  per-segment tool pose criteria.
+- Add tool pose bounds. `ToolPoseBound` limits a tool frame's position and
+  orientation over the whole trajectory relative to the goal, the start, or
+  the robot base: planes, lines, boxes, the tilt of a tool axis, and yaw and
+  roll ranges, with `plane`, `line`, `axis_tilt`, and `orientation_box`
+  factories. A tool frame can hold several bounds, and `center_weight` keeps
+  paths near the middle of limits with two ends. They are set with
+  `update_tool_pose_bounds` on the motion planner, IK, trajectory
+  optimization, MPC, and the multi-waypoint planner.
+  The default IK, trajectory optimization, and MPC task configs include the
+  `eef_bound_cfg` cost, which has no effect until a bound is set.
+- Remove `position_tolerance_traj` and `orientation_tolerance_traj` from
+  `TrajectoryOptimizerCfg.create` and `MotionPlannerCfg.create`. To check the
+  steps before the goal, set `path_tolerance` and `enforce_path_tolerance=True`
+  on the `ToolPoseCriteria` instead.
+
+### Bug Fixes & Misc.
+- `mesh_collision_ignored_link_names` now only leaves links out of the mesh scene check.
+  Their meshes are loaded and still tested by the mesh self-collision check, so a base link
+  bolted to the table is still protected from the hand. Leave link pairs out of the
+  self-collision check with `mesh_self_collision_ignore`.
+- Decimate robot link meshes closer to their surface. Decimation now merges duplicate
+  vertices, closes the mesh when it can, keeps open borders, and keeps the result closest
+  to the original among several settings. Franka's links 2-5, decimated from 300 to the
+  default 256 triangles, moved by up to 2.3 cm before and stay within about 1 mm now. The
+  deviation of every decimated link is logged, with a warning above 2 mm.
+- Fix `RobotCollisionChecker.validate` with `use_mesh_constraint=True`, which
+  combined terms of different shapes.
+- Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,
+  only intersecting triangles were reported, so the margin had almost no effect.
+- Catch obstacles between the samples of large robot triangles on fine voxel
+  grids: where the sampling cap applies, the voxel mesh check widens its
+  threshold by the extra reach of the coarser samples.
+- Require `fast_simplification`. Without it, link meshes over their triangle
+  budget fell back to their convex hull, which fills concave gaps such as the
+  space between gripper fingers.
+- Fix `GoalManager` storing the caller's goal tensors as its reusable buffer, so
+  the next solve overwrote them. `plan_grasp` lost its grasp poses this way.
+- Fix the approach-to-grasp and lift phases of `plan_grasp`, which always
+  failed: their start states carried the previous trajectory's `dt`, which
+  clamped every joint to within one step of motion.
+- Fix the `ToolPoseCost` rotation term for the default axis-angle rotation
+  error. Its gradient reached the joints at half its value, which hid that the
+  rotation distance was `w * theta^2` while the position distance is
+  `0.5 * w * |delta|^2`. The rotation distance is now `0.5 * w * theta^2` and its
+  gradient reaches the joints exactly, so the optimizers receive the same
+  rotation gradient as before and the reported rotation cost is half its
+  previous value. The Lie group rotation methods are unchanged.
+
+## Version 0.9.0
+
+### New Features
+- Add cuRoboV2-Fast for payload-aware, torque-limited collision-free motion
+  planning with B-spline trajectory optimization, accelerated GPU robot
+  computations, and differentiable inverse dynamics. See the
+  [project page](https://research.nvidia.com/labs/lpr/curobov2-fast/).
+- Add Cartesian waypoint motion planning through
+  `MotionPlanner.plan_pose_waypoints()` and
+  `BatchMotionPlanner.plan_pose_waypoints()`, with ordered tool targets,
+  position-only or full-pose tracking, and separate path and final tolerances.
+  Include an interactive Viser tutorial for editing targets and previewing
+  validated trajectories.
+- Add GPU bidirectional RRT with parallel candidate search, collision-checked
+  shortcutting, and B-spline fitting for trajectory seeds, with optional
+  trajectory-optimization refinement.
+- Add TimeOpt fixed-path time optimization under sampled joint velocity,
+  acceleration, jerk, and torque constraints, using local spline support
+  and banded Newton systems on the GPU.
+- Add a C++ deployment runtime for robot kinematics and Jacobians, IK,
+  motion planning, MPC, collision checking, attachments, payload dynamics,
+  and volumetric mapping. Export precompiled CUDA artifacts for deployment
+  on another GPU, including Jetson platforms.
+- Add robot pose calibration with global ICP initialization and local
+  mesh-distance refinement, including a separate C++ calibration API
+  and an interactive Python reference example.
+- Add deferred fused-feature rendering with `Mapper.render_features()`. Compact int32 block and
+  int16 node images support full images, absolute-coordinate patches, batched cameras, optional
+  semantic filtering, and fp16/fp32 materialization of contiguous feature-channel slices.
+- Add reusable semantic filtering for mapper outputs. `SemanticFilter` supports cosine similarity,
+  argmax equality, or both for one-hot and latent feature grids, with `only` and `exclude` modes
+  applied before occupied-voxel, render, ESDF, mesh, and textured-mesh generation.
 - Add feature-aware volumetric mapping. `CameraObservation` can carry an
   optional channels-last `feature_grid`; `MapperCfg.feature_dim` enables
   RGB and neural-feature fusion into per-block accumulators.
@@ -71,88 +188,19 @@
   and Hugging Face CLI setup plus sequence-only download commands.
 - Add `live_volumetric_mapping_mpc.py`, a live RGB-D TSDF/ESDF mapping
   reference example with Franka MPC using a RealSense backend.
-- Add exact robot-mesh collision checking. `mesh_collision_check=True` on
-  `MotionPlannerCfg.create`, `InverseKinematicsCfg.create`,
-  `TrajectoryOptimizerCfg.create`, and `ModelPredictiveControlCfg.create`
-  loads the URDF collision meshes and rejects solutions whose meshes touch
-  the scene; `mesh_collision_margin` sets the clearance. The optimizers still
-  avoid obstacles with the collision spheres. Robot YAMLs can set
-  `max_triangles_per_link`, `mesh_collision_ignored_link_names`, and
-  `extra_collision_meshes`, and `RobotCollisionCheckerCfg.load_from_config`
-  accepts `use_mesh_constraint`.
-- Extend the exact mesh collision check. Trajectory optimization also checks
-  every step of the interpolated trajectory. `AttachmentManager` writes an
-  attached object's mesh into the link's reserved triangle slots and clears it
-  on detach (`franka.yml` reserves 256 for `attached_object`), and
-  `clear_link_mesh` / `enable_link_mesh` manage runtime geometry.
-  `disable_link_collision` / `enable_link_collision` toggle the link meshes
-  too, so `plan_grasp` works with the mesh check. Scene and link-mesh updates
-  are tested to reach captured CUDA graphs.
-- Add `get_mesh_collision_links` to the IK, trajectory optimization and MPC
-  solvers and the motion planners. It names the link whose collision mesh
-  touches the scene, per configuration, e.g. per step of a failed trajectory.
-- Add an exact self-collision check between the robot's link meshes.
-  `mesh_self_collision_check=True` (and `mesh_self_collision_margin`) on the same
-  `create` methods rejects solutions in which two link meshes collide, including
-  pairs the sphere check must ignore because their spheres always overlap, such
-  as Franka's link5 with link7 and the hand. Links in one rigid body and links
-  one joint apart are skipped, plus a `mesh_self_collision_ignore` list in the
-  robot YAML; `RobotBuilder.compute_mesh_collision_matrix` derives that list.
-  `get_mesh_self_collision_pairs` names a colliding pair, and
-  `RobotCollisionCheckerCfg.load_from_config` accepts
-  `use_mesh_self_collision_constraint`.
-- Speed up the mesh collision check by skipping links whose bounding sphere is
-  clear of every obstacle: 2x to 12x faster for 4096 configurations,
-  depending on the scene type.
-- Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
-  plans one trajectory through an ordered list of Cartesian waypoints with
-  per-segment tool pose criteria.
-- Add tool pose bounds. `ToolPoseBound` limits a tool frame's position and
-  orientation over the whole trajectory relative to the goal, the start, or
-  the robot base: planes, lines, boxes, the tilt of a tool axis, and yaw and
-  roll ranges, with `plane`, `line`, `axis_tilt`, and `orientation_box`
-  factories. A tool frame can hold several bounds, and `center_weight` keeps
-  paths near the middle of limits with two ends. They are set with
-  `update_tool_pose_bounds` on the motion planner, IK, trajectory
-  optimization, MPC, and the multi-waypoint planner.
-  The default IK, trajectory optimization, and MPC task configs include the
-  `eef_bound_cfg` cost, which has no effect until a bound is set.
-- Add `position_tolerance_traj` and `orientation_tolerance_traj` to
-  `TrajectoryOptimizerCfg.create` and `MotionPlannerCfg.create` to check the
-  steps before the goal against the non-terminal tool pose criteria.
 
 ### Bug Fixes & Misc.
-- `mesh_collision_ignored_link_names` now only leaves links out of the mesh scene check.
-  Their meshes are loaded and still tested by the mesh self-collision check, so a base link
-  bolted to the table is still protected from the hand. Leave link pairs out of the
-  self-collision check with `mesh_self_collision_ignore`.
-- Decimate robot link meshes closer to their surface. Decimation now merges duplicate
-  vertices, closes the mesh when it can, keeps open borders, and keeps the result closest
-  to the original among several settings. Franka's links 2-5, decimated from 300 to the
-  default 256 triangles, moved by up to 2.3 cm before and stay within about 1 mm now. The
-  deviation of every decimated link is logged, with a warning above 2 mm.
-- Fix `RobotCollisionChecker.validate` with `use_mesh_constraint=True`, which
-  combined terms of different shapes.
-- Make `mesh_collision_margin` an exact clearance against mesh obstacles. Before,
-  only intersecting triangles were reported, so the margin had almost no effect.
-- Catch obstacles between the samples of large robot triangles on fine voxel
-  grids: where the sampling cap applies, the voxel mesh check widens its
-  threshold by the extra reach of the coarser samples.
-- Require `fast_simplification`. Without it, link meshes over their triangle
-  budget fell back to their convex hull, which fills concave gaps such as the
-  space between gripper fingers.
-- Fix `GoalManager` storing the caller's goal tensors as its reusable buffer, so
-  the next solve overwrote them. `plan_grasp` lost its grasp poses this way.
-- Fix the approach-to-grasp and lift phases of `plan_grasp`, which always
-  failed: their start states carried the previous trajectory's `dt`, which
-  clamped every joint to within one step of motion.
-- Fix the `ToolPoseCost` rotation term for the default axis-angle rotation
-  error. Its gradient reached the joints at half its value, which hid that the
-  rotation distance was `w * theta^2` while the position distance is
-  `0.5 * w * |delta|^2`. The rotation distance is now `0.5 * w * theta^2` and its
-  gradient reaches the joints exactly, so the optimizers receive the same
-  rotation gradient as before and the reported rotation cost is half its
-  previous value. The Lie group rotation methods are unchanged.
+- Fix Levenberg–Marquardt IK step acceptance in Python and C++ to reject
+  invalid or worsening steps and preserve the accepted objective after
+  rejected updates. Make joint-limit costs consistent with their residual
+  derivatives.
+- Make IK retargeting accept feasible approximate link targets, reject
+  infeasible initialization, and hold the previous feasible pose when a
+  local update remains infeasible after joint and velocity bound correction.
+- Fix SDF pose refinement so CUDA graph warmup cannot overwrite the initial
+  pose's cost and Jacobian through shared scratch buffers.
+- Synchronize native Warp mesh construction before subsequent GPU queries.
+- Refresh public API documentation, tutorials, and native export examples.
 - Reduce GPU memory consumption for batched motion planning by 3x with
   batch-aware IK and TrajOpt seed defaults and a smaller interpolation buffer.
 - Fix `MotionPlanner` and `BatchMotionPlanner` attachment-manager access so
@@ -205,6 +253,8 @@
   default.
 
 ### Breaking Changes
+- Re-export native IK artifacts to include the updated LM objective-update
+  kernel and manifest entry.
 - `MapperCfg` now requires `image_height` and `image_width` so the
   voxel-project scratch buffer can be allocated during mapper construction.
 - `MapperCfg.block_size`, `BlockSparseTSDFCfg.block_size`,
