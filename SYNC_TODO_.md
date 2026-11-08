@@ -82,8 +82,14 @@ branch back into `dev/main`.
 
 ## Verification
 
-- [ ] CPU: `python -c "import curobo"`, import every module `dev/main` added, `ruff check`.
-- [ ] CPU: `pytest --collect-only curobo/tests` collects without import errors.
+- [x] CPU: `import curobo` and all 240 modules `dev/main` added or changed import (needs
+      `cuda-core` and `viser` installed). `ruff check --select F` shows no new errors from the
+      merge; imports in the touched files are sorted.
+- [x] CPU: `pytest --collect-only curobo/tests` collects 8012 tests without errors.
+- [x] CPU: the merged areas' tests (`test_multi_waypoint_planner`, `test_tool_pose_bound`,
+      `test_cost_eef_bound`, `test_manager_goal`, `test_solver_trajopt_result`,
+      `test_cost_tool_pose`, `test_self_collision_params`, `test_update_tool_pose_bounds`,
+      `test_motion_planner_cfg`): 239 passed, 84 skipped for lack of CUDA.
 - [ ] GPU (Kaggle): mesh collision tests (`curobo/tests/_src/collision/test_robot_mesh_*`,
       `test_mesh_collision_end_to_end.py`), `test_tool_pose_bound.py`, `test_cost_eef_bound.py`
       (gradient convention), `test_update_tool_pose_bounds.py`, `test_coverage_sphere.py`,
