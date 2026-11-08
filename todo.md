@@ -150,6 +150,18 @@ None right now.
 - [ ] **Graph planner ignores meshes** (benchmark). Scheduled after the mode above.
 - [ ] **MPC executes infeasible actions.** Handled on another branch; reference only.
 
+### Noted for later (user's decision)
+
+- [ ] **`collision_sphere_buffer` also grows the self-collision spheres.** In
+  `curobo/_src/robot/loader/kinematics_loader.py` (`_build_collision_model`) the loader
+  subtracts the buffer from a local copy of `self_collision_buffer` and then passes the
+  unmodified `self.self_collision_buffer` to `SelfCollisionKinematicsCfg.create_from_link_pairs`,
+  so the intended cancellation never happens (since the initial v2 commit `457b658`). The
+  guide's "Fix solves that fail only with the mesh check" describes the current behavior.
+  Likely a bug; fixing it changes self-collision for every robot with a non-zero buffer
+  (franka.yml and ur10e.yml use 0). Upstream v1 behavior not checked yet (the fetch of the
+  NVlabs file returned 404).
+
 ### Later (P3)
 
 - [ ] **Clearance against dense meshes with a large cap** is still slow: 192k-triangle mesh,
