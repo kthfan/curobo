@@ -465,6 +465,7 @@ def _mesh_robot_model(reserve_mesh_slots: bool = True, num_envs: int = 1) -> Kin
     kparams = model.config.kinematics_config
     if num_envs > 1:
         kparams.link_spheres = kparams.link_spheres.repeat(num_envs, 1, 1)
+        kparams.sphere_collision_mask = kparams.sphere_collision_mask.repeat(num_envs, 1)
         kparams.reference_link_spheres = kparams.reference_link_spheres.repeat(num_envs, 1, 1)
     return model
 

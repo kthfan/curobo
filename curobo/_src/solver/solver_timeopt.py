@@ -113,7 +113,8 @@ class TimeOptSolver:
             finite &= ((values >= bounds[0] - 1e-4) & (values <= bounds[1] + 1e-4)).all(
                 dim=(-2, -1)
             )
-        state = self.rollout.transition_model.compute_augmented_state(sampled)
+        # The metrics transition model also exposes the link transforms the mesh check needs.
+        state = self.rollout.metrics_transition_model.compute_augmented_state(sampled)
         if self.config.enable_inverse_dynamics:
             torque = state.joint_torque
             if torque is None:

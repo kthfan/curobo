@@ -124,6 +124,18 @@ class GraspPhasePlanner:
 
             executor = self._create_update_executor(key, update)
         executor.replay(clone_outputs=False)
+        if self.device_cfg.device.type == "cuda":
+            # The captured update only writes sphere radii; the exact-mesh check also needs
+            # the links' triangles toggled. These writes are in place, so captured solver
+            # graphs see them.
+            kinematics_config = self.kinematics.config.kinematics_config
+            for link in stable_links:
+                if not kinematics_config.has_link_mesh(link):
+                    continue
+                if enable:
+                    kinematics_config.enable_link_mesh(link)
+                else:
+                    kinematics_config.disable_link_mesh(link)
 
     @staticmethod
     def validate_linear_path_tolerance(tolerance: Tuple[float, float]) -> None:

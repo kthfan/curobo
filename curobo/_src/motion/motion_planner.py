@@ -1007,8 +1007,8 @@ class MotionPlanner:
         """
         if current_state.ndim > 2:
             log_and_raise(f"current_state must be a 2D tensor, got shape: {current_state.shape}")
-        self._check_tool_pose_bounds(goal_tool_poses, current_state)
         initial_iters = _initial_iteration_budget(self.trajopt_solver, outer_iterations)
+        self._check_tool_pose_bounds(goal_tool_poses, current_state)
 
         if goal_tool_poses.num_goalset > 1:
             return self._plan_pose_goalset(
@@ -1750,7 +1750,8 @@ class MotionPlanner:
 
     def _check_tool_pose_bounds(self, goal_tool_poses: GoalToolPose, current_state: JointState):
         """Raise if the start state or every goal violates a tool pose bound."""
-        if not self._tool_pose_bounds:
+        # Planners built without __init__ (as in unit tests) have no tracked bounds.
+        if not getattr(self, "_tool_pose_bounds", None):
             return
         # Positions only, matching how the solvers read current_state.
         start_tool_poses = self.compute_kinematics(

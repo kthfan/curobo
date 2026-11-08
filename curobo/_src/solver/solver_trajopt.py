@@ -904,7 +904,8 @@ class TrajOptSolver:
         else:
             interpolated, counts, _ = self.get_interpolated_trajectory(native)
             rollout = self.additional_metrics_rollouts["interpolated_rollout"]
-            state = rollout.transition_model.compute_augmented_state(interpolated)
+            # The metrics transition model also exposes the link transforms the mesh check needs.
+            state = rollout.metrics_transition_model.compute_augmented_state(interpolated)
             final_metrics = rollout.compute_metrics_from_state(state)
         result = self._result_processor.finalize(
             return_seeds,
