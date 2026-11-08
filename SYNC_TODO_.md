@@ -77,8 +77,8 @@ branch back into `dev/main`.
 - [x] Deleted `dev/main` files nothing references: `task/metrics_base_custom.yml` and
       `task/trajopt/transition_bspline_trajopt_custom.yml`.
 - [x] `pyproject.toml`: `fast_simplification` kept; upstream already dropped the pybind data.
-- [ ] `KinematicsState.link_transforms` reads `_buffers["batch_cumul_mat"]`; upstream changed the
-      forward kinematics kernel, so verify the buffer layout on GPU.
+- [x] `KinematicsState.link_transforms` reads `_buffers["batch_cumul_mat"]`; the layout still
+      holds after upstream's forward kinematics changes (`test_link_transforms` passes on GPU).
 - [ ] `ToolPoseCriteria.path_tolerance` rotation units: upstream's waypoint planner converts an
       angle to the chord `2·sin(θ/2)` before storing it; the guide follows that. Confirm on GPU.
 
@@ -92,9 +92,23 @@ branch back into `dev/main`.
       `test_cost_eef_bound`, `test_manager_goal`, `test_solver_trajopt_result`,
       `test_cost_tool_pose`, `test_self_collision_params`, `test_update_tool_pose_bounds`,
       `test_motion_planner_cfg`): 239 passed, 84 skipped for lack of CUDA.
-- [ ] GPU (Kaggle): mesh collision tests (`curobo/tests/_src/collision/test_robot_mesh_*`,
-      `test_mesh_collision_end_to_end.py`), `test_tool_pose_bound.py`, `test_cost_eef_bound.py`
-      (gradient convention), `test_update_tool_pose_bounds.py`, `test_coverage_sphere.py`,
-      `test_multi_waypoint_planner.py`, `test_link_transforms.py`, and the upstream motion
-      planner tests.
+- [x] GPU (Kaggle, 2x T4, commit 7d7ef8f): 7886 passed, 13 failed, 85 skipped. All 13
+      failures are unrelated to the merge:
+      - 11 fail identically on upstream `5e4f23d` (run separately as a baseline):
+        `test_builder::test_feature_channel_grouping_specializes_feature_kernel`,
+        `test_motion_planner_relative_target` (3), `test_solver_tool_relative_transform_target`
+        (2; test stubs miss attributes upstream code reads),
+        `test_cost_self_collision::test_sum_collision_exact_and_aabb_match`,
+        `test_backend_lazy_import` (upstream's TimeOpt imports `cuda.core` at import time),
+        `test_lbfgs::test_backtracking_preserves_direction_and_history_in_graph[True]` (wmma
+        kernel does not compile on T4), `test_timeopt_solver::test_grouped_assembly_matches_autograd`
+        (2).
+      - 2 need `pinocchio`, which the test environment lacks:
+        `test_motion_plan_benchmark_metrics` (2).
+- [x] Merge-caused GPU failures fixed: mesh constraints in the TimeOpt and interpolated
+      validation (metrics transition model), link meshes in `GraspPhasePlanner`, the tool pose
+      bound check on stub planners, the multi-env attachment test helper, and the
+      `mesh_only_success` sampling test (float32 rounding).
+- [x] Verified on GPU: the `eef_bound` gradient convention, `KinematicsState.link_transforms`
+      (`test_link_transforms`), and the mesh collision suites.
 - [ ] Merge `dev/sync-v0.9.0` back into `dev/main` and remove this file.
