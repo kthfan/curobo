@@ -70,10 +70,12 @@ branch back into `dev/main`.
       `kernels/kinematics/kinematics_jacobian_backward_kernel.cuh` (pybind backend removed
       upstream; upstream ships its own `kinematics_jacobian_backward_kernel`).
 - [x] Imports of modules upstream moved or removed: none left.
-- [ ] Unreferenced files from the 3fd54dc sync: mapper kernels `wp_hash`, `wp_coord`,
-      `wp_raycast`, `wp_raycast_common`, `wp_integrate_sort_filter`,
-      `perception/mapper/kernel/wp_esdf_seed`, `esdf/kernel/wp_resample`, and
-      `util/warp_tile_mlp.py`. Nothing imports them; decide whether to delete them.
+- [x] Deleted files that neither `dev/main` wrote nor upstream still has: the mapper kernels,
+      `warp_tile_mlp.py`, `cost_pose_metric.py` and its test (identical to the upstream copies
+      that upstream removed in dc2383a), and `.github/copilot-instructions.md` plus
+      `.github/instructions/*.md` (older copies of upstream's `.agent/` rules).
+- [x] Deleted `dev/main` files nothing references: `task/metrics_base_custom.yml` and
+      `task/trajopt/transition_bspline_trajopt_custom.yml`.
 - [x] `pyproject.toml`: `fast_simplification` kept; upstream already dropped the pybind data.
 - [ ] `KinematicsState.link_transforms` reads `_buffers["batch_cumul_mat"]`; upstream changed the
       forward kinematics kernel, so verify the buffer layout on GPU.
