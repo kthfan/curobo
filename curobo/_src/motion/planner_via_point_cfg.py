@@ -43,7 +43,7 @@ class ViaPointMotionPlannerCfg:
     #: Scale of the seed's time step for the geometric optimization. TimeOpt then sets the
     #: fastest timing along the optimized path, so a slow geometric pass can pass sharp corners
     #: at the waypoints precisely without making the motion slower.
-    geometry_dt_scale: float = 5.0
+    geometry_dt_scale: float = 10.0
 
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
@@ -63,7 +63,7 @@ class ViaPointMotionPlannerCfg:
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 2,
-        geometry_dt_scale: float = 5.0,
+        geometry_dt_scale: float = 10.0,
         num_knots: int = 32,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
