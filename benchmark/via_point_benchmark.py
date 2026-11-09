@@ -76,12 +76,19 @@ def main():
     parser.add_argument("--num_waypoints", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--geometry_dt_scale", type=float, default=10.0)
+    parser.add_argument("--num_knots", type=int, default=32)
+    parser.add_argument("--min_segment_intervals", type=int, default=2)
     parser.add_argument("--skip_multi", action="store_true", help="only run the via-point planner")
     args = parser.parse_args()
 
     common = dict(robot="franka.yml", scene_model="collision_table.yml", use_cuda_graph=True)
     via = ViaPointMotionPlanner(
-        ViaPointMotionPlannerCfg.create(geometry_dt_scale=args.geometry_dt_scale, **common)
+        ViaPointMotionPlannerCfg.create(
+            geometry_dt_scale=args.geometry_dt_scale,
+            num_knots=args.num_knots,
+            min_segment_intervals=args.min_segment_intervals,
+            **common,
+        )
     )
     via.warmup()
     multi = None
@@ -132,7 +139,8 @@ def main():
 
     print(
         f"{args.num_problems} paths of {args.num_waypoints} waypoints, "
-        f"geometry_dt_scale={args.geometry_dt_scale}"
+        f"geometry_dt_scale={args.geometry_dt_scale}, num_knots={args.num_knots}, "
+        f"min_segment_intervals={args.min_segment_intervals}"
     )
     summarize("ViaPoint", via_rows)
     if multi is not None:
