@@ -40,9 +40,16 @@ class ViaPointMotionPlannerCfg:
     #: to the joint-space distance they cover.
     min_segment_intervals: int = 2
 
+    #: Scale of the seed's time step for the geometric optimization. TimeOpt then sets the
+    #: fastest timing along the optimized path, so a slow geometric pass can pass sharp corners
+    #: at the waypoints precisely without making the motion slower.
+    geometry_dt_scale: float = 5.0
+
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
             log_and_raise("max_attempts, ik_return_seeds and min_segment_intervals must be >= 1")
+        if self.geometry_dt_scale <= 0.0:
+            log_and_raise("geometry_dt_scale must be positive")
         if self.ik_dedup_joint_tol < 0.0:
             log_and_raise("ik_dedup_joint_tol must be >= 0")
 
@@ -56,6 +63,8 @@ class ViaPointMotionPlannerCfg:
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 2,
+        geometry_dt_scale: float = 5.0,
+        num_knots: int = 32,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
         """Build a configuration from a robot and via-point planning parameters.
@@ -67,19 +76,25 @@ class ViaPointMotionPlannerCfg:
             ik_dedup_joint_tol: Joint-space de-duplication tolerance of IK solutions.
             waypoint_tolerance: Default reach tolerance (m, rad).
             min_segment_intervals: Fewest native reference intervals per segment.
+            geometry_dt_scale: Time step scale of the geometric optimization.
+            num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
+                corners at the waypoints more closely and hold more waypoints.
             **motion_planner_kwargs: Forwarded to :meth:`MotionPlannerCfg.create`, for example
-                ``scene_model``, ``num_knots`` or ``num_trajopt_seeds``.
+                ``scene_model`` or ``num_trajopt_seeds``.
 
         Returns:
             The configuration.
         """
         return cls(
-            motion_planner_cfg=MotionPlannerCfg.create(robot, **motion_planner_kwargs),
+            motion_planner_cfg=MotionPlannerCfg.create(
+                robot, num_knots=num_knots, **motion_planner_kwargs
+            ),
             max_attempts=max_attempts,
             ik_return_seeds=ik_return_seeds,
             ik_dedup_joint_tol=ik_dedup_joint_tol,
             waypoint_tolerance=waypoint_tolerance,
             min_segment_intervals=min_segment_intervals,
+            geometry_dt_scale=geometry_dt_scale,
         )
 
 

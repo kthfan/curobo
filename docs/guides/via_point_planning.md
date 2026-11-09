@@ -100,7 +100,7 @@ optimization with the status `No IK solution at waypoint k satisfies its segment
   `result.trajopt_result.debug_info["validation"]`, which tells whether path tracking,
   collisions, or joint limits and dynamics rejected the trajectory.
 
-Segments with very different lengths get native samples in proportion to their joint-space
-distance. When a plan has many waypoints and fails on path tracking, configure more spline knots
-with `num_knots` in `ViaPointMotionPlannerCfg.create`; one plan holds at most
-`planner.max_waypoints` waypoints.
+Segments get native samples in proportion to their joint-space distance. When a plan with many
+waypoints or sharp corners misses a waypoint, configure more spline knots with `num_knots` in
+`ViaPointMotionPlannerCfg.create` (32 by default), or a larger `geometry_dt_scale`; one plan
+holds at most `planner.max_waypoints` waypoints.

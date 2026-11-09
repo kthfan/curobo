@@ -621,6 +621,7 @@ class ViaPointMotionPlanner:
             use_implicit_goal=True,
             finetune_attempts=finetune_attempts,
             initial_iters=initial_iters,
+            initial_dt_scale=self.config.geometry_dt_scale,
             track_intermediate=True,
             path_tolerance=tolerance,
             final_tolerance=tolerance,

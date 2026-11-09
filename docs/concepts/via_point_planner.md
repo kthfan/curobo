@@ -28,8 +28,11 @@ One call of `plan_waypoints` runs four stages:
    Waypoint {math}`k` is placed at native sample {math}`w_k`, and a Cartesian reference is
    interpolated through the waypoints on that grid: linear in position, SLERP in rotation.
 4. **One trajectory optimization.** The criteria and bounds of every segment are written into
-   the optimizer's costs, and the spline is optimized once from the chain seeds. Validation
-   checks the native samples and the dense, time-optimized samples.
+   the optimizer's costs, and the spline is optimized once from the chain seeds. The geometry is
+   optimized with a slow time step (`geometry_dt_scale` times the seed's), so the path can pass
+   sharp corners at the waypoints precisely; TimeOpt then sets the fastest timing along that
+   path within the joint limits. Validation checks the native samples and the dense,
+   time-optimized samples.
 
 The trajectory starts at rest at the current state, passes the intermediate waypoints without
 stopping, and ends at rest at the last waypoint. If a stage fails, for example no IK solution
