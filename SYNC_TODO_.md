@@ -79,8 +79,10 @@ branch back into `dev/main`.
 - [x] `pyproject.toml`: `fast_simplification` kept; upstream already dropped the pybind data.
 - [x] `KinematicsState.link_transforms` reads `_buffers["batch_cumul_mat"]`; the layout still
       holds after upstream's forward kinematics changes (`test_link_transforms` passes on GPU).
-- [ ] `ToolPoseCriteria.path_tolerance` rotation units: upstream's waypoint planner converts an
-      angle to the chord `2·sin(θ/2)` before storing it; the guide follows that. Confirm on GPU.
+- [x] `ToolPoseCriteria.path_tolerance` rotation units: the pose metric's rotation residual is
+      `2·vec(q_err)` (`wp_pose_metric.compute_rotation_error`), whose norm is `2·sin(θ/2)`, and
+      `TrajOptSolver._waypoint_tracking` converts angles the same way. The guide's
+      `2.0 * math.sin(angle / 2.0)` is correct.
 
 ## Verification
 
