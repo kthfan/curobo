@@ -10,4 +10,5 @@ Optimization & Planning
    :maxdepth: 1
 
    multi_waypoint_planner
+   via_point_planner
    mesh_collision

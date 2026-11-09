@@ -31,3 +31,4 @@ Motion Planning
 
    tool_pose_bounds
    mesh_collision
+   via_point_planning

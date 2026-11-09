@@ -40,6 +40,15 @@
 - Speed up the mesh collision check by skipping links whose bounding sphere is
   clear of every obstacle: 2x to 12x faster for 4096 configurations,
   depending on the scene type.
+- Add `ViaPointMotionPlanner` in `curobo.via_point_planner`, which plans one
+  continuous trajectory from the current state through ordered Cartesian waypoints
+  with `ToolPoseCriteria` and `ToolPoseBound` limits per segment. It picks among
+  the IK solutions of every waypoint by joint-space distance and solves the whole
+  path with one trajectory optimization, so the robot does not stop at the
+  intermediate waypoints. The tool pose and tool pose bound costs gain optional
+  per-segment criteria for it; without them they behave as before.
+- Add `ToolPoseBound.anchored_at_base`, which turns a goal- or start-anchored bound
+  into the equivalent base-anchored bound for a known anchor pose.
 - Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which
   plans one trajectory through an ordered list of Cartesian waypoints with
   per-segment tool pose criteria.

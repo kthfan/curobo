@@ -64,7 +64,7 @@ Documentation
 
 - :doc:`getting-started/index`: Step-by-step tutorials covering installation, robot setup, kinematics, IK, MPC, motion planning, and volumetric mapping.
 - :doc:`guides/index`: Writing custom optimization problems, cost terms, and optimizers.
-- :doc:`concepts/index`: How the multi-waypoint planner and the exact mesh collision check work.
+- :doc:`concepts/index`: How the multi-waypoint and via-point planners and the exact mesh collision check work.
 - :doc:`reference/index`: API, style guide, runtime configuration, benchmarks, sphere fitting, and self-collision.
 
 Research
