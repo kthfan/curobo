@@ -93,7 +93,7 @@ def test_one_segment_table_matches_the_terminal_path_kernel(device_cfg):
     for cost in (reference, segmented):
         cost.setup_batch_tensors(2, horizon)
     table = ToolPoseSegmentTable(FRAMES, 4, horizon, 1, device_cfg)
-    table.set_plan([criteria], [criteria], [(0.0, 0.0)], [horizon - 1])
+    table.set_plan([criteria], [criteria], [horizon - 1])
     segmented.attach_segment_table(table, dense=False)
     current, goal = _random_problem(device_cfg, 2, horizon, torch.Generator().manual_seed(0))
     routes = torch.tensor([[0], [1]], device=device_cfg.device, dtype=torch.int32)
@@ -112,7 +112,7 @@ def test_segments_use_their_own_criteria(device_cfg):
     cost.setup_batch_tensors(1, horizon)
     table = ToolPoseSegmentTable(FRAMES, 4, horizon, 1, device_cfg)
     # Segment 0 (samples 0-2) is free, segment 1 (samples 4-5) tracks; waypoints at 3 and 6.
-    table.set_plan([free, tracked], [free, tracked], [(0.01, 0.1), (0.002, 0.02)], [3, 6])
+    table.set_plan([free, tracked], [free, tracked], [3, 6])
     cost.attach_segment_table(table, dense=False)
     current, goal = _random_problem(device_cfg, 1, horizon, torch.Generator().manual_seed(1))
     routes = torch.zeros((1, 1), device=device_cfg.device, dtype=torch.int32)
@@ -131,7 +131,7 @@ def test_dense_samples_follow_their_reference_progress(device_cfg):
     table = ToolPoseSegmentTable(FRAMES, 4, horizon, 2, device_cfg)
     criteria = _criteria(device_cfg)
     # Active native samples 2..8; waypoints at 4 and 8.
-    table.set_plan([criteria, criteria], [criteria, criteria], [(0.01, 0.1)] * 2, [4, 8])
+    table.set_plan([criteria, criteria], [criteria, criteria], [4, 8])
     progress = torch.tensor([[0.0, 0.2, 0.4, 0.6, 0.9, 1.0]], device=device_cfg.device)
     counts = torch.tensor([5], device=device_cfg.device, dtype=torch.int32)
     slots = torch.zeros((1, 6), device=device_cfg.device, dtype=torch.int32)
@@ -188,7 +188,7 @@ def test_eef_bound_applies_each_segment_bounds(device_cfg):
     )
     table = ToolPoseSegmentTable(["a"], 4, horizon, 1, device_cfg)
     free = {"a": ToolPoseCriteria(device_cfg=device_cfg)}
-    table.set_plan([free, free], [free, free], [(0.01, 0.1)] * 2, [3, 6])
+    table.set_plan([free, free], [free, free], [3, 6])
     cost.attach_segment_table(table, dense=False)
     floor = ToolPoseBound.plane((0.0, 0.0, 1.0), max_distance=None, anchor="base")
     ceiling = ToolPoseBound(anchor="base", z=(None, 0.5))

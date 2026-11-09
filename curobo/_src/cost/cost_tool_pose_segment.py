@@ -121,7 +121,6 @@ class ToolPoseSegmentTable:
         self,
         path_criteria: Sequence[Dict[str, ToolPoseCriteria]],
         reach_criteria: Sequence[Dict[str, ToolPoseCriteria]],
-        reach_tolerance: Sequence[Tuple[float, float]],
         waypoint_indices: Sequence[int],
     ) -> None:
         """Write the criteria of one plan in place.
@@ -129,13 +128,13 @@ class ToolPoseSegmentTable:
         Args:
             path_criteria: Criteria per segment; their path fields apply inside the segment.
                 Every dict holds every tool frame.
-            reach_criteria: Criteria per waypoint; their terminal fields apply at the waypoint.
-            reach_tolerance: Enforced reach tolerance per waypoint (m, 2·sin(angle/2)).
+            reach_criteria: Criteria per waypoint; their terminal fields apply at the waypoint,
+                where ``terminal_tolerance`` (m, 2·sin(angle/2)) is always enforced.
             waypoint_indices: Native sample index of every waypoint, strictly increasing.
         """
         n = len(waypoint_indices)
-        if not (len(path_criteria) == len(reach_criteria) == len(reach_tolerance) == n):
-            log_and_raise("every segment needs path criteria, reach criteria and a tolerance")
+        if not (len(path_criteria) == len(reach_criteria) == n):
+            log_and_raise("every segment needs path criteria and reach criteria")
         slots = native_sample_slots(waypoint_indices, self.horizon, self.capacity)
         cap, links = self.capacity, len(self.tool_frames)
         rows, fields = [], {key: [] for key in ("pp", "ps", "rp", "rs", "frame", "tol", "enf")}
@@ -158,7 +157,7 @@ class ToolPoseSegmentTable:
                         fields["tol"].append(c.path_tolerance)
                         fields["enf"].append(c.enforce_path_tolerance)
                     else:
-                        fields["tol"].append(self.tolerance.new_tensor(reach_tolerance[k]))
+                        fields["tol"].append(c.terminal_tolerance)
                         fields["enf"].append(self.enforce.new_ones(()))
         stacked = {key: torch.stack(values) for key, values in fields.items()}
         index = torch.tensor(rows, device=self.device_cfg.device, dtype=torch.long)
@@ -196,8 +195,10 @@ class ToolPoseSegmentTable:
         """
         if progress is None:
             if out.shape[1] != self.horizon:
-                log_and_raise("native samples must cover the optimizer's native horizon")
-            out.copy_(self.native_slots.unsqueeze(0).expand_as(out))
+                # Evaluations off the native grid (such as goal-only checks) reach the goal.
+                out.copy_(self.final_slot.expand_as(out))
+            else:
+                out.copy_(self.native_slots.unsqueeze(0).expand_as(out))
             return out
         active = self.horizon - 2 * self.padding
         native = torch.nan_to_num(progress, nan=0.0).clamp(0.0, 1.0) * float(active - 1)
