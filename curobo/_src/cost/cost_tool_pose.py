@@ -25,6 +25,7 @@ from curobo._src.util.logging import log_and_raise
 if TYPE_CHECKING:
     # CuRobo
     from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
+    from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentState, ToolPoseSegmentTable
     from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 
 
@@ -55,6 +56,11 @@ class ToolPoseCost(BaseCost):
         self._reference_padding = 0
         self._dense_position: Optional[torch.Tensor] = None
         self._dense_quaternion: Optional[torch.Tensor] = None
+        # Optional per-segment criteria; see attach_segment_table.
+        self._segment_state: Optional[ToolPoseSegmentState] = None
+        self._segment_kernel: Optional[wp.kernel] = None
+        self._segment_goalset = -1
+        self._segment_slots: Optional[torch.Tensor] = None
         # Waypoint objectives stay active while criteria retain separate acceptance bounds.
         self._apply_tolerance_to_cost = torch.ones((), **self.device_cfg.as_torch_dict())
         self._position_metric = torch.empty(
@@ -171,6 +177,10 @@ class ToolPoseCost(BaseCost):
             goal_pos, goal_quat = self._dense_position, self._dense_quaternion
             idxs_goal = self._dense_routes
             counts = self._reference_counts
+        if self._segment_state is not None:
+            return self._forward_segments(
+                current_tool_poses, goal_pos, goal_quat, idxs_goal, counts, num_goalset
+            )
         cost, linear_distance, angular_distance, goalset_idx = ToolPoseDistance.apply(
             current_tool_poses.position,
             current_tool_poses.quaternion,
@@ -204,6 +214,83 @@ class ToolPoseCost(BaseCost):
         self._reference_progress = progress
         self._reference_counts = valid_steps
         self._reference_padding = padding
+        if self._segment_state is not None and self._segment_state.dense:
+            self._segment_state.table.dense_progress = progress
+            self._segment_state.table.dense_counts = valid_steps
+
+    def attach_segment_table(self, table: ToolPoseSegmentTable, dense: bool) -> None:
+        """Read per-segment criteria from ``table`` instead of the terminal/path criteria.
+
+        Attach before the first evaluation: CUDA graphs captured afterwards run the segment
+        kernel. The table is read on every evaluation, so later plans only update it in place.
+
+        Args:
+            table: Shared per-segment criteria of the planned trajectory.
+            dense: This cost evaluates dense validation samples.
+        """
+        from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentState
+
+        if table.tool_frames != self.tool_frames:
+            log_and_raise("segment table tool frames must match the cost's tool frames")
+        self._segment_state = ToolPoseSegmentState(table, dense)
+
+    def _forward_segments(
+        self,
+        current_tool_poses: ToolPose,
+        goal_pos: torch.Tensor,
+        goal_quat: torch.Tensor,
+        idxs_goal: torch.Tensor,
+        counts: torch.Tensor,
+        num_goalset: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate the pose cost with the criteria slot of every sample."""
+        from curobo._src.cost.wp_tool_pose_segment import (
+            SegmentToolPoseDistance,
+            create_segment_pose_distance_kernel,
+        )
+
+        if self._segment_goalset != num_goalset:
+            self._segment_goalset = num_goalset
+            self._segment_kernel = create_segment_pose_distance_kernel(num_goalset)
+        state = self._segment_state
+        table = state.table
+        self._segment_slots = state.sample_slots(
+            self._batch_size, self._horizon, counts, self._reference_progress
+        )
+        return SegmentToolPoseDistance.apply(
+            current_tool_poses.position,
+            current_tool_poses.quaternion,
+            goal_pos,
+            goal_quat,
+            idxs_goal,
+            self._weight,
+            table.position_metric,
+            table.rotation_metric,
+            table.deadband,
+            table.error_frame,
+            self._segment_slots,
+            self._out_distance,
+            self._out_position_distance,
+            self._out_rotation_distance,
+            self._out_position_gradient,
+            self._out_rotation_gradient,
+            self._out_goalset_idx,
+            self.config.use_grad_input,
+            self._segment_kernel,
+            counts,
+        )
+
+    def _sample_acceptance(self, terminal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return enforced flags ``[batch,horizon,links]`` and tolerances ``[...,2]``."""
+        if self._segment_state is not None and self._segment_slots is not None:
+            return self._segment_state.acceptance(self._segment_slots)
+        criteria = self._stacked_tool_pose_criteria
+        enabled = torch.where(
+            terminal.unsqueeze(-1),
+            criteria.enforce_terminal_tolerance.view(1, 1, -1),
+            criteria.enforce_path_tolerance.view(1, 1, -1),
+        )
+        return enabled, self._sample_tolerances(terminal)
 
     def update_tool_pose_criteria(
         self,
@@ -222,22 +309,16 @@ class ToolPoseCost(BaseCost):
         current_tool_poses: ToolPose,
     ) -> torch.Tensor:
         """Check enabled physical tolerances, returning ``[batch,horizon]`` validity."""
-        criteria = self._stacked_tool_pose_criteria
         counts = (
             self._reference_counts
             if self._reference_progress is not None
             else self._evaluation_counts
         )
         terminal = self._sample_indices == counts[:, None] - 1
-        enabled = torch.where(
-            terminal.unsqueeze(-1),
-            criteria.enforce_terminal_tolerance.view(1, 1, -1),
-            criteria.enforce_path_tolerance.view(1, 1, -1),
-        )
+        enabled, tolerance = self._sample_acceptance(terminal)
         finite = torch.isfinite(current_tool_poses.position).all(dim=-1)
         finite = finite & torch.isfinite(current_tool_poses.quaternion).all(dim=-1)
         finite = finite & (current_tool_poses.quaternion.square().sum(dim=-1) > 0.0)
-        tolerance = self._sample_tolerances(terminal)
         finite = finite & torch.isfinite(position_error) & torch.isfinite(rotation_error)
         violated = (
             (position_error > tolerance[..., 0]) | (rotation_error > tolerance[..., 1]) | ~finite
@@ -274,7 +355,7 @@ class ToolPoseCost(BaseCost):
             if self._reference_progress is not None
             else self._evaluation_counts
         )
-        tolerance = self._sample_tolerances(self._sample_indices == counts[:, None] - 1)
+        _, tolerance = self._sample_acceptance(self._sample_indices == counts[:, None] - 1)
         return (
             torch.where(position_error <= tolerance[..., 0], 0.0, position_error),
             torch.where(rotation_error <= tolerance[..., 1], 0.0, rotation_error),

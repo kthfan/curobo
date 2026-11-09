@@ -38,7 +38,7 @@ Limits are evaluated by :mod:`curobo._src.cost.cost_eef_bound_eval`.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -181,6 +181,43 @@ class ToolPoseBound:
                     + f"got tilt={self.tilt}. Choose tool_rotation so that the tool axis is "
                     + "perpendicular to the reference axis, or use orientation_box"
                 )
+
+    def anchored_at_base(
+        self, anchor_position: Sequence[float], anchor_quaternion: Sequence[float]
+    ) -> ToolPoseBound:
+        """Return the same limits with the anchor replaced by a fixed pose in the base frame.
+
+        A goal- or start-anchored bound whose anchor pose is known becomes a base-anchored
+        bound that limits the tool frame exactly the same way. Base-anchored bounds are
+        returned unchanged.
+
+        Args:
+            anchor_position: Anchor position in the base frame (m).
+            anchor_quaternion: Anchor orientation (wxyz) in the base frame.
+
+        Returns:
+            Base-anchored bound with base reference axes.
+        """
+        if self.anchor == ToolPoseBoundAnchor.BASE:
+            return self
+        anchor_quaternion = _unit_quaternion(anchor_quaternion, "anchor_quaternion")
+        reference = self.reference_rotation
+        if self.reference_axes == "anchor":
+            reference = _quat_multiply(anchor_quaternion, reference)
+        # (x, y, z) = R_refᵀ (p - t_anchor) = R_refᵀ p - R_refᵀ t_anchor.
+        offset = _rotate_vector(_conjugate(reference), [float(v) for v in anchor_position])
+        shifted = {}
+        for axis, name in enumerate(("x", "y", "z")):
+            limit = getattr(self, name)
+            if limit is not None:
+                shifted[name] = (_shift(limit[0], offset[axis]), _shift(limit[1], offset[axis]))
+        return replace(
+            self,
+            anchor=ToolPoseBoundAnchor.BASE,
+            reference_axes="base",
+            reference_rotation=reference,
+            **shifted,
+        )
 
     @property
     def uses_rotation(self) -> bool:
@@ -424,6 +461,16 @@ def _unit_vector(v: Sequence[float], name: str) -> List[float]:
 
 def _conjugate(q: Sequence[float]) -> List[float]:
     return [q[0], -q[1], -q[2], -q[3]]
+
+
+def _quat_multiply(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    """Hamilton product ``a ⊗ b`` of wxyz quaternions."""
+    return [
+        a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+    ]
 
 
 def _rotate_vector(q: Sequence[float], v: Sequence[float]) -> List[float]:

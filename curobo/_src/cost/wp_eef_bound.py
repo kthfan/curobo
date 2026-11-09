@@ -179,7 +179,8 @@ def eef_bound_cost_kernel(
     start_position: wp.array(dtype=wp.vec3),  # (B_start*L)
     start_quaternion: wp.array(dtype=wp.vec4),  # (B_start*L) wxyz
     idxs_start: wp.array(dtype=wp.int32),  # (B)
-    anchor: wp.array(dtype=wp.int32),  # (L*K) -1 unused, 0 goal, 1 start, 2 base
+    sample_segment: wp.array(dtype=wp.int32),  # (B*H) segment whose slots apply to the sample
+    anchor: wp.array(dtype=wp.int32),  # (S*L*K) -1 unused, 0 goal, 1 start, 2 base
     axes: wp.array(dtype=wp.int32),  # (L*K) 0 anchor axes, 1 base axes
     reference_rotation: wp.array(dtype=wp.vec4),  # (L*K) wxyz
     tool_rotation: wp.array(dtype=wp.vec4),  # (L*K) wxyz
@@ -210,13 +211,15 @@ def eef_bound_cost_kernel(
         pull = 1
     c_pos = current_position[tid]
     c_quat = current_quaternion[tid]
+    # Slot tensors hold num_slots bounds per (segment, link).
+    slot_base = (sample_segment[b * horizon + h_idx] * num_links + li) * num_slots
 
     total = float(0.0)
     grad_pos = wp.vec3(0.0)
     omega = wp.vec3(0.0)
     has_goal_slot = int(0)
     for k in range(num_slots):
-        s = li * num_slots + k
+        s = slot_base + k
         a = anchor[s]
         if a < 0:
             continue
@@ -266,7 +269,7 @@ def eef_bound_cost_kernel(
             goal_grad_pos = wp.vec3(0.0)
             goal_omega = wp.vec3(0.0)
             for k in range(num_slots):
-                s = li * num_slots + k
+                s = slot_base + k
                 if anchor[s] != 0:
                     continue
                 cost, g_pos, g_omega = _slot_cost(
@@ -326,6 +329,7 @@ class EEFBoundCostFunction(torch.autograd.Function):
         start_position: torch.Tensor,
         start_quaternion: torch.Tensor,
         idxs_start: torch.Tensor,
+        sample_segment: torch.Tensor,
         anchor: torch.Tensor,
         axes: torch.Tensor,
         reference_rotation: torch.Tensor,
@@ -346,8 +350,8 @@ class EEFBoundCostFunction(torch.autograd.Function):
         """Launch the kernel and return the weighted per-link cost.
 
         Shapes: current ``(B, H, L, 3/4)``; goal ``(B_goal*L*G, 3/4)``; start
-        ``(B_start*L, 3/4)``; idxs ``(B,)`` int32; slot tensors ``(L, K[, 4 or 6])``; outputs
-        ``(B, H, L[, 3/4])``.
+        ``(B_start*L, 3/4)``; idxs ``(B,)`` int32; ``sample_segment`` ``(B, H)`` int32; slot
+        tensors ``(S, L, K[, 4 or 6])`` for ``S`` segments; outputs ``(B, H, L[, 3/4])``.
         """
         b, h, num_links, _ = current_position.shape
         num_slots = anchor.shape[-1]
@@ -364,6 +368,7 @@ class EEFBoundCostFunction(torch.autograd.Function):
                 wp.from_torch(start_position, dtype=wp.vec3),
                 wp.from_torch(start_quaternion, dtype=wp.vec4),
                 wp.from_torch(idxs_start, dtype=wp.int32),
+                wp.from_torch(sample_segment.view(-1), dtype=wp.int32),
                 wp.from_torch(anchor.view(-1), dtype=wp.int32),
                 wp.from_torch(axes.view(-1), dtype=wp.int32),
                 wp.from_torch(reference_rotation.view(-1, 4), dtype=wp.vec4),
@@ -396,7 +401,7 @@ class EEFBoundCostFunction(torch.autograd.Function):
     def backward(ctx, grad_cost: torch.Tensor):
         """Return the cached pose gradients, scaled by ``grad_cost`` when requested."""
         position_gradient, quaternion_gradient = ctx.saved_tensors
-        grads = [None] * 24
+        grads = [None] * 25
         if ctx.use_grad_input:
             grad_cost = grad_cost.unsqueeze(-1)
             position_gradient = position_gradient * grad_cost

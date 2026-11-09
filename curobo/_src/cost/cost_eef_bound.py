@@ -21,9 +21,11 @@ from curobo._src.cost.cost_eef_bound_eval import (
     eef_bound_center_pull,
     eef_bound_limits,
 )
+from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentState, ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import (
     ToolPoseBound,
     ToolPoseBoundAnchor,
+    ToolPoseBounds,
     normalize_tool_pose_bounds,
 )
 from curobo._src.cost.wp_eef_bound import EEFBoundCostFunction
@@ -58,10 +60,23 @@ class EEFBoundCost(BaseCost):
             )
         init_warp()
 
+        self._bounds: Dict[str, List[ToolPoseBound]] = {name: [] for name in self.tool_frames}
+        # Bounds of every segment when a segment table is attached; see attach_segment_table.
+        self._segment_bounds: List[Dict[str, List[ToolPoseBound]]] = []
+        self._segment_state: Optional[ToolPoseSegmentState] = None
+        self._sample_segment: Optional[torch.Tensor] = None
+        self._allocate_slots(1)
         device = self.device_cfg.device
         dtype = self.device_cfg.dtype
-        slots = (num_links, config.max_bounds_per_tool_frame)
-        self._bounds: Dict[str, List[ToolPoseBound]] = {name: [] for name in self.tool_frames}
+        # Placeholders for anchors that are not in use.
+        self._unused_position = torch.zeros((1, 3), device=device, dtype=dtype)
+        self._unused_quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
+
+    def _allocate_slots(self, num_segments: int) -> None:
+        """Allocate unbounded slot tensors ``(num_segments, links, max_bounds_per_tool_frame)``."""
+        device = self.device_cfg.device
+        dtype = self.device_cfg.dtype
+        slots = (num_segments, len(self.tool_frames), self.config.max_bounds_per_tool_frame)
         self._anchor = torch.full(slots, -1, device=device, dtype=torch.int32)
         self._axes = torch.zeros(slots, device=device, dtype=torch.int32)
         self._reference_rotation = torch.zeros((*slots, 4), device=device, dtype=dtype)
@@ -73,9 +88,52 @@ class EEFBoundCost(BaseCost):
         self._pull_target = torch.zeros((*slots, 6), device=device, dtype=dtype)
         self._pull_weight = torch.zeros((*slots, 6), device=device, dtype=dtype)
         self._use_rotation = torch.zeros(slots, device=device, dtype=torch.int32)
-        # Placeholders for anchors that are not in use.
-        self._unused_position = torch.zeros((1, 3), device=device, dtype=dtype)
-        self._unused_quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
+
+    def attach_segment_table(self, table: ToolPoseSegmentTable, dense: bool) -> None:
+        """Hold bounds per segment of ``table`` and apply each sample's segment bounds.
+
+        Attach before the first evaluation, as for
+        :meth:`ToolPoseCost.attach_segment_table
+        <curobo._src.cost.cost_tool_pose.ToolPoseCost.attach_segment_table>`: the slot tensors
+        grow to ``table.capacity`` segments. Set the bounds with
+        :meth:`update_segment_tool_pose_bounds`.
+
+        Args:
+            table: Shared per-segment criteria of the planned trajectory.
+            dense: This cost evaluates dense validation samples.
+        """
+        if table.tool_frames != self.tool_frames:
+            log_and_raise("segment table tool frames must match the cost's tool frames")
+        self._allocate_slots(table.capacity)
+        self._bounds = {name: [] for name in self.tool_frames}
+        self._segment_bounds = [{} for _ in range(table.capacity)]
+        self._segment_state = ToolPoseSegmentState(table, dense)
+
+    def update_segment_tool_pose_bounds(
+        self,
+        segment_bounds: Sequence[Dict[str, ToolPoseBounds]],
+    ) -> None:
+        """Replace the bounds of every segment; segments past the list are unbounded.
+
+        Args:
+            segment_bounds: Per segment, a map from tool frame name to its bounds. Missing tool
+                frames are unbounded in that segment.
+        """
+        if self._segment_state is None:
+            log_and_raise("EEFBoundCost: attach a segment table before setting segment bounds")
+        if len(segment_bounds) > len(self._segment_bounds):
+            log_and_raise(
+                f"EEFBoundCost: {len(segment_bounds)} segments exceed the segment capacity "
+                + f"{len(self._segment_bounds)}"
+            )
+        for seg in range(len(self._segment_bounds)):
+            bounds = segment_bounds[seg] if seg < len(segment_bounds) else {}
+            for name in self.tool_frames:
+                self._write_slots(seg, name, bounds.get(name))
+        self._bounds = {
+            name: [b for seg_bounds in self._segment_bounds for b in seg_bounds.get(name, [])]
+            for name in self.tool_frames
+        }
 
     @property
     def tool_pose_bounds(self) -> Dict[str, List[ToolPoseBound]]:
@@ -95,34 +153,51 @@ class EEFBoundCost(BaseCost):
         Args:
             bounds: Map from tool frame name to a bound, a list of bounds, or ``None`` to clear.
         """
-        num_slots = self._anchor.shape[1]
+        if self._segment_state is not None:
+            log_and_raise(
+                "EEFBoundCost: bounds of a cost with a segment table are set per segment with "
+                + "update_segment_tool_pose_bounds"
+            )
         for name, value in bounds.items():
-            if name not in self._bounds:
-                log_and_raise(f"EEFBoundCost: unknown tool frame {name}, have {self.tool_frames}")
-            frame_bounds = normalize_tool_pose_bounds(value)
-            if len(frame_bounds) > num_slots:
-                log_and_raise(
-                    f"EEFBoundCost: tool frame {name} has {len(frame_bounds)} bounds, at most "
-                    + f"{num_slots} are supported (EEFBoundCostCfg.max_bounds_per_tool_frame)"
-                )
-            i = self.tool_frames.index(name)
-            self._bounds[name] = frame_bounds
-            self._anchor[i] = -1
-            for k, bound in enumerate(frame_bounds):
-                center, lower, upper = eef_bound_limits(bound, self.config.metric)
-                pull_target, pull_weight = eef_bound_center_pull(bound, self.config.metric)
-                self._axes[i, k] = 0 if bound.reference_axes == "anchor" else 1
-                self._reference_rotation[i, k] = self._reference_rotation.new_tensor(
-                    bound.reference_rotation
-                )
-                self._tool_rotation[i, k] = self._tool_rotation.new_tensor(bound.tool_rotation)
-                self._center[i, k] = self._center.new_tensor(center)
-                self._lower[i, k] = self._lower.new_tensor(lower)
-                self._upper[i, k] = self._upper.new_tensor(upper)
-                self._pull_target[i, k] = self._pull_target.new_tensor(pull_target)
-                self._pull_weight[i, k] = self._pull_weight.new_tensor(pull_weight)
-                self._use_rotation[i, k] = int(bound.uses_rotation)
-                self._anchor[i, k] = bound.anchor.value
+            self._bounds[name] = self._write_slots(0, name, value)
+
+    def _write_slots(
+        self,
+        segment: int,
+        name: str,
+        value: Optional[Union[ToolPoseBound, Sequence[ToolPoseBound]]],
+    ) -> List[ToolPoseBound]:
+        """Write the bounds of one tool frame into the slots of one segment."""
+        if name not in self._bounds:
+            log_and_raise(f"EEFBoundCost: unknown tool frame {name}, have {self.tool_frames}")
+        num_slots = self._anchor.shape[-1]
+        frame_bounds = normalize_tool_pose_bounds(value)
+        if len(frame_bounds) > num_slots:
+            log_and_raise(
+                f"EEFBoundCost: tool frame {name} has {len(frame_bounds)} bounds, at most "
+                + f"{num_slots} are supported (EEFBoundCostCfg.max_bounds_per_tool_frame)"
+            )
+        i = self.tool_frames.index(name)
+        if self._segment_bounds:
+            self._segment_bounds[segment][name] = frame_bounds
+        self._anchor[segment, i] = -1
+        for k, bound in enumerate(frame_bounds):
+            center, lower, upper = eef_bound_limits(bound, self.config.metric)
+            pull_target, pull_weight = eef_bound_center_pull(bound, self.config.metric)
+            slot = (segment, i, k)
+            self._axes[slot] = 0 if bound.reference_axes == "anchor" else 1
+            self._reference_rotation[slot] = self._reference_rotation.new_tensor(
+                bound.reference_rotation
+            )
+            self._tool_rotation[slot] = self._tool_rotation.new_tensor(bound.tool_rotation)
+            self._center[slot] = self._center.new_tensor(center)
+            self._lower[slot] = self._lower.new_tensor(lower)
+            self._upper[slot] = self._upper.new_tensor(upper)
+            self._pull_target[slot] = self._pull_target.new_tensor(pull_target)
+            self._pull_weight[slot] = self._pull_weight.new_tensor(pull_weight)
+            self._use_rotation[slot] = int(bound.uses_rotation)
+            self._anchor[slot] = bound.anchor.value
+        return frame_bounds
 
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]) -> None:
         """Take the bounds from ``ToolPoseCriteria.bounds`` of the given tool frames."""
@@ -142,6 +217,9 @@ class EEFBoundCost(BaseCost):
             )
             self._unused_idxs = torch.zeros(
                 (batch_size,), device=self.device_cfg.device, dtype=torch.int32
+            )
+            self._sample_segment = torch.zeros(
+                (batch_size, horizon), device=self.device_cfg.device, dtype=torch.int32
             )
         super().setup_batch_tensors(batch_size, horizon)
 
@@ -224,6 +302,7 @@ class EEFBoundCost(BaseCost):
             start_position.detach().contiguous(),
             start_quaternion.detach().contiguous(),
             idxs_start_flat,
+            self._sample_segments(b, h),
             self._anchor,
             self._axes,
             self._reference_rotation,
@@ -246,6 +325,17 @@ class EEFBoundCost(BaseCost):
             cost = torch.clamp(cost, max=1.0)
             cost = torch.where(cost > 0, cost + 1.0, cost)
         return cost
+
+    def _sample_segments(self, batch_size: int, horizon: int) -> torch.Tensor:
+        """Segment of every sample ``[batch, horizon]``; all zero without a segment table."""
+        state = self._segment_state
+        if state is None:
+            return self._sample_segment
+        table = state.table
+        progress = table.dense_progress if state.dense else None
+        slots = state.sample_slots(batch_size, horizon, table.dense_counts, progress)
+        self._sample_segment.copy_(table.segment_of_slot(slots))
+        return self._sample_segment
 
     @staticmethod
     def _flat_idxs(idxs: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
