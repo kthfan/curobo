@@ -36,9 +36,10 @@ class ViaPointMotionPlannerCfg:
     #: ``terminal_tolerance``.
     waypoint_tolerance: Tuple[float, float] = (0.005, 0.05)
 
-    #: Fewest native reference intervals given to one segment. Segments get more in proportion
-    #: to the joint-space distance they cover.
-    min_segment_intervals: int = 2
+    #: Fewest native reference intervals given to one segment (4 per spline control by
+    #: default). Segments get more in proportion to the joint-space distance they cover; a
+    #: segment that is too short cannot slow down after one waypoint to pass the next.
+    min_segment_intervals: int = 8
 
     #: Scale of the seed's time step for the geometric optimization. TimeOpt then sets the
     #: fastest timing along the optimized path, so a slow geometric pass can pass sharp corners
@@ -62,9 +63,9 @@ class ViaPointMotionPlannerCfg:
         ik_return_seeds: int = 16,
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
-        min_segment_intervals: int = 2,
+        min_segment_intervals: int = 8,
         geometry_dt_scale: float = 10.0,
-        num_knots: int = 32,
+        num_knots: int = 64,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
         """Build a configuration from a robot and via-point planning parameters.
@@ -78,7 +79,8 @@ class ViaPointMotionPlannerCfg:
             min_segment_intervals: Fewest native reference intervals per segment.
             geometry_dt_scale: Time step scale of the geometric optimization.
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
-                corners at the waypoints more closely and hold more waypoints.
+                corners at the waypoints more closely and hold more waypoints; fewer give
+                somewhat shorter motions and miss more corners.
             **motion_planner_kwargs: Forwarded to :meth:`MotionPlannerCfg.create`, for example
                 ``scene_model`` or ``num_trajopt_seeds``.
 

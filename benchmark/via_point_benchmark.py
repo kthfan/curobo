@@ -76,8 +76,8 @@ def main():
     parser.add_argument("--num_waypoints", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--geometry_dt_scale", type=float, default=10.0)
-    parser.add_argument("--num_knots", type=int, default=32)
-    parser.add_argument("--min_segment_intervals", type=int, default=2)
+    parser.add_argument("--num_knots", type=int, default=64)
+    parser.add_argument("--min_segment_intervals", type=int, default=8)
     parser.add_argument("--skip_multi", action="store_true", help="only run the via-point planner")
     args = parser.parse_args()
 
