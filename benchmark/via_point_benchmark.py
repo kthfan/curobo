@@ -75,13 +75,19 @@ def main():
     parser.add_argument("--num_problems", type=int, default=20)
     parser.add_argument("--num_waypoints", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--geometry_dt_scale", type=float, default=5.0)
+    parser.add_argument("--skip_multi", action="store_true", help="only run the via-point planner")
     args = parser.parse_args()
 
     common = dict(robot="franka.yml", scene_model="collision_table.yml", use_cuda_graph=True)
-    via = ViaPointMotionPlanner(ViaPointMotionPlannerCfg.create(**common))
+    via = ViaPointMotionPlanner(
+        ViaPointMotionPlannerCfg.create(geometry_dt_scale=args.geometry_dt_scale, **common)
+    )
     via.warmup()
-    multi = MultiWaypointMotionPlanner(MultiWaypointMotionPlannerCfg.create(**common))
-    multi.motion_planner.warmup(enable_graph=False)
+    multi = None
+    if not args.skip_multi:
+        multi = MultiWaypointMotionPlanner(MultiWaypointMotionPlannerCfg.create(**common))
+        multi.motion_planner.warmup(enable_graph=False)
 
     start = JointState.from_position(
         via.default_joint_state.position.unsqueeze(0), joint_names=via.joint_names
@@ -103,6 +109,8 @@ def main():
                 error = 1000 * result.waypoint_position_error.max().item()
                 reason += f" failed={failed} max_waypoint_error={error:.1f}mm"
             via_failures[reason] += 1
+        if multi is None:
+            continue
 
         targets = [home.as_goal()] + [
             GoalToolPose(
@@ -122,13 +130,18 @@ def main():
             motion = (trajectory.position.shape[-2] - 1) * dt
         multi_rows.append({"success": ok, "time": elapsed, "motion": motion})
 
-    print(f"{args.num_problems} paths of {args.num_waypoints} waypoints")
+    print(
+        f"{args.num_problems} paths of {args.num_waypoints} waypoints, "
+        f"geometry_dt_scale={args.geometry_dt_scale}"
+    )
     summarize("ViaPoint", via_rows)
-    summarize("MultiWaypoint", multi_rows)
+    if multi is not None:
+        summarize("MultiWaypoint", multi_rows)
     for reason, count in via_failures.most_common():
         print(f"  ViaPoint failure x{count}: {reason}")
     via.destroy()
-    multi.destroy()
+    if multi is not None:
+        multi.destroy()
 
 
 if __name__ == "__main__":
