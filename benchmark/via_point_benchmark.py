@@ -16,6 +16,7 @@ Example::
 
 import argparse
 import time
+from collections import Counter
 from typing import Dict, List
 
 import numpy as np
@@ -88,12 +89,20 @@ def main():
     home = via.compute_kinematics(start).tool_poses
     paths = random_paths(home, args.num_problems, args.num_waypoints, args.seed)
 
-    via_rows, multi_rows = [], []
+    via_rows, multi_rows, via_failures = [], [], Counter()
     for path in paths:
         result, elapsed = time_call(lambda: via.plan_waypoints(path, start))
         ok = bool(result.success.item())
         motion = float(result.trajopt_result.motion_time().view(-1)[0]) if ok else np.nan
         via_rows.append({"success": ok, "time": elapsed, "motion": motion})
+        if not ok:
+            reason = result.status
+            if result.trajopt_result is not None:
+                validation = result.trajopt_result.debug_info.get("validation", {})
+                failed = [name for name, valid in validation.items() if not bool(valid.all())]
+                error = 1000 * result.waypoint_position_error.max().item()
+                reason += f" failed={failed} max_waypoint_error={error:.1f}mm"
+            via_failures[reason] += 1
 
         targets = [home.as_goal()] + [
             GoalToolPose(
@@ -116,6 +125,8 @@ def main():
     print(f"{args.num_problems} paths of {args.num_waypoints} waypoints")
     summarize("ViaPoint", via_rows)
     summarize("MultiWaypoint", multi_rows)
+    for reason, count in via_failures.most_common():
+        print(f"  ViaPoint failure x{count}: {reason}")
     via.destroy()
     multi.destroy()
 

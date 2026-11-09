@@ -180,13 +180,24 @@ def test_plan_reaches_every_waypoint_without_stopping(planner):
     velocity = velocity.reshape(-1, *velocity.shape[-2:])[0]
     assert velocity[result.waypoint_indices[0]].abs().max() > 1e-3
     trajectory = result.get_interpolated_plan()
-    assert trajectory.position.shape[-1] == len(planner.joint_names)
+    assert trajectory.position.shape[-1] == len(trajectory.joint_names)
+    assert set(planner.joint_names) <= set(trajectory.joint_names)
 
 
 @cuda
 def test_segment_criteria_constrain_only_their_segment(planner):
     """A straight-line segment stays on its line; the free segment before it does not need to."""
-    start, waypoints = _offsets(planner, [[0.15, 0.2, 0.0], [0.15, 0.2, -0.2]])
+    start, home = _home(planner)
+    # The line runs 15 cm along the home tool axis, which linear_motion("z") keeps free.
+    w, x, y, z = home.quaternion[0, 0, 0].tolist()
+    axis = torch.tensor(
+        [2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)],
+        device=home.position.device,
+    )
+    first = home.position[0, 0, 0] + torch.tensor([0.15, 0.2, 0.05], device=axis.device)
+    position = torch.stack([first, first + 0.15 * axis]).view(1, 2, 1, 1, 3)
+    quaternion = home.quaternion[:, 0:1].expand(-1, 2, -1, -1).unsqueeze(3)
+    waypoints = GoalToolPose(planner.tool_frames, position, quaternion.contiguous())
     straight = replace(
         ToolPoseCriteria.linear_motion("z", device_cfg=planner._motion_planner.device_cfg),
         path_tolerance=(0.005, 2.0 * math.sin(0.05 / 2.0)),
@@ -196,9 +207,11 @@ def test_segment_criteria_constrain_only_their_segment(planner):
     result = planner.plan_waypoints(waypoints, start, [None, {frame: straight}])
     assert result.success.item(), result.status
     positions = _native_tool_positions(planner, result)
-    first, last = result.waypoint_indices
-    line = positions[first : last + 1, :2] - waypoints.position[0, 0, 0, 0, :2]
-    assert line.norm(dim=-1).max() <= 0.005 + 1e-3
+    begin, end = result.waypoint_indices
+    offset = positions[begin + 1 : end] - first
+    off_line = offset - (offset @ axis).unsqueeze(-1) * axis
+    # Path samples stay within the path tolerance of the line through the reference.
+    assert off_line.norm(dim=-1).max() <= 0.005 + 1e-3
 
 
 @cuda
