@@ -78,16 +78,19 @@ def main():
     parser.add_argument("--geometry_dt_scale", type=float, default=10.0)
     parser.add_argument("--num_knots", type=int, default=64)
     parser.add_argument("--min_segment_intervals", type=int, default=8)
+    parser.add_argument("--num_trajopt_seeds", type=int, default=None)
     parser.add_argument("--skip_multi", action="store_true", help="only run the via-point planner")
     args = parser.parse_args()
 
     common = dict(robot="franka.yml", scene_model="collision_table.yml", use_cuda_graph=True)
+    seeds = {} if args.num_trajopt_seeds is None else {"num_trajopt_seeds": args.num_trajopt_seeds}
     via = ViaPointMotionPlanner(
         ViaPointMotionPlannerCfg.create(
             geometry_dt_scale=args.geometry_dt_scale,
             num_knots=args.num_knots,
             min_segment_intervals=args.min_segment_intervals,
             **common,
+            **seeds,
         )
     )
     via.warmup()
@@ -140,7 +143,8 @@ def main():
     print(
         f"{args.num_problems} paths of {args.num_waypoints} waypoints, "
         f"geometry_dt_scale={args.geometry_dt_scale}, num_knots={args.num_knots}, "
-        f"min_segment_intervals={args.min_segment_intervals}"
+        f"min_segment_intervals={args.min_segment_intervals}, "
+        f"num_trajopt_seeds={via._motion_planner.trajopt_solver.config.num_seeds}"
     )
     summarize("ViaPoint", via_rows)
     if multi is not None:

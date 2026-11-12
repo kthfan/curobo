@@ -43,7 +43,8 @@ class ViaPointMotionPlannerCfg:
 
     #: Scale of the seed's time step for the geometric optimization. TimeOpt then sets the
     #: fastest timing along the optimized path, so a slow geometric pass can pass sharp corners
-    #: at the waypoints precisely without making the motion slower. Each retry doubles it.
+    #: at the waypoints precisely without making the motion slower. The scaled time step is
+    #: limited by the optimizer's ``maximum_trajectory_dt``.
     geometry_dt_scale: float = 10.0
 
     def __post_init__(self):

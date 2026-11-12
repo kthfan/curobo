@@ -442,9 +442,8 @@ class ViaPointMotionPlanner:
         )
         try:
             for attempt in range(max_attempts or self.config.max_attempts):
+                # Retries keep the random state, so they solve IK with new seeds.
                 result.attempts = attempt + 1
-                if attempt > 0:
-                    self.reset_seed()
                 layers, status = self._ik_layers(waypoints, state, criteria, segment_bounds)
                 if layers is None:
                     result.status = status
@@ -460,8 +459,6 @@ class ViaPointMotionPlanner:
                     tolerance,
                     finetune_attempts,
                     initial_iters,
-                    # Each retry optimizes the geometry twice as slowly; TimeOpt sets the timing.
-                    self.config.geometry_dt_scale * 2**attempt,
                 )
                 indices, trajopt_result = trajopt
                 result.waypoint_indices = indices
@@ -586,7 +583,6 @@ class ViaPointMotionPlanner:
         tolerance: Tuple[float, float],
         finetune_attempts: int,
         initial_iters: int,
-        geometry_dt_scale: float,
     ):
         """Seed and run one trajectory optimization through the IK layers."""
         planner = self._motion_planner
@@ -624,7 +620,7 @@ class ViaPointMotionPlanner:
             use_implicit_goal=True,
             finetune_attempts=finetune_attempts,
             initial_iters=initial_iters,
-            initial_dt_scale=geometry_dt_scale,
+            initial_dt_scale=self.config.geometry_dt_scale,
             track_intermediate=True,
             path_tolerance=tolerance,
             final_tolerance=tolerance,
