@@ -21,8 +21,8 @@ One call of `plan_waypoints` runs four stages:
    and remove near-duplicates.
 2. **IK chains.** A chain picks one IK solution per waypoint. Dynamic programming on joint-space
    distance finds, for every solution of the last waypoint, the shortest chain from the current
-   state to it. The optimizer gets one seed per chain, starting with the shortest ones, so the
-   seeds explore different IK branches of the goal.
+   state to it. The optimizer gets one seed per chain, starting with the shortest ones (8 chains
+   by default, `num_trajopt_seeds`), so the seeds explore different IK branches of the goal.
 3. **Reference.** The spline's native samples are spread over the segments in proportion to
    the joint-space distance of the shortest chain, at least `min_segment_intervals` per segment.
    Waypoint {math}`k` is placed at native sample {math}`w_k`, and a Cartesian reference is

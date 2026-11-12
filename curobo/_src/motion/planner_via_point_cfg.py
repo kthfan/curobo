@@ -67,6 +67,7 @@ class ViaPointMotionPlannerCfg:
         min_segment_intervals: int = 8,
         geometry_dt_scale: float = 10.0,
         num_knots: int = 64,
+        num_trajopt_seeds: int = 8,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
         """Build a configuration from a robot and via-point planning parameters.
@@ -82,6 +83,8 @@ class ViaPointMotionPlannerCfg:
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
+            num_trajopt_seeds: Trajectory optimization seeds, one per IK chain. More chains
+                cover more IK branches of the waypoints.
             **motion_planner_kwargs: Forwarded to :meth:`MotionPlannerCfg.create`, for example
                 ``scene_model`` or ``num_trajopt_seeds``.
 
@@ -90,7 +93,10 @@ class ViaPointMotionPlannerCfg:
         """
         return cls(
             motion_planner_cfg=MotionPlannerCfg.create(
-                robot, num_knots=num_knots, **motion_planner_kwargs
+                robot,
+                num_knots=num_knots,
+                num_trajopt_seeds=num_trajopt_seeds,
+                **motion_planner_kwargs,
             ),
             max_attempts=max_attempts,
             ik_return_seeds=ik_return_seeds,
