@@ -247,3 +247,14 @@ def test_a_bound_no_waypoint_ik_satisfies_fails_before_optimization(planner):
     # The planner is not left with the failed plan's bounds.
     result = planner.plan_waypoints(waypoints, start)
     assert result.success.item(), result.status
+
+
+@cuda
+def test_back_and_forth_path_reaches_every_waypoint(planner):
+    """Large swings miss the first waypoints at the default geometry time step; a retry with a
+    slower geometric optimization passes them."""
+    offsets = [[0.076, -0.214, 0.073], [0.144, 0.222, -0.004], [0.05, -0.235, -0.08]]
+    start, waypoints = _offsets(planner, offsets + [[0.073, -0.228, 0.218]])
+    result = planner.plan_waypoints(waypoints, start)
+    assert result.success.item(), result.status
+    assert result.waypoint_position_error.max() <= 0.005 + 1e-4
