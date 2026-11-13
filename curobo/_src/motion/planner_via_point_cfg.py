@@ -47,6 +47,16 @@ class ViaPointMotionPlannerCfg:
     #: limited by the optimizer's ``maximum_trajectory_dt``.
     geometry_dt_scale: float = 10.0
 
+    #: Add the full-turn variants of every IK solution (``q ± 2π`` on revolute joints whose
+    #: limits span more than one turn) to the waypoint's IK solutions, so the IK chain can
+    #: reach a waypoint "the other way round" when that makes the whole path shorter.
+    expand_revolutions: bool = True
+
+    #: Seed the IK of every waypoint with the IK solutions of the previous one (the current
+    #: state for the first), besides random seeds, so every IK branch found at a waypoint has
+    #: its nearest continuation at the next one.
+    seed_ik_from_previous: bool = True
+
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
             log_and_raise("max_attempts, ik_return_seeds and min_segment_intervals must be >= 1")
@@ -66,6 +76,8 @@ class ViaPointMotionPlannerCfg:
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 8,
         geometry_dt_scale: float = 10.0,
+        expand_revolutions: bool = True,
+        seed_ik_from_previous: bool = True,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
         **motion_planner_kwargs: Any,
@@ -80,6 +92,9 @@ class ViaPointMotionPlannerCfg:
             waypoint_tolerance: Default reach tolerance (m, rad).
             min_segment_intervals: Fewest native reference intervals per segment.
             geometry_dt_scale: Time step scale of the geometric optimization.
+            expand_revolutions: Add the full-turn variants of the IK solutions.
+            seed_ik_from_previous: Seed every waypoint's IK with the previous waypoint's
+                solutions.
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
@@ -104,6 +119,8 @@ class ViaPointMotionPlannerCfg:
             waypoint_tolerance=waypoint_tolerance,
             min_segment_intervals=min_segment_intervals,
             geometry_dt_scale=geometry_dt_scale,
+            expand_revolutions=expand_revolutions,
+            seed_ik_from_previous=seed_ik_from_previous,
         )
 
 

@@ -39,6 +39,11 @@ from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import ToolPoseBound, ToolPoseBoundAnchor
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
+from curobo._src.motion.ik_revolution import (
+    dedup_joint_revolutions,
+    expand_joint_revolutions,
+    revolute_joint_mask,
+)
 from curobo._src.motion.motion_planner import (
     MotionPlanner,
     _initial_iteration_budget,
@@ -307,6 +312,10 @@ class ViaPointMotionPlanner:
             frame: ToolPoseCriteria(device_cfg=self._motion_planner.device_cfg)
             for frame in self.tool_frames
         }
+        kinematics = self._motion_planner.kinematics
+        limits = kinematics.get_joint_limits().position
+        self._position_limits = (limits[0].clone(), limits[1].clone())
+        self._revolute_joints = revolute_joint_mask(kinematics.kinematics_config)
 
     # -- Lifecycle --
 
@@ -527,7 +536,9 @@ class ViaPointMotionPlanner:
         """Solve, bound-filter and de-duplicate IK at every waypoint."""
         ik_solver = self._motion_planner.ik_solver
         return_seeds = min(self.config.ik_return_seeds, ik_solver.config.num_seeds)
+        lower, upper = self._position_limits
         layers = []
+        previous = state.position.view(1, -1)
         for j in range(waypoints.horizon):
             ik_solver.update_tool_pose_criteria(_without_bounds(criteria[j]))
             target = GoalToolPose(
@@ -535,7 +546,13 @@ class ViaPointMotionPlanner:
                 waypoints.position[:, j : j + 1].contiguous(),
                 waypoints.quaternion[:, j : j + 1].contiguous(),
             )
-            ik = ik_solver.solve_pose(target, current_state=state, return_seeds=return_seeds)
+            seed_config = None
+            if self.config.seed_ik_from_previous:
+                # Half of the seeds continue the previous solutions; the rest stay random.
+                seed_config = previous[: max(1, ik_solver.config.num_seeds // 2)].unsqueeze(0)
+            ik = ik_solver.solve_pose(
+                target, current_state=state, seed_config=seed_config, return_seeds=return_seeds
+            )
             solutions = ik.solution.reshape(-1, ik.solution.shape[-1])[ik.success.view(-1)]
             if solutions.shape[0] == 0:
                 return None, f"No IK solution at waypoint {j}."
@@ -543,7 +560,15 @@ class ViaPointMotionPlanner:
             solutions = self._filter_by_bounds(solutions, bounds)
             if solutions.shape[0] == 0:
                 return None, f"No IK solution at waypoint {j} satisfies its segments' bounds."
-            layers.append(dedup_joint_solutions(solutions, self.config.ik_dedup_joint_tol))
+            tol = self.config.ik_dedup_joint_tol
+            if self.config.expand_revolutions:
+                previous = dedup_joint_revolutions(
+                    solutions, tol, lower, upper, self._revolute_joints
+                )
+                layer = expand_joint_revolutions(previous, lower, upper, self._revolute_joints)
+            else:
+                previous = layer = dedup_joint_solutions(solutions, tol)
+            layers.append(layer)
         return layers, ""
 
     def _filter_by_bounds(

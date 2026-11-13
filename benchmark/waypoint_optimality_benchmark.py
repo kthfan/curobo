@@ -1,0 +1,476 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Measure how close waypoint plans are to the shortest joint-space path.
+
+A trajectory through Cartesian waypoints passes one IK solution of every waypoint, so it is at
+least as long as the shortest *IK chain*: the choice of one IK solution per waypoint with the
+smallest sum of joint-space distances. This script builds a reference for that chain from a
+dense set of IK solutions per waypoint (many IK rounds, plus the full-turn variants ``q ± 2π`` of
+joints whose limits span more than one turn), and compares the chains and trajectories of
+:class:`ViaPointMotionPlanner` and :class:`MultiWaypointMotionPlanner` with it.
+
+The paths are built to punish a planner that only looks one waypoint ahead:
+
+- ``wrap``: a joint with more than one turn of range keeps turning the same way until the
+  next waypoint lies beyond its limit. A myopic planner unwinds a full turn there; the shortest
+  path takes the long way at the step where that costs least.
+- ``double_wrap``: two such joints with different step patterns.
+- ``random_reach``: waypoints at the tool poses of widely spread configurations, from a start
+  near a joint limit.
+- ``pillar``: sweeps from one side of a pillar to the other; the shortest IK chain ignores it.
+
+Reported per planner: success, IK chain length over the reference (1.0 is optimal), trajectory
+arc length over the reference, how often the chain is more than 5 % longer than the reference,
+motion time, and planning time. ``greedy`` is the chain of a planner that always moves to the
+nearest IK solution of the next waypoint, from the same dense IK sets.
+
+Example::
+
+    python benchmark/waypoint_optimality_benchmark.py --robot ur10e.yml --num_problems 8
+"""
+
+import argparse
+import json
+import math
+import time
+from typing import Dict, List, Optional
+
+import torch
+
+from curobo._src.motion.ik_revolution import (
+    dedup_joint_revolutions,
+    expand_joint_revolutions,
+    revolute_joint_mask,
+)
+from curobo._src.motion.multi_waypoint_planner import MultiWaypointMotionPlanner
+from curobo._src.motion.multi_waypoint_planner_cfg import MultiWaypointMotionPlannerCfg
+from curobo._src.motion.planner_via_point import ViaPointMotionPlanner
+from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg
+from curobo._src.state.state_joint import JointState
+from curobo._src.types.tool_pose import GoalToolPose
+from curobo.scene import Cuboid, Scene
+
+TURN = 2.0 * math.pi
+DEG = math.pi / 180.0
+
+#: Joints that drive the wrap paths (first is the tool roll, the second the base pan) and the
+#: spread of the random configurations, per robot.
+ROBOTS = {
+    "ur10e.yml": {
+        "wrap_joints": [5, 0],
+        "spread": [2.5, 0.5, 0.5, 1.0, 1.0, 3.0],
+        "pan_joint": 0,
+    },
+    "franka.yml": {
+        "wrap_joints": [6, 0],
+        "spread": [1.2, 0.4, 1.2, 0.4, 1.2, 0.6, 2.0],
+        "pan_joint": 0,
+    },
+}
+
+#: ViaPointMotionPlanner settings compared: (expand_revolutions, seed_ik_from_previous).
+VIA_VARIANTS = {
+    "via_base": (False, False),
+    "via_rev": (True, False),
+    "via_full": (True, True),
+}
+
+
+def table_scene(pillar: Optional[List[float]] = None) -> Scene:
+    """The table of ``collision_table.yml``, with an optional pillar ``[x, y, top z]``."""
+    cuboids = [Cuboid(name="table", dims=[4.0, 4.0, 0.2], pose=[0.0, 0.0, -0.2, 1, 0, 0, 0])]
+    if pillar is not None:
+        x, y, top = pillar
+        cuboids.append(
+            Cuboid(
+                name="pillar",
+                dims=[0.12, 0.12, top + 0.1],
+                pose=[x, y, (top - 0.1) / 2.0, 1, 0, 0, 0],
+            )
+        )
+    return Scene(cuboid=cuboids)
+
+
+# -- Chains --
+
+
+def pair_cost(a: torch.Tensor, b: torch.Tensor, vmax: Optional[torch.Tensor]) -> torch.Tensor:
+    """Cost ``[A, B]`` between configurations: L2 distance, or the time bound with ``vmax``."""
+    if vmax is None:
+        return torch.cdist(a, b)
+    return ((a.unsqueeze(1) - b.unsqueeze(0)).abs() / vmax).amax(dim=-1)
+
+
+def shortest_chain(
+    start: torch.Tensor, layers: List[torch.Tensor], vmax: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Globally shortest IK chain ``[N, dof]`` through the layers, by dynamic programming."""
+    cost = pair_cost(start.view(1, -1), layers[0], vmax)[0]
+    parents = []
+    for previous, layer in zip(layers[:-1], layers[1:]):
+        cost, parent = (cost.unsqueeze(1) + pair_cost(previous, layer, vmax)).min(dim=0)
+        parents.append(parent)
+    node = int(cost.argmin())
+    nodes = [node]
+    for parent in reversed(parents):
+        node = int(parent[node])
+        nodes.append(node)
+    nodes.reverse()
+    return torch.stack([layer[i] for layer, i in zip(layers, nodes)])
+
+
+def greedy_chain(start: torch.Tensor, layers: List[torch.Tensor]) -> torch.Tensor:
+    """IK chain ``[N, dof]`` that always moves to the nearest solution of the next waypoint."""
+    chain, current = [], start
+    for layer in layers:
+        current = layer[(layer - current).norm(dim=-1).argmin()]
+        chain.append(current)
+    return torch.stack(chain)
+
+
+def chain_metrics(start: torch.Tensor, chain: torch.Tensor, vmax: torch.Tensor) -> Dict:
+    """Joint-space length (L2 and total rotation) and time bound of a chain from ``start``."""
+    steps = torch.cat((start.view(1, -1), chain))
+    delta = steps[1:] - steps[:-1]
+    return {
+        "l2": float(delta.norm(dim=-1).sum()),
+        "l1": float(delta.abs().sum()),
+        "time_bound": float((delta.abs() / vmax).amax(dim=-1).sum()),
+    }
+
+
+def arc_length(position: torch.Tensor) -> float:
+    """Joint-space L2 arc length of a trajectory ``[T, dof]``."""
+    return float((position[1:] - position[:-1]).norm(dim=-1).sum())
+
+
+# -- Problems --
+
+
+def make_waypoints(planner: ViaPointMotionPlanner, configs: torch.Tensor) -> GoalToolPose:
+    """Waypoints ``[1, N, links, 1, 3/4]`` at the tool poses of ``configs`` ``[N, dof]``.
+
+    Forward kinematics is periodic, so configurations beyond the joint limits are fine here.
+    """
+    poses = planner.compute_kinematics(
+        JointState.from_position(configs, joint_names=planner.joint_names)
+    ).tool_poses
+    return GoalToolPose(
+        planner.tool_frames,
+        poses.position.view(1, configs.shape[0], -1, 1, 3).contiguous(),
+        poses.quaternion.view(1, configs.shape[0], -1, 1, 4).contiguous(),
+    )
+
+
+def wrap_problems(q0, lower, upper, joints, count, generator) -> List[Dict]:
+    """Paths that keep turning ``joints`` the same way until a waypoint is beyond a limit."""
+    problems = []
+    for index in range(count):
+        start = q0.clone()
+        steps = int(torch.randint(3, 6, (1,), generator=generator))
+        configs = start.repeat(steps, 1)
+        for joint in joints:
+            limit = float(min(upper[joint], -lower[joint]))
+            sign = 1.0 if float(torch.rand(1, generator=generator)) < 0.5 else -1.0
+            if index == 0 and len(joints) == 1:
+                # A joint at 0 turns to 90, 270 and 360 degrees.
+                first, sizes = 0.0, torch.tensor([90.0, 180.0, 90.0]) * DEG
+                configs = start.repeat(3, 1)
+            else:
+                first = sign * limit * float(0.2 + 0.7 * torch.rand(1, generator=generator))
+                sizes = (20.0 + 150.0 * torch.rand(configs.shape[0], generator=generator)) * DEG
+            start[joint] = first
+            configs[:, joint] = first + sign * torch.cumsum(sizes, dim=0)
+        for joint in range(q0.numel()):
+            if joint not in joints:
+                configs[:, joint] = start[joint]
+        problems.append({"start": start, "configs": configs, "pillar": None})
+    return problems
+
+
+def random_reach_problems(q0, lower, upper, spec, count, generator) -> List[Dict]:
+    """Waypoints at the tool poses of widely spread configurations, from a wrapped start."""
+    spread = torch.tensor(spec["spread"])
+    problems = []
+    for _ in range(count):
+        start = q0.clone()
+        for joint in spec["wrap_joints"]:
+            limit = float(min(upper[joint], -lower[joint]))
+            start[joint] = limit * 0.9 * float(2.0 * torch.rand(1, generator=generator) - 1.0)
+        offsets = (2.0 * torch.rand(4, q0.numel(), generator=generator) - 1.0) * spread
+        configs = torch.maximum(torch.minimum(q0 + offsets, upper - 0.05), lower + 0.05)
+        problems.append({"start": start, "configs": configs, "pillar": None})
+    return problems
+
+
+def pillar_problems(planner, q0, spec, count, generator) -> List[Dict]:
+    """Sweeps of the base joint from one side of a pillar to the other and back."""
+    pan = spec["pan_joint"]
+    problems = []
+    for _ in range(count):
+        half = float(0.45 + 0.3 * torch.rand(1, generator=generator))
+        start = q0.clone()
+        start[pan] = q0[pan] - half
+        sides = torch.tensor([half, -half, half], device=q0.device)
+        configs = q0.repeat(3, 1)
+        configs[:, pan] = q0[pan] + sides
+        middle = planner.compute_kinematics(
+            JointState.from_position(q0.view(1, -1), joint_names=planner.joint_names)
+        ).tool_poses.position.view(-1)[:3]
+        pillar = [float(middle[0]), float(middle[1]), float(middle[2]) + 0.25]
+        problems.append({"start": start, "configs": configs, "pillar": pillar})
+    return problems
+
+
+# -- Reference IK --
+
+
+def dense_ik_layers(
+    planner: ViaPointMotionPlanner,
+    waypoints: GoalToolPose,
+    state: JointState,
+    rounds: int,
+    extra: List[List[torch.Tensor]],
+) -> Optional[List[torch.Tensor]]:
+    """Dense IK solutions per waypoint with their full-turn variants, or None if one has none.
+
+    Args:
+        planner: Planner whose IK solver and limits are used.
+        waypoints: Targets ``[1, N, links, 1, 3/4]``.
+        state: Current joint state, the first IK seed of every round.
+        rounds: IK calls per waypoint; every call uses new random seeds.
+        extra: Per waypoint, configurations to add (the planners' own waypoint configurations),
+            so the reference is never longer than a planner's chain.
+    """
+    ik_solver = planner._motion_planner.ik_solver
+    lower, upper = planner._position_limits
+    layers = []
+    for j in range(waypoints.horizon):
+        target = GoalToolPose(
+            waypoints.tool_frames,
+            waypoints.position[:, j : j + 1].contiguous(),
+            waypoints.quaternion[:, j : j + 1].contiguous(),
+        )
+        found = list(extra[j])
+        for _ in range(rounds):
+            ik = ik_solver.solve_pose(
+                target, current_state=state, return_seeds=ik_solver.config.num_seeds
+            )
+            found.append(ik.solution.reshape(-1, ik.solution.shape[-1])[ik.success.view(-1)])
+        solutions = torch.cat([f.view(-1, lower.numel()) for f in found])
+        if solutions.shape[0] == 0:
+            return None
+        revolute = planner._revolute_joints
+        solutions = dedup_joint_revolutions(solutions, 0.02, lower, upper, revolute)
+        layers.append(expand_joint_revolutions(solutions, lower, upper, revolute))
+    return layers
+
+
+# -- Planner runs --
+
+
+def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> Dict:
+    planner.config.expand_revolutions, planner.config.seed_ik_from_previous = VIA_VARIANTS[variant]
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    result = planner.plan_waypoints(waypoints, state)
+    torch.cuda.synchronize()
+    row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
+    row["status"] = result.status
+    if row["success"]:
+        row["chain"] = result.waypoint_configs
+        trajectory = result.get_interpolated_plan()
+        row["arc"] = arc_length(trajectory.position.view(-1, trajectory.position.shape[-1]))
+        row["motion_time"] = float(result.trajopt_result.motion_time().view(-1)[0])
+    return row
+
+
+def run_multi(planner: MultiWaypointMotionPlanner, start_pose, waypoints, state) -> Dict:
+    targets = [start_pose.as_goal()] + [
+        GoalToolPose(
+            waypoints.tool_frames,
+            waypoints.position[:, j : j + 1].contiguous(),
+            waypoints.quaternion[:, j : j + 1].contiguous(),
+        )
+        for j in range(waypoints.horizon)
+    ]
+    captured = {}
+    generate = planner._generate_ik_layers
+
+    def capture(*args, **kwargs):
+        captured["layers"], status = generate(*args, **kwargs)
+        return captured["layers"], status
+
+    planner._generate_ik_layers = capture
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    try:
+        result = planner.plan_waypoints(targets, state, [{} for _ in range(waypoints.horizon)])
+    finally:
+        planner._generate_ik_layers = generate
+    torch.cuda.synchronize()
+    row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
+    row["status"] = result.status
+    if row["success"]:
+        nodes = torch.stack(
+            [layer[i] for layer, i in zip(captured["layers"], result.chosen_ik_indices)]
+        )
+        # The planner starts at an IK solution of the first target, not at the current state.
+        row["start_gap"] = float((nodes[0] - state.position.view(-1)).norm())
+        row["chain"] = nodes
+        position = result.composed_trajectory.position
+        row["arc"] = arc_length(position.view(-1, position.shape[-1]))
+        row["motion_time"] = float(
+            sum(float(r.motion_time().view(-1)[0]) for r in result.segment_results)
+        )
+    return row
+
+
+def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
+    print(f"\n== {family}: {len(rows)} paths ==")
+    greedy = [r["greedy"]["l2"] / r["reference"]["l2"] for r in rows]
+    print(
+        f"{'greedy':>9}: chain/ref mean {sum(greedy) / len(greedy):.3f} max {max(greedy):.3f}, "
+        f"longer than 1.05x in {sum(g > 1.05 for g in greedy)}/{len(greedy)}"
+    )
+    for name in planners:
+        ran = [r for r in rows if name in r]
+        ok = [r for r in ran if r[name]["success"]]
+        if not ran:
+            continue
+        line = f"{name:>9}: success {len(ok)}/{len(ran)}"
+        if ok:
+            chain = [r[name]["chain_l2"] / r["reference"]["l2"] for r in ok]
+            arc = [r[name]["arc"] / r["reference"]["l2"] for r in ok]
+            motion = [r[name]["motion_time"] / r["reference"]["time_bound"] for r in ok]
+            plan = [r[name]["plan_time"] for r in ran]
+            line += (
+                f", chain/ref mean {sum(chain) / len(chain):.3f} max {max(chain):.3f} "
+                f"(>1.05x in {sum(c > 1.05 for c in chain)}/{len(chain)}), "
+                f"arc/ref {sum(arc) / len(arc):.3f}, "
+                f"motion/time bound {sum(motion) / len(motion):.2f}, "
+                f"motion {sum(r[name]['motion_time'] for r in ok) / len(ok):.2f} s, "
+                f"plan {1000 * sum(plan) / len(plan):.0f} ms"
+            )
+            if name == "multi":
+                gap = [r[name]["start_gap"] for r in ok]
+                line += f", start gap mean {sum(gap) / len(gap):.2f} max {max(gap):.2f} rad"
+        print(line)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--robot", default="ur10e.yml", choices=sorted(ROBOTS))
+    parser.add_argument("--num_problems", type=int, default=8, help="paths per family")
+    parser.add_argument("--multi_problems", type=int, default=4, help="paths per family, multi")
+    parser.add_argument("--ik_rounds", type=int, default=20, help="reference IK calls per waypoint")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--families", default="wrap_tool,wrap_pan,double_wrap,random_reach,pillar")
+    parser.add_argument("--out", default=None, help="write the per-path results to this JSON")
+    args = parser.parse_args()
+
+    spec = ROBOTS[args.robot]
+    common = dict(
+        robot=args.robot,
+        scene_model="collision_table.yml",
+        collision_cache={"cuboid": 4},
+        use_cuda_graph=True,
+    )
+    via = ViaPointMotionPlanner(ViaPointMotionPlannerCfg.create(**common))
+    via.warmup()
+    multi = None
+    if args.multi_problems > 0:
+        multi = MultiWaypointMotionPlanner(MultiWaypointMotionPlannerCfg.create(**common))
+        multi.motion_planner.warmup(enable_graph=False)
+
+    device = via._motion_planner.device_cfg.device
+    lower, upper = (limit.cpu() for limit in via._position_limits)
+    vmax = via._motion_planner.kinematics.get_joint_limits().velocity[1]
+    q0 = via.default_joint_state.position.view(-1).cpu()
+    generator = torch.Generator().manual_seed(args.seed)
+    print(
+        f"robot {args.robot}: limits {[round(float(v) / DEG) for v in upper]} deg, full-turn "
+        f"joints {revolute_joint_mask(via._motion_planner.kinematics.kinematics_config).tolist()}"
+    )
+
+    wrap = spec["wrap_joints"]
+    families = {
+        "wrap_tool": lambda: wrap_problems(q0, lower, upper, wrap[:1], args.num_problems, generator),
+        "wrap_pan": lambda: wrap_problems(q0, lower, upper, wrap[1:], args.num_problems, generator),
+        "double_wrap": lambda: wrap_problems(q0, lower, upper, wrap, args.num_problems, generator),
+        "random_reach": lambda: random_reach_problems(
+            q0, lower, upper, spec, args.num_problems, generator
+        ),
+        "pillar": lambda: pillar_problems(via, q0.to(device), spec, args.num_problems, generator),
+    }
+    planners = list(VIA_VARIANTS) + ["multi"]
+    report = {}
+    for family in args.families.split(","):
+        rows = []
+        for index, problem in enumerate(families[family]()):
+            pillar = problem["pillar"]
+            if pillar is not None:
+                via.update_world(table_scene(pillar))
+                if multi is not None:
+                    multi.update_world(table_scene(pillar))
+            start = problem["start"].to(device)
+            state = JointState.from_position(start.view(1, -1), joint_names=via.joint_names)
+            waypoints = make_waypoints(via, problem["configs"].to(device))
+            row = {"index": index, "start": start, "pillar": pillar}
+            extra = [[] for _ in range(waypoints.horizon)]
+            for name in VIA_VARIANTS:
+                row[name] = run_via(via, waypoints, state, name)
+            if multi is not None and index < args.multi_problems:
+                start_pose = via.compute_kinematics(state).tool_poses
+                row["multi"] = run_multi(multi, start_pose, waypoints, state)
+            for name in planners:
+                if name in row and row[name]["success"]:
+                    chain = row[name]["chain"][-waypoints.horizon :]
+                    for j in range(waypoints.horizon):
+                        extra[j].append(chain[j])
+            layers = dense_ik_layers(via, waypoints, state, args.ik_rounds, extra)
+            if pillar is not None:
+                via.update_world(table_scene())
+                if multi is not None:
+                    multi.update_world(table_scene())
+            if layers is None:
+                print(f"{family} {index}: a waypoint has no IK solution, skipped")
+                continue
+            row["layer_sizes"] = [int(layer.shape[0]) for layer in layers]
+            reference = shortest_chain(start, layers)
+            row["reference"] = chain_metrics(start, reference, vmax)
+            row["reference"]["time_bound"] = chain_metrics(
+                start, shortest_chain(start, layers, vmax), vmax
+            )["time_bound"]
+            row["reference"]["chain"] = reference
+            row["greedy"] = chain_metrics(start, greedy_chain(start, layers), vmax)
+            for name in planners:
+                if name in row and row[name]["success"]:
+                    # A multi-waypoint chain starts at its own IK solution of the start pose;
+                    # measured from the current state it includes the way to that solution.
+                    row[name]["chain_l2"] = chain_metrics(start, row[name]["chain"], vmax)["l2"]
+            rows.append(row)
+        summarize(family, rows, planners)
+        report[family] = rows
+
+    if args.out is not None:
+
+        def plain(value):
+            if isinstance(value, torch.Tensor):
+                return [[round(v, 4) for v in r] for r in value.view(-1, value.shape[-1]).tolist()]
+            if isinstance(value, dict):
+                return {k: plain(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [plain(v) for v in value]
+            return value
+
+        with open(args.out, "w") as file:
+            json.dump({"robot": args.robot, "families": plain(report)}, file)
+    via.destroy()
+    if multi is not None:
+        multi.destroy()
+
+
+if __name__ == "__main__":
+    main()
