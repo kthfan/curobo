@@ -425,9 +425,15 @@ class ViaPointMotionPlanner:
         )
         try:
             for attempt in range(max_attempts or self.config.max_attempts):
-                # Retries keep the random state, so they solve IK with new seeds.
+                # The first attempt follows the shortest IK chains: IK continues the previous
+                # waypoint's solutions and only chains near the shortest are seeded. Retries
+                # explore: they keep the random state, solve IK from random seeds only, and
+                # seed the shortest chain to every IK solution of the last waypoint.
                 result.attempts = attempt + 1
-                layers, status = self._ik_layers(waypoints, state, criteria, segment_bounds)
+                explore = attempt > 0
+                layers, status = self._ik_layers(
+                    waypoints, state, criteria, segment_bounds, explore
+                )
                 if layers is None:
                     result.status = status
                     continue
@@ -442,9 +448,7 @@ class ViaPointMotionPlanner:
                     tolerance,
                     finetune_attempts,
                     initial_iters,
-                    # The first attempt follows the shortest IK chains only; retries also try
-                    # longer chains that end on other IK solutions.
-                    self.config.chain_length_slack if attempt == 0 else None,
+                    None if explore else self.config.chain_length_slack,
                 )
                 indices, trajopt_result = trajopt
                 result.waypoint_indices = indices
@@ -509,8 +513,13 @@ class ViaPointMotionPlanner:
         state: JointState,
         criteria: List[Dict[str, ToolPoseCriteria]],
         segment_bounds: List[Dict[str, List[ToolPoseBound]]],
+        explore: bool = False,
     ) -> Tuple[Optional[List[torch.Tensor]], str]:
-        """Solve, bound-filter and de-duplicate IK at every waypoint."""
+        """Solve, bound-filter and de-duplicate IK at every waypoint.
+
+        With ``explore``, IK starts from random seeds only instead of also continuing the
+        previous waypoint's solutions.
+        """
         ik_solver = self._motion_planner.ik_solver
         return_seeds = min(self.config.ik_return_seeds, ik_solver.config.num_seeds)
         lower, upper = self._position_limits
@@ -524,7 +533,7 @@ class ViaPointMotionPlanner:
                 waypoints.quaternion[:, j : j + 1].contiguous(),
             )
             seed_config = None
-            if self.config.seed_ik_from_previous:
+            if self.config.seed_ik_from_previous and not explore:
                 # Half of the seeds continue the previous solutions; the rest stay random.
                 seed_config = previous[: max(1, ik_solver.config.num_seeds // 2)].unsqueeze(0)
             ik = ik_solver.solve_pose(
