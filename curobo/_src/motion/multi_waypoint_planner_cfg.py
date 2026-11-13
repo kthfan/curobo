@@ -60,7 +60,7 @@ class MultiWaypointMotionPlannerCfg:
     max_attempts: int = 4
 
     #: Number of IK solutions requested per waypoint (before de-duplication).
-    ik_return_seeds: int = 20
+    ik_return_seeds: int = 32
 
     #: Joint-space tolerance for de-duplicating IK solutions at a waypoint.
     #: Solutions closer than this (see ``ik_dedup.py``) are treated as
@@ -91,7 +91,7 @@ class MultiWaypointMotionPlannerCfg:
     #: Most IK solutions kept per waypoint for the edge trajectory optimizations: the ones on
     #: the shortest joint-space chains from the start state through all waypoints. ``None``
     #: keeps every solution.
-    max_layer_nodes: Optional[int] = 12
+    max_layer_nodes: Optional[int] = 8
 
     #: Count the way from the start state to the first waypoint's IK solution (as the time the
     #: joints need at their velocity limits) in the path search, so the trajectory starts at a
@@ -105,13 +105,13 @@ class MultiWaypointMotionPlannerCfg:
         segment_constraints: Optional[List[SegmentPlanCfg]] = None,
         *,
         max_attempts: int = 4,
-        ik_return_seeds: int = 20,
+        ik_return_seeds: int = 32,
         ik_dedup_joint_tol: float = 0.05,
         knn_edges: Optional[int] = None,
         max_edges_per_layer_pair: Optional[int] = None,
         waypoint_constraint_merge_mode: str = "max_weights_min_tols",
         expand_revolutions: bool = True,
-        max_layer_nodes: Optional[int] = 12,
+        max_layer_nodes: Optional[int] = 8,
         start_state_cost: bool = True,
         **motion_planner_kwargs: Any,
     ) -> "MultiWaypointMotionPlannerCfg":

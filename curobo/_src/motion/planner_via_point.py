@@ -533,9 +533,11 @@ class ViaPointMotionPlanner:
                 waypoints.quaternion[:, j : j + 1].contiguous(),
             )
             seed_config = None
-            if self.config.seed_ik_from_previous and not explore:
-                # Half of the seeds continue the previous solutions; the rest stay random.
-                seed_config = previous[: max(1, ik_solver.config.num_seeds // 2)].unsqueeze(0)
+            if self.config.seed_ik_from_previous and not explore and j > 0:
+                # The current state and a quarter of the seeds continue the previous
+                # waypoint's solutions; the rest stay random to find other IK branches.
+                continued = previous[: max(1, ik_solver.config.num_seeds // 4)]
+                seed_config = torch.cat((state.position.view(1, -1), continued)).unsqueeze(0)
             ik = ik_solver.solve_pose(
                 target, current_state=state, seed_config=seed_config, return_seeds=return_seeds
             )

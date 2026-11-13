@@ -63,32 +63,31 @@ ROBOTS = {
         "spread": [2.5, 0.5, 0.5, 1.0, 1.0, 3.0],
         "pan_joint": 0,
         "pillar_sweep": (0.45, 0.75),
-        "pillar_rise": 0.25,
     },
     "franka.yml": {
         "wrap_joints": [6, 0],
         "spread": [1.2, 0.4, 1.2, 0.4, 1.2, 0.6, 2.0],
         "pan_joint": 0,
         "pillar_sweep": (0.6, 0.9),
-        "pillar_rise": 0.0,
     },
 }
 
 #: ViaPointMotionPlanner settings compared: (expand_revolutions, seed_ik_from_previous,
-#: chain_length_slack, seed_bulge, ik_return_seeds). ``via_base`` is the planner before this
-#: study.
+#: chain_length_slack, seed_bulge, ik_return_seeds) and the number of IK seeds of the planner.
+#: ``via_base`` is the planner before this study.
 VIA_VARIANTS = {
-    "via_base": (False, False, None, 0.0, 16),
-    "via_short": (True, True, 0.1, 0.0, 16),
-    "via_bulge": (True, True, 0.1, 0.4, 16),
-    "via_ik32": (True, True, 0.1, 0.4, 32),
+    "via_base": ((False, False, None, 0.0, 16), 32),
+    "via_noprev": ((True, False, 0.1, 0.4, 32), 32),
+    "via_new": ((True, True, 0.1, 0.4, 32), 32),
+    "via_ik64": ((True, True, 0.1, 0.4, 64), 64),
 }
 
 #: MultiWaypointMotionPlanner settings compared:
-#: (expand_revolutions, max_layer_nodes, start_state_cost).
+#: (expand_revolutions, max_layer_nodes, start_state_cost, ik_return_seeds).
+#: ``multi_base`` is the planner before this study.
 MULTI_VARIANTS = {
-    "multi_base": (False, None, False),
-    "multi_new": (True, 8, True),
+    "multi_base": (False, None, False, 20),
+    "multi_new": (True, 8, True, 32),
 }
 
 
@@ -234,12 +233,33 @@ def pillar_problems(planner, q0, spec, count, generator) -> List[Dict]:
         middle = planner.compute_kinematics(
             JointState.from_position(q0.view(1, -1), joint_names=planner.joint_names)
         ).tool_poses.position.view(-1)[:3]
-        pillar = [float(middle[0]), float(middle[1]), float(middle[2]) + spec["pillar_rise"]]
+        # x, y and the height of the tool there; the pillar's top is set when it is placed.
+        pillar = [float(middle[0]), float(middle[1]), float(middle[2])]
         problems.append({"start": start, "configs": configs, "pillar": pillar})
     return problems
 
 
 # -- Reference IK --
+
+
+def reachable(planner: ViaPointMotionPlanner, waypoints: GoalToolPose, state: JointState) -> bool:
+    """Whether every waypoint has a collision-free IK solution in the planner's scene."""
+    ik_solver = planner._motion_planner.ik_solver
+    for j in range(waypoints.horizon):
+        target = GoalToolPose(
+            waypoints.tool_frames,
+            waypoints.position[:, j : j + 1].contiguous(),
+            waypoints.quaternion[:, j : j + 1].contiguous(),
+        )
+        found = False
+        for _ in range(3):
+            ik = ik_solver.solve_pose(
+                target, current_state=state, return_seeds=ik_solver.config.num_seeds
+            )
+            found = found or bool(ik.success.any())
+        if not found:
+            return False
+    return True
 
 
 def dense_ik_layers(
@@ -294,7 +314,7 @@ def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> D
         config.chain_length_slack,
         config.seed_bulge,
         config.ik_return_seeds,
-    ) = VIA_VARIANTS[variant]
+    ) = VIA_VARIANTS[variant][0]
     # The IK solver rebuilds its result graphs when the number of returned seeds changes;
     # keep that out of the planning time.
     planner.plan_waypoints(waypoints, state, max_attempts=1)
@@ -334,9 +354,12 @@ def run_multi(
     planner: MultiWaypointMotionPlanner, start_pose, waypoints, state, variant: str
 ) -> Dict:
     config = planner.config
-    config.expand_revolutions, config.max_layer_nodes, config.start_state_cost = MULTI_VARIANTS[
-        variant
-    ]
+    (
+        config.expand_revolutions,
+        config.max_layer_nodes,
+        config.start_state_cost,
+        config.ik_return_seeds,
+    ) = MULTI_VARIANTS[variant]
     targets = [start_pose.as_goal()] + [
         GoalToolPose(
             waypoints.tool_frames,
@@ -441,8 +464,13 @@ def main():
         collision_cache={"cuboid": 4},
         use_cuda_graph=True,
     )
-    via = ViaPointMotionPlanner(ViaPointMotionPlannerCfg.create(**common))
-    via.warmup()
+    via_planners = {}
+    for seeds in sorted({seeds for _, seeds in VIA_VARIANTS.values()}):
+        via_planners[seeds] = ViaPointMotionPlanner(
+            ViaPointMotionPlannerCfg.create(num_ik_seeds=seeds, **common)
+        )
+        via_planners[seeds].warmup()
+    via = via_planners[32]
     multi = None
     if args.multi_problems > 0:
         multi = MultiWaypointMotionPlanner(MultiWaypointMotionPlannerCfg.create(**common))
@@ -474,17 +502,23 @@ def main():
         rows = []
         for index, problem in enumerate(families[family]()):
             pillar = problem["pillar"]
-            if pillar is not None:
-                via.update_world(table_scene(pillar))
-                if multi is not None:
-                    multi.update_world(table_scene(pillar))
             start = problem["start"].to(device)
             state = JointState.from_position(start.view(1, -1), joint_names=via.joint_names)
             waypoints = make_waypoints(via, problem["configs"].to(device))
+            if pillar is not None:
+                # The tallest pillar that leaves every waypoint reachable.
+                for rise in (0.25, 0.1, 0.0, -0.1, -0.2):
+                    pillar = problem["pillar"][:2] + [problem["pillar"][2] + rise]
+                    via.update_world(table_scene(pillar))
+                    if reachable(via, waypoints, state):
+                        break
+                scene_planners = [p for p in via_planners.values() if p is not via]
+                for planner in scene_planners + ([multi] if multi is not None else []):
+                    planner.update_world(table_scene(pillar))
             row = {"index": index, "start": start, "pillar": pillar}
             extra = [[] for _ in range(waypoints.horizon)]
-            for name in VIA_VARIANTS:
-                row[name] = run_via(via, waypoints, state, name)
+            for name, (_, seeds) in VIA_VARIANTS.items():
+                row[name] = run_via(via_planners[seeds], waypoints, state, name)
             if multi is not None and index < args.multi_problems:
                 start_pose = via.compute_kinematics(state).tool_poses
                 for name in MULTI_VARIANTS:
@@ -496,9 +530,8 @@ def main():
                         extra[j].append(chain[j])
             layers = dense_ik_layers(via, waypoints, state, args.ik_rounds, extra)
             if pillar is not None:
-                via.update_world(table_scene())
-                if multi is not None:
-                    multi.update_world(table_scene())
+                for planner in list(via_planners.values()) + ([multi] if multi is not None else []):
+                    planner.update_world(table_scene())
             if layers is None:
                 print(f"{family} {index}: a waypoint has no IK solution, skipped")
                 continue
@@ -532,7 +565,8 @@ def main():
 
         with open(args.out, "w") as file:
             json.dump({"robot": args.robot, "families": plain(report)}, file)
-    via.destroy()
+    for planner in via_planners.values():
+        planner.destroy()
     if multi is not None:
         multi.destroy()
 

@@ -25,8 +25,9 @@ class ViaPointMotionPlannerCfg:
     #: Whole-plan retries; each one solves the waypoint IK again with new seeds.
     max_attempts: int = 3
 
-    #: IK solutions requested per waypoint, before de-duplication.
-    ik_return_seeds: int = 16
+    #: IK solutions requested per waypoint, before de-duplication; at most the IK solver's
+    #: seeds, of which only the successful ones are kept.
+    ik_return_seeds: int = 32
 
     #: Joint-space distance (weighted L-infinity, rad or m) under which two IK solutions of a
     #: waypoint count as one.
@@ -52,9 +53,9 @@ class ViaPointMotionPlannerCfg:
     #: reach a waypoint "the other way round" when that makes the whole path shorter.
     expand_revolutions: bool = True
 
-    #: Seed the IK of every waypoint with the IK solutions of the previous one (the current
-    #: state for the first), besides random seeds, so every IK branch found at a waypoint has
-    #: its nearest continuation at the next one.
+    #: Seed the IK of every waypoint with the current state and the IK solutions of the
+    #: previous waypoint, besides random seeds, so the IK branches found at a waypoint have
+    #: their nearest continuation at the next one.
     seed_ik_from_previous: bool = True
 
     #: The first attempt seeds the optimizer only with IK chains at most this fraction longer
@@ -66,7 +67,7 @@ class ViaPointMotionPlannerCfg:
     #: Largest joint-space offset (rad or m) at the middle of every segment for the seeds that
     #: repeat an IK chain, used when fewer chains than seeds are within ``chain_length_slack``.
     #: Zero repeats the chain's straight seed.
-    seed_bulge: float = 0.0
+    seed_bulge: float = 0.4
 
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
@@ -86,7 +87,7 @@ class ViaPointMotionPlannerCfg:
         robot: Any,
         *,
         max_attempts: int = 3,
-        ik_return_seeds: int = 16,
+        ik_return_seeds: int = 32,
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 8,
@@ -94,7 +95,7 @@ class ViaPointMotionPlannerCfg:
         expand_revolutions: bool = True,
         seed_ik_from_previous: bool = True,
         chain_length_slack: Optional[float] = 0.1,
-        seed_bulge: float = 0.0,
+        seed_bulge: float = 0.4,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
         **motion_planner_kwargs: Any,
