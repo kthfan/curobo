@@ -12,7 +12,6 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
-from curobo._src.motion.ik_chain import select_ik_chains
 from curobo._src.motion.planner_via_point import (
     ViaPointMotionPlanner,
     allocate_waypoint_indices,
@@ -76,16 +75,6 @@ def test_reference_passes_the_waypoints_at_their_indices():
     torch.testing.assert_close(position[8:], torch.tensor([[1.0, 2.0, 0.0]] * 3))
 
 
-def test_select_ik_chains_takes_the_shortest_joint_paths():
-    start = torch.zeros(1)
-    layers = [torch.tensor([[1.0], [-1.0]]), torch.tensor([[1.5], [-3.0], [0.9]])]
-    chains, cost, distinct = select_ik_chains(start, layers, num_chains=4)
-    # Ends sorted by path length: 0.9 (via 1.0, 1.1), 1.5 (1.5), -3.0 (via -1.0, 3.0).
-    expected = torch.tensor([[1.0, 0.9], [1.0, 1.5], [-1.0, -3.0], [1.0, 0.9]])
-    torch.testing.assert_close(chains[:, :, 0], expected)
-    torch.testing.assert_close(cost, torch.tensor([1.1, 1.5, 3.0, 1.1]))
-
-
 def test_knot_space_seeds_pass_the_chain_at_its_progress():
     start = torch.zeros(2)
     chains = torch.tensor([[[2.0, 0.0], [2.0, 4.0]]])
@@ -94,6 +83,18 @@ def test_knot_space_seeds_pass_the_chain_at_its_progress():
     torch.testing.assert_close(seeds[0, 0], start)
     torch.testing.assert_close(seeds[0, 3], torch.tensor([2.0, 0.0]))  # knot progress 0.6
     torch.testing.assert_close(seeds[0, -1], chains[0, -1])
+
+
+def test_knot_space_seeds_bulge_between_the_waypoints_only():
+    start = torch.zeros(2)
+    chains = torch.tensor([[[2.0, 0.0], [2.0, 4.0]]])
+    bulge = torch.tensor([[[0.0, 1.0], [0.5, 0.0]]])
+    straight = knot_space_seeds(start, chains, [5, 10], 0, 10, num_knots=5)
+    seeds = knot_space_seeds(start, chains, [5, 10], 0, 10, num_knots=5, bulge=bulge)
+    # Knots at progress 0, 0.25, 0.5, 0.75, 1: the waypoints are at 0.5 and 1.
+    torch.testing.assert_close(seeds[0, [0, 2, 4]], straight[0, [0, 2, 4]], atol=1e-6, rtol=0)
+    torch.testing.assert_close(seeds[0, 1] - straight[0, 1], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(seeds[0, 3] - straight[0, 3], torch.tensor([0.5, 0.0]))
 
 
 def test_segment_bounds_are_anchored_at_the_segment_ends():
@@ -257,3 +258,48 @@ def test_back_and_forth_path_reaches_every_waypoint(planner):
     result = planner.plan_waypoints(waypoints, start)
     assert result.success.item(), result.status
     assert result.waypoint_position_error.max() <= 0.005 + 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# Joints with more than one turn of range (UR10e)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def ur_planner():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    config = ViaPointMotionPlannerCfg.create(
+        robot="ur10e.yml", scene_model="collision_table.yml", use_cuda_graph=True
+    )
+    planner = ViaPointMotionPlanner(config)
+    planner.warmup(num_warmup_iterations=1)
+    yield planner
+    planner.destroy()
+
+
+@cuda
+def test_tool_roll_beyond_the_joint_limit_does_not_unwind(ur_planner):
+    """The tool rolls on by 90, 260 and 360 deg from wrist 3 at 0, but 360 deg is beyond the
+    joint limit. Turning on to 260 deg forces 260 deg back to 0 (520 deg in total); the planner
+    reaches the second waypoint the other way round, at -100 deg (380 deg in total)."""
+    planner = ur_planner
+    wrist = planner.joint_names.index("wrist_3_joint")
+    home = planner.default_joint_state.position.view(-1).clone()
+    home[wrist] = 0.0
+    start = JointState.from_position(home.view(1, -1), joint_names=planner.joint_names)
+    configs = home.repeat(3, 1)
+    configs[:, wrist] = torch.tensor([90.0, 260.0, 360.0], device=home.device) * math.pi / 180.0
+    poses = planner.compute_kinematics(
+        JointState.from_position(configs, joint_names=planner.joint_names)
+    ).tool_poses
+    waypoints = GoalToolPose(
+        planner.tool_frames,
+        poses.position.view(1, 3, 1, 1, 3).contiguous(),
+        poses.quaternion.view(1, 3, 1, 1, 4).contiguous(),
+    )
+    result = planner.plan_waypoints(waypoints, start)
+    assert result.success.item(), result.status
+    chain = torch.cat((home.view(1, -1), result.waypoint_configs))
+    length = float((chain[1:] - chain[:-1]).norm(dim=-1).sum())
+    assert length < 1.15 * math.radians(380.0)
