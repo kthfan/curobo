@@ -34,7 +34,13 @@ from curobo._src.cost.tool_pose_bound import (
     normalize_tool_pose_bounds,
 )
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import prune_ik_layers
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
+from curobo._src.motion.ik_revolution import (
+    dedup_joint_revolutions,
+    expand_joint_revolutions,
+    revolute_joint_mask,
+)
 from curobo._src.motion.motion_planner import MotionPlanner
 from curobo._src.motion.multi_waypoint_planner_cfg import MultiWaypointMotionPlannerCfg
 from curobo._src.motion.multi_waypoint_planner_result import MultiWaypointPlanResult
@@ -53,7 +59,9 @@ class MultiWaypointMotionPlanner:
 
     Layers correspond to the waypoints; segment ``s`` is the edge between
     waypoint ``s`` and waypoint ``s + 1``.  There are ``num_waypoints - 1``
-    segments.  The robot ``start_state`` is used as the IK seed.
+    segments.  The trajectory starts at an IK solution of the first waypoint; the robot
+    ``start_state`` seeds the IK and, with ``start_state_cost``, the path search prefers
+    solutions near it.
     """
 
     def __init__(self, config: MultiWaypointMotionPlannerCfg):
@@ -354,12 +362,21 @@ class MultiWaypointMotionPlanner:
 
     # -- Graph search --
 
-    def _shortest_path(self, layer_costs: List[torch.Tensor]) -> Optional[List[int]]:
+    def _shortest_path(
+        self, layer_costs: List[torch.Tensor], start_cost: Optional[torch.Tensor] = None
+    ) -> Optional[List[int]]:
         """Forward DP over the layered DAG; return one node index per layer.
+
+        Args:
+            layer_costs: Edge costs ``[Ms, Mt]`` of every segment.
+            start_cost: Cost ``[M0]`` of starting at every node of the first layer; zero when
+                ``None``.
 
         Returns ``None`` if no finite-cost path reaches the last layer.
         """
         dist = torch.zeros(layer_costs[0].shape[0], device=layer_costs[0].device)
+        if start_cost is not None:
+            dist = start_cost.to(dist)
         parents: List[torch.Tensor] = []
         for cost_matrix in layer_costs:
             total = dist.view(-1, 1) + cost_matrix  # [Ms, Mt]
@@ -467,7 +484,9 @@ class MultiWaypointMotionPlanner:
                     result.status = status
                     continue
 
-                path = self._shortest_path(layer_costs)
+                path = self._shortest_path(
+                    layer_costs, self._start_cost(start_state, ik_sets[0])
+                )
                 if path is None:
                     result.status = "No surviving path through waypoint layers."
                     continue
@@ -551,10 +570,28 @@ class MultiWaypointMotionPlanner:
                     f"No IK solution at waypoint {i} satisfies the tool pose bounds of its "
                     + "segments."
                 )
-            ik_sets.append(
-                dedup_joint_solutions(good, self.config.ik_dedup_joint_tol)
+            tol = self.config.ik_dedup_joint_tol
+            if self.config.expand_revolutions:
+                limits = self.kinematics.get_joint_limits().position
+                revolute = revolute_joint_mask(self.kinematics.kinematics_config)
+                good = dedup_joint_revolutions(good, tol, limits[0], limits[1], revolute)
+                ik_sets.append(expand_joint_revolutions(good, limits[0], limits[1], revolute))
+            else:
+                ik_sets.append(dedup_joint_solutions(good, tol))
+        if self.config.max_layer_nodes is not None:
+            ik_sets = prune_ik_layers(
+                start_state.position.view(-1), ik_sets, self.config.max_layer_nodes
             )
         return ik_sets, None
+
+    def _start_cost(
+        self, start_state: JointState, first_layer: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Time (s) the joints need from the start state to every first-waypoint solution."""
+        if not self.config.start_state_cost:
+            return None
+        velocity = self.kinematics.get_joint_limits().velocity[1]
+        return ((first_layer - start_state.position.view(1, -1)).abs() / velocity).amax(dim=-1)
 
     def _filter_by_segment_bounds(
         self,

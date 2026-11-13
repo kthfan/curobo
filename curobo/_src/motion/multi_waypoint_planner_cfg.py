@@ -82,6 +82,22 @@ class MultiWaypointMotionPlannerCfg:
     #: segments' constraints.
     waypoint_constraint_merge_mode: str = "max_weights_min_tols"
 
+    #: Add the full-turn variants of every IK solution (``q ± 2π`` on revolute joints whose
+    #: limits span more than one turn), so a waypoint can be reached "the other way round"
+    #: when that makes the whole path shorter. Use it with ``max_layer_nodes``: the variants
+    #: multiply the IK solutions of a waypoint.
+    expand_revolutions: bool = True
+
+    #: Most IK solutions kept per waypoint for the edge trajectory optimizations: the ones on
+    #: the shortest joint-space chains from the start state through all waypoints. ``None``
+    #: keeps every solution.
+    max_layer_nodes: Optional[int] = 12
+
+    #: Count the way from the start state to the first waypoint's IK solution (as the time the
+    #: joints need at their velocity limits) in the path search, so the trajectory starts at a
+    #: solution near the start state instead of at any solution of the first waypoint.
+    start_state_cost: bool = True
+
     @classmethod
     def create(
         cls,
@@ -94,6 +110,9 @@ class MultiWaypointMotionPlannerCfg:
         knn_edges: Optional[int] = None,
         max_edges_per_layer_pair: Optional[int] = None,
         waypoint_constraint_merge_mode: str = "max_weights_min_tols",
+        expand_revolutions: bool = True,
+        max_layer_nodes: Optional[int] = 12,
+        start_state_cost: bool = True,
         **motion_planner_kwargs: Any,
     ) -> "MultiWaypointMotionPlannerCfg":
         """Build a config from a robot spec and multi-waypoint parameters.
@@ -111,6 +130,9 @@ class MultiWaypointMotionPlannerCfg:
             knn_edges: Optional per-source nearest-neighbour edge cap.
             max_edges_per_layer_pair: Optional total edge cap per layer pair.
             waypoint_constraint_merge_mode: Shared-waypoint merge strategy.
+            expand_revolutions: Add the full-turn variants of the IK solutions.
+            max_layer_nodes: Most IK solutions kept per waypoint, ``None`` for all.
+            start_state_cost: Count the way from the start state in the path search.
             **motion_planner_kwargs: Forwarded to ``MotionPlannerCfg.create``.
 
         Returns:
@@ -126,4 +148,7 @@ class MultiWaypointMotionPlannerCfg:
             knn_edges=knn_edges,
             max_edges_per_layer_pair=max_edges_per_layer_pair,
             waypoint_constraint_merge_mode=waypoint_constraint_merge_mode,
+            expand_revolutions=expand_revolutions,
+            max_layer_nodes=max_layer_nodes,
+            start_state_cost=start_state_cost,
         )

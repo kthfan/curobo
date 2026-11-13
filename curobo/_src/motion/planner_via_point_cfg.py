@@ -57,6 +57,17 @@ class ViaPointMotionPlannerCfg:
     #: its nearest continuation at the next one.
     seed_ik_from_previous: bool = True
 
+    #: The first attempt seeds the optimizer only with IK chains at most this fraction longer
+    #: (in joint space) than the shortest chain, and returns the fastest trajectory among them.
+    #: ``None`` seeds the shortest chain to every IK solution of the last waypoint instead, as
+    #: retries do: the fastest trajectory then may take a much longer way in joint space.
+    chain_length_slack: Optional[float] = 0.1
+
+    #: Largest joint-space offset (rad or m) at the middle of every segment for the seeds that
+    #: repeat an IK chain, used when fewer chains than seeds are within ``chain_length_slack``.
+    #: Zero repeats the chain's straight seed.
+    seed_bulge: float = 0.0
+
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
             log_and_raise("max_attempts, ik_return_seeds and min_segment_intervals must be >= 1")
@@ -64,6 +75,10 @@ class ViaPointMotionPlannerCfg:
             log_and_raise("geometry_dt_scale must be positive")
         if self.ik_dedup_joint_tol < 0.0:
             log_and_raise("ik_dedup_joint_tol must be >= 0")
+        if self.chain_length_slack is not None and self.chain_length_slack < 0.0:
+            log_and_raise("chain_length_slack must be >= 0 or None")
+        if self.seed_bulge < 0.0:
+            log_and_raise("seed_bulge must be >= 0")
 
     @classmethod
     def create(
@@ -78,6 +93,8 @@ class ViaPointMotionPlannerCfg:
         geometry_dt_scale: float = 10.0,
         expand_revolutions: bool = True,
         seed_ik_from_previous: bool = True,
+        chain_length_slack: Optional[float] = 0.1,
+        seed_bulge: float = 0.0,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
         **motion_planner_kwargs: Any,
@@ -95,6 +112,9 @@ class ViaPointMotionPlannerCfg:
             expand_revolutions: Add the full-turn variants of the IK solutions.
             seed_ik_from_previous: Seed every waypoint's IK with the previous waypoint's
                 solutions.
+            chain_length_slack: Longest IK chain seeded on the first attempt, as a fraction
+                above the shortest chain; ``None`` for no limit.
+            seed_bulge: Largest mid-segment offset of the seeds that repeat a chain.
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
@@ -121,6 +141,8 @@ class ViaPointMotionPlannerCfg:
             geometry_dt_scale=geometry_dt_scale,
             expand_revolutions=expand_revolutions,
             seed_ik_from_previous=seed_ik_from_previous,
+            chain_length_slack=chain_length_slack,
+            seed_bulge=seed_bulge,
         )
 
 

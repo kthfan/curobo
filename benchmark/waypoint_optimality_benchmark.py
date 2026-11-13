@@ -61,19 +61,30 @@ ROBOTS = {
         "wrap_joints": [5, 0],
         "spread": [2.5, 0.5, 0.5, 1.0, 1.0, 3.0],
         "pan_joint": 0,
+        "pillar_sweep": (0.45, 0.75),
     },
     "franka.yml": {
         "wrap_joints": [6, 0],
         "spread": [1.2, 0.4, 1.2, 0.4, 1.2, 0.6, 2.0],
         "pan_joint": 0,
+        "pillar_sweep": (0.8, 1.1),
     },
 }
 
-#: ViaPointMotionPlanner settings compared: (expand_revolutions, seed_ik_from_previous).
+#: ViaPointMotionPlanner settings compared:
+#: (expand_revolutions, seed_ik_from_previous, chain_length_slack, seed_bulge).
 VIA_VARIANTS = {
-    "via_base": (False, False),
-    "via_rev": (True, False),
-    "via_full": (True, True),
+    "via_base": (False, False, None, 0.0),
+    "via_rev": (True, True, None, 0.0),
+    "via_short": (True, True, 0.1, 0.0),
+    "via_bulge": (True, True, 0.1, 0.4),
+}
+
+#: MultiWaypointMotionPlanner settings compared:
+#: (expand_revolutions, max_layer_nodes, start_state_cost).
+MULTI_VARIANTS = {
+    "multi_base": (False, None, False),
+    "multi_new": (True, 12, True),
 }
 
 
@@ -209,7 +220,8 @@ def pillar_problems(planner, q0, spec, count, generator) -> List[Dict]:
     pan = spec["pan_joint"]
     problems = []
     for _ in range(count):
-        half = float(0.45 + 0.3 * torch.rand(1, generator=generator))
+        low, high = spec["pillar_sweep"]
+        half = float(low + (high - low) * torch.rand(1, generator=generator))
         start = q0.clone()
         start[pan] = q0[pan] - half
         sides = torch.tensor([half, -half, half], device=q0.device)
@@ -254,8 +266,9 @@ def dense_ik_layers(
         )
         found = list(extra[j])
         for _ in range(rounds):
+            # The planner's own number of returned seeds, so its IK graphs are not rebuilt.
             ik = ik_solver.solve_pose(
-                target, current_state=state, return_seeds=ik_solver.config.num_seeds
+                target, current_state=state, return_seeds=planner.config.ik_return_seeds
             )
             found.append(ik.solution.reshape(-1, ik.solution.shape[-1])[ik.success.view(-1)])
         solutions = torch.cat([f.view(-1, lower.numel()) for f in found])
@@ -271,13 +284,20 @@ def dense_ik_layers(
 
 
 def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> Dict:
-    planner.config.expand_revolutions, planner.config.seed_ik_from_previous = VIA_VARIANTS[variant]
+    config = planner.config
+    (
+        config.expand_revolutions,
+        config.seed_ik_from_previous,
+        config.chain_length_slack,
+        config.seed_bulge,
+    ) = VIA_VARIANTS[variant]
     torch.cuda.synchronize()
     started = time.perf_counter()
     result = planner.plan_waypoints(waypoints, state)
     torch.cuda.synchronize()
     row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
     row["status"] = result.status
+    row["attempts"] = result.attempts
     if row["success"]:
         row["chain"] = result.waypoint_configs
         trajectory = result.get_interpolated_plan()
@@ -286,7 +306,13 @@ def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> D
     return row
 
 
-def run_multi(planner: MultiWaypointMotionPlanner, start_pose, waypoints, state) -> Dict:
+def run_multi(
+    planner: MultiWaypointMotionPlanner, start_pose, waypoints, state, variant: str
+) -> Dict:
+    config = planner.config
+    config.expand_revolutions, config.max_layer_nodes, config.start_state_cost = MULTI_VARIANTS[
+        variant
+    ]
     targets = [start_pose.as_goal()] + [
         GoalToolPose(
             waypoints.tool_frames,
@@ -329,6 +355,8 @@ def run_multi(planner: MultiWaypointMotionPlanner, start_pose, waypoints, state)
 
 def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
     print(f"\n== {family}: {len(rows)} paths ==")
+    if not rows:
+        return
     greedy = [r["greedy"]["l2"] / r["reference"]["l2"] for r in rows]
     print(
         f"{'greedy':>9}: chain/ref mean {sum(greedy) / len(greedy):.3f} max {max(greedy):.3f}, "
@@ -353,7 +381,7 @@ def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
                 f"motion {sum(r[name]['motion_time'] for r in ok) / len(ok):.2f} s, "
                 f"plan {1000 * sum(plan) / len(plan):.0f} ms"
             )
-            if name == "multi":
+            if name in MULTI_VARIANTS:
                 gap = [r[name]["start_gap"] for r in ok]
                 line += f", start gap mean {sum(gap) / len(gap):.2f} max {max(gap):.2f} rad"
         print(line)
@@ -364,7 +392,7 @@ def main():
     parser.add_argument("--robot", default="ur10e.yml", choices=sorted(ROBOTS))
     parser.add_argument("--num_problems", type=int, default=8, help="paths per family")
     parser.add_argument("--multi_problems", type=int, default=4, help="paths per family, multi")
-    parser.add_argument("--ik_rounds", type=int, default=20, help="reference IK calls per waypoint")
+    parser.add_argument("--ik_rounds", type=int, default=40, help="reference IK calls per waypoint")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--families", default="wrap_tool,wrap_pan,double_wrap,random_reach,pillar")
     parser.add_argument("--out", default=None, help="write the per-path results to this JSON")
@@ -404,7 +432,7 @@ def main():
         ),
         "pillar": lambda: pillar_problems(via, q0.to(device), spec, args.num_problems, generator),
     }
-    planners = list(VIA_VARIANTS) + ["multi"]
+    planners = list(VIA_VARIANTS) + list(MULTI_VARIANTS)
     report = {}
     for family in args.families.split(","):
         rows = []
@@ -423,7 +451,8 @@ def main():
                 row[name] = run_via(via, waypoints, state, name)
             if multi is not None and index < args.multi_problems:
                 start_pose = via.compute_kinematics(state).tool_poses
-                row["multi"] = run_multi(multi, start_pose, waypoints, state)
+                for name in MULTI_VARIANTS:
+                    row[name] = run_multi(multi, start_pose, waypoints, state, name)
             for name in planners:
                 if name in row and row[name]["success"]:
                     chain = row[name]["chain"][-waypoints.horizon :]

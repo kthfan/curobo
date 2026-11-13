@@ -12,13 +12,13 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import select_ik_chains
 from curobo._src.motion.planner_via_point import (
     ViaPointMotionPlanner,
     allocate_waypoint_indices,
     base_anchored_segment_bounds,
     interpolate_via_point_reference,
     knot_space_seeds,
-    select_ik_chains,
 )
 from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg
 from curobo._src.state.state_joint import JointState
@@ -79,7 +79,7 @@ def test_reference_passes_the_waypoints_at_their_indices():
 def test_select_ik_chains_takes_the_shortest_joint_paths():
     start = torch.zeros(1)
     layers = [torch.tensor([[1.0], [-1.0]]), torch.tensor([[1.5], [-3.0], [0.9]])]
-    chains, cost = select_ik_chains(start, layers, num_chains=4)
+    chains, cost, distinct = select_ik_chains(start, layers, num_chains=4)
     # Ends sorted by path length: 0.9 (via 1.0, 1.1), 1.5 (1.5), -3.0 (via -1.0, 3.0).
     expected = torch.tensor([[1.0, 0.9], [1.0, 1.5], [-1.0, -3.0], [1.0, 0.9]])
     torch.testing.assert_close(chains[:, :, 0], expected)

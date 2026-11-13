@@ -38,6 +38,7 @@ from curobo._src.cost.cost_eef_bound_eval import tool_pose_bounds_violation
 from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import ToolPoseBound, ToolPoseBoundAnchor
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import select_ik_chains
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
@@ -144,39 +145,6 @@ def interpolate_via_point_reference(
     )
 
 
-def select_ik_chains(
-    start: torch.Tensor, layers: Sequence[torch.Tensor], num_chains: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pick IK chains through the waypoint layers by shortest joint-space path.
-
-    Every chain is the shortest path from the start to one IK solution of the last waypoint;
-    the ``num_chains`` chains end on the solutions with the shortest paths, repeated when the
-    last waypoint has fewer solutions.
-
-    Args:
-        start: Start configuration ``[dof]``.
-        layers: IK solutions of every waypoint, ``[M_j, dof]`` each.
-        num_chains: Number of chains to return.
-
-    Returns:
-        Chains ``[num_chains, N, dof]`` and their joint-space path lengths ``[num_chains]``.
-    """
-    cost = (layers[0] - start).norm(dim=-1)
-    parents = []
-    for previous, layer in zip(layers[:-1], layers[1:]):
-        total = cost.unsqueeze(1) + torch.cdist(previous, layer)
-        cost, parent = total.min(dim=0)
-        parents.append(parent)
-    order = torch.argsort(cost)
-    picks = order[torch.arange(num_chains, device=order.device) % order.numel()]
-    nodes = [picks]
-    for parent in reversed(parents):
-        nodes.append(parent[nodes[-1]])
-    nodes.reverse()
-    chains = torch.stack([layer[index] for layer, index in zip(layers, nodes)], dim=1)
-    return chains, cost[picks]
-
-
 def knot_space_seeds(
     start: torch.Tensor,
     chains: torch.Tensor,
@@ -184,6 +152,7 @@ def knot_space_seeds(
     padding: int,
     intervals: int,
     num_knots: int,
+    bulge: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Spline control seeds that follow each IK chain at its waypoints' reference progress.
 
@@ -194,6 +163,8 @@ def knot_space_seeds(
         padding: Native index of the start sample.
         intervals: Native reference intervals.
         num_knots: Number of spline controls.
+        bulge: Joint-space offset ``[S, N, dof]`` of every seed at the middle of every segment.
+            It fades to zero at the segment's ends, so the seed still passes the chain.
 
     Returns:
         Seeds ``[S, num_knots, dof]``; the last control is the chain's last configuration.
@@ -209,7 +180,10 @@ def knot_space_seeds(
     segment = (torch.searchsorted(progress, knots, right=True) - 1).clamp(0, n - 1)
     t = ((knots - progress[segment]) / (progress[segment + 1] - progress[segment])).clamp(0, 1)
     t = t.view(1, num_knots, 1)
-    return (1 - t) * configs[:, segment] + t * configs[:, segment + 1]
+    knot_seeds = (1 - t) * configs[:, segment] + t * configs[:, segment + 1]
+    if bulge is not None:
+        knot_seeds = knot_seeds + torch.sin(math.pi * t) * bulge[:, segment]
+    return knot_seeds
 
 
 def base_anchored_segment_bounds(
@@ -468,6 +442,9 @@ class ViaPointMotionPlanner:
                     tolerance,
                     finetune_attempts,
                     initial_iters,
+                    # The first attempt follows the shortest IK chains only; retries also try
+                    # longer chains that end on other IK solutions.
+                    self.config.chain_length_slack if attempt == 0 else None,
                 )
                 indices, trajopt_result = trajopt
                 result.waypoint_indices = indices
@@ -608,13 +585,16 @@ class ViaPointMotionPlanner:
         tolerance: Tuple[float, float],
         finetune_attempts: int,
         initial_iters: int,
+        length_slack: Optional[float],
     ):
         """Seed and run one trajectory optimization through the IK layers."""
         planner = self._motion_planner
         solver = planner.trajopt_solver
         layout = planner.config.spline_layout
+        lower, upper = self._position_limits
         start = state.position[0]
-        chains, _ = select_ik_chains(start, layers, solver.config.num_seeds)
+        num_seeds = solver.config.num_seeds
+        chains, _, distinct = select_ik_chains(start, layers, num_seeds, length_slack)
         best = torch.cat((start.unsqueeze(0), chains[0]), dim=0)
         distances = (best[1:] - best[:-1]).norm(dim=-1).tolist()
         indices = allocate_waypoint_indices(
@@ -636,7 +616,9 @@ class ViaPointMotionPlanner:
             layout.padding,
             layout.reference_intervals,
             solver.action_horizon,
+            self._seed_bulge(chains, distinct),
         )
+        seed_traj = torch.maximum(torch.minimum(seed_traj, upper), lower)
         result = solver.solve_pose(
             reference,
             state,
@@ -652,6 +634,25 @@ class ViaPointMotionPlanner:
             track_orientation=True,
         )
         return indices, result
+
+    def _seed_bulge(self, chains: torch.Tensor, distinct: int) -> Optional[torch.Tensor]:
+        """Mid-segment offsets ``[S, N, dof]`` for the seeds that repeat a chain.
+
+        When fewer distinct chains than seeds are near the shortest, the chains repeat. Each
+        repeat bends every segment in a fixed pseudo-random joint-space direction, more for
+        later repeats, so the seeds try different ways around obstacles between the same IK
+        solutions.
+        """
+        seeds, n, dof = chains.shape
+        scale = self.config.seed_bulge
+        if scale <= 0.0 or distinct >= seeds:
+            return None
+        generator = torch.Generator().manual_seed(0)
+        direction = torch.randn(seeds, n, dof, generator=generator)
+        direction = direction / direction.norm(dim=-1, keepdim=True)
+        repeat = torch.arange(seeds) // distinct
+        amplitude = scale * repeat / repeat.max()
+        return (direction * amplitude.view(seeds, 1, 1)).to(chains)
 
     def _attach_waypoint_errors(self, result: ViaPointPlanResult, waypoints: GoalToolPose) -> None:
         """Record the configurations and pose errors of the trajectory at the waypoints."""

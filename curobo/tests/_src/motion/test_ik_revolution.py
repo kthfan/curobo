@@ -9,7 +9,7 @@ import math
 import torch
 
 from curobo._src.motion.ik_revolution import dedup_joint_revolutions, expand_joint_revolutions
-from curobo._src.motion.planner_via_point import select_ik_chains
+from curobo._src.motion.ik_chain import select_ik_chains
 
 TURN = 2.0 * math.pi
 DEG = math.pi / 180.0
@@ -83,7 +83,7 @@ def test_chain_through_variants_avoids_unwinding_at_a_limit():
         )
         for angle in (90.0, 260.0, 0.0)
     ]
-    chains, cost = select_ik_chains(start, layers, 1)
+    chains, cost, _ = select_ik_chains(start, layers, 1)
     assert torch.allclose(chains[0, :, 0], torch.tensor([90.0, -100.0, 0.0]) * DEG, atol=1e-4)
     assert abs(float(cost[0]) - 380.0 * DEG) < 1e-4
 
