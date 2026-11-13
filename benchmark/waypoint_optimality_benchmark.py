@@ -38,6 +38,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from curobo._src.motion.ik_chain import select_ik_chains
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
     expand_joint_revolutions,
@@ -62,29 +63,32 @@ ROBOTS = {
         "spread": [2.5, 0.5, 0.5, 1.0, 1.0, 3.0],
         "pan_joint": 0,
         "pillar_sweep": (0.45, 0.75),
+        "pillar_rise": 0.25,
     },
     "franka.yml": {
         "wrap_joints": [6, 0],
         "spread": [1.2, 0.4, 1.2, 0.4, 1.2, 0.6, 2.0],
         "pan_joint": 0,
-        "pillar_sweep": (0.8, 1.1),
+        "pillar_sweep": (0.6, 0.9),
+        "pillar_rise": 0.0,
     },
 }
 
-#: ViaPointMotionPlanner settings compared:
-#: (expand_revolutions, seed_ik_from_previous, chain_length_slack, seed_bulge).
+#: ViaPointMotionPlanner settings compared: (expand_revolutions, seed_ik_from_previous,
+#: chain_length_slack, seed_bulge, ik_return_seeds). ``via_base`` is the planner before this
+#: study.
 VIA_VARIANTS = {
-    "via_base": (False, False, None, 0.0),
-    "via_rev": (True, True, None, 0.0),
-    "via_short": (True, True, 0.1, 0.0),
-    "via_bulge": (True, True, 0.1, 0.4),
+    "via_base": (False, False, None, 0.0, 16),
+    "via_short": (True, True, 0.1, 0.0, 16),
+    "via_bulge": (True, True, 0.1, 0.4, 16),
+    "via_ik32": (True, True, 0.1, 0.4, 32),
 }
 
 #: MultiWaypointMotionPlanner settings compared:
 #: (expand_revolutions, max_layer_nodes, start_state_cost).
 MULTI_VARIANTS = {
     "multi_base": (False, None, False),
-    "multi_new": (True, 12, True),
+    "multi_new": (True, 8, True),
 }
 
 
@@ -230,7 +234,7 @@ def pillar_problems(planner, q0, spec, count, generator) -> List[Dict]:
         middle = planner.compute_kinematics(
             JointState.from_position(q0.view(1, -1), joint_names=planner.joint_names)
         ).tool_poses.position.view(-1)[:3]
-        pillar = [float(middle[0]), float(middle[1]), float(middle[2]) + 0.25]
+        pillar = [float(middle[0]), float(middle[1]), float(middle[2]) + spec["pillar_rise"]]
         problems.append({"start": start, "configs": configs, "pillar": pillar})
     return problems
 
@@ -266,9 +270,8 @@ def dense_ik_layers(
         )
         found = list(extra[j])
         for _ in range(rounds):
-            # The planner's own number of returned seeds, so its IK graphs are not rebuilt.
             ik = ik_solver.solve_pose(
-                target, current_state=state, return_seeds=planner.config.ik_return_seeds
+                target, current_state=state, return_seeds=ik_solver.config.num_seeds
             )
             found.append(ik.solution.reshape(-1, ik.solution.shape[-1])[ik.success.view(-1)])
         solutions = torch.cat([f.view(-1, lower.numel()) for f in found])
@@ -290,14 +293,35 @@ def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> D
         config.seed_ik_from_previous,
         config.chain_length_slack,
         config.seed_bulge,
+        config.ik_return_seeds,
     ) = VIA_VARIANTS[variant]
+    # The IK solver rebuilds its result graphs when the number of returned seeds changes;
+    # keep that out of the planning time.
+    planner.plan_waypoints(waypoints, state, max_attempts=1)
+
+    # Record, per attempt, the shortest chain through the planner's own IK solutions and how
+    # many distinct chains it seeds.
+    attempts = []
+    plan_through = planner._plan_through
+
+    def record(*args):
+        layers, slack = args[3], args[-1]
+        seeds = planner._motion_planner.trajopt_solver.config.num_seeds
+        _, cost, distinct = select_ik_chains(state.position[0], layers, seeds, slack)
+        attempts.append({"shortest": float(cost[0]), "distinct": distinct})
+        return plan_through(*args)
+
+    planner._plan_through = record
     torch.cuda.synchronize()
     started = time.perf_counter()
-    result = planner.plan_waypoints(waypoints, state)
+    try:
+        result = planner.plan_waypoints(waypoints, state)
+    finally:
+        planner._plan_through = plan_through
     torch.cuda.synchronize()
     row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
     row["status"] = result.status
-    row["attempts"] = result.attempts
+    row["attempts"] = attempts
     if row["success"]:
         row["chain"] = result.waypoint_configs
         trajectory = result.get_interpolated_plan()
@@ -381,6 +405,18 @@ def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
                 f"motion {sum(r[name]['motion_time'] for r in ok) / len(ok):.2f} s, "
                 f"plan {1000 * sum(plan) / len(plan):.0f} ms"
             )
+            if name in VIA_VARIANTS:
+                first = [r[name]["attempts"][0] for r in ran if r[name]["attempts"]]
+                cover = [
+                    r[name]["attempts"][0]["shortest"] / r["reference"]["l2"]
+                    for r in ran
+                    if r[name]["attempts"]
+                ]
+                line += (
+                    f", own IK shortest/ref {sum(cover) / len(cover):.3f} max {max(cover):.3f}, "
+                    f"chains seeded {sum(a['distinct'] for a in first) / len(first):.1f}, "
+                    f"attempts {sum(len(r[name]['attempts']) for r in ran) / len(ran):.2f}"
+                )
             if name in MULTI_VARIANTS:
                 gap = [r[name]["start_gap"] for r in ok]
                 line += f", start gap mean {sum(gap) / len(gap):.2f} max {max(gap):.2f} rad"
@@ -391,7 +427,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--robot", default="ur10e.yml", choices=sorted(ROBOTS))
     parser.add_argument("--num_problems", type=int, default=8, help="paths per family")
-    parser.add_argument("--multi_problems", type=int, default=4, help="paths per family, multi")
+    parser.add_argument("--multi_problems", type=int, default=8, help="paths per family, multi")
     parser.add_argument("--ik_rounds", type=int, default=40, help="reference IK calls per waypoint")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--families", default="wrap_tool,wrap_pan,double_wrap,random_reach,pillar")
