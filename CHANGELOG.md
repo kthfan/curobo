@@ -47,6 +47,18 @@
   path with one trajectory optimization, so the robot does not stop at the
   intermediate waypoints. The tool pose and tool pose bound costs gain optional
   per-segment criteria for it; without them they behave as before.
+- Choose globally shortest IK chains in the waypoint planners. Both planners add the
+  full-turn variants (`q ± 2π`) of IK solutions for joints whose limits span more
+  than one turn (`expand_revolutions`), so a joint is not turned into its limit at
+  one waypoint and unwound at the next. `ViaPointMotionPlanner` seeds only IK chains
+  near the shortest one on the first attempt (`chain_length_slack`), bends repeated
+  seeds (`seed_bulge`) and seeds each waypoint's IK from the previous one
+  (`seed_ik_from_previous`). `MultiWaypointMotionPlanner` keeps the IK solutions on
+  the shortest joint-space chains (`max_layer_nodes`, default 8) and counts the way
+  from the start state to the first waypoint's solution (`start_state_cost`); its
+  `ik_return_seeds` default is now 32. `benchmark/waypoint_optimality_benchmark.py`
+  compares both planners with a dense-IK reference on paths that punish a planner
+  that only looks one waypoint ahead.
 - Add `ToolPoseBound.anchored_at_base`, which turns a goal- or start-anchored bound
   into the equivalent base-anchored bound for a known anchor pose.
 - Add `MultiWaypointMotionPlanner` in `curobo.multi_waypoint_planner`, which

@@ -90,6 +90,25 @@ A `"goal"` anchor is the segment's waypoint, and a `"start"` anchor is the previ
 its two segments are discarded, so a bound no solution satisfies fails before the trajectory
 optimization with the status `No IK solution at waypoint k satisfies its segments' bounds.`
 
+## Keep the joint-space path short
+
+The planner chooses the IK solutions of all waypoints together, so it does not turn a joint
+into its limit at one waypoint and unwind it at the next. Three settings of
+`ViaPointMotionPlannerCfg.create` control this:
+
+- `expand_revolutions` (default `True`) lets joints with more than one turn of range, such as
+  those of a UR arm, reach a waypoint at `q ± 2π`.
+- `chain_length_slack` (default `0.1`) limits the first attempt to IK chains at most 10 %
+  longer than the shortest one; the fastest trajectory among them is returned. `None` returns
+  the fastest trajectory over more varied chains, which can take a much longer way in joint
+  space, for example through another arm configuration.
+- `seed_bulge` (default `0.4` rad) bends the seeds that repeat a chain. Raise it in cluttered
+  scenes; zero repeats the straight seed.
+
+`result.attempts` above one means no trajectory was found along the shortest chains and the
+planner fell back to exploring longer ones. Compare `result.waypoint_configs` with the start
+state to see which IK solutions the trajectory passes.
+
 ## Diagnose a failed plan
 
 `result.status` names the stage that failed:
