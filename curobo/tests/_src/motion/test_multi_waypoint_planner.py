@@ -456,16 +456,20 @@ class TestShortestPath:
         assert planner._shortest_path([cost0], torch.tensor([2.0, 0.0])) == [1, 1]
         assert planner._shortest_path([cost0], torch.tensor([0.0, 2.0])) == [0, 0]
 
-    def test_start_cost_is_the_time_at_the_velocity_limits(self):
+    def test_start_cost_is_the_rest_to_rest_time_of_the_slowest_joint(self):
         planner = _stub_planner(start_state_cost=True)
-        limits = SimpleNamespace(velocity=torch.tensor([[-2.0, -1.0], [2.0, 1.0]]))
+        limits = SimpleNamespace(
+            velocity=torch.tensor([[-2.0, -1.0], [2.0, 1.0]]),
+            acceleration=torch.tensor([[-4.0, -1.0], [4.0, 1.0]]),
+        )
         planner.motion_planner = SimpleNamespace(
             kinematics=SimpleNamespace(get_joint_limits=lambda: limits)
         )
         start = SimpleNamespace(position=torch.tensor([[0.0, 0.0]]))
-        first_layer = torch.tensor([[0.0, 0.0], [4.0, 1.0], [1.0, -3.0]])
+        first_layer = torch.tensor([[0.0, 0.0], [4.0, 1.0], [1.0, -3.0], [0.25, 0.0]])
         cost = planner._start_cost(start, first_layer)
-        torch.testing.assert_close(cost, torch.tensor([0.0, 2.0, 3.0]))
+        # Cruise: distance / v + v / a; the last row is too short to reach the velocity limit.
+        torch.testing.assert_close(cost, torch.tensor([0.0, 2.5, 4.0, 0.5]))
         planner.config.start_state_cost = False
         assert planner._start_cost(start, first_layer) is None
 

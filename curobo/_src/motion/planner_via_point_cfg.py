@@ -27,7 +27,7 @@ class ViaPointMotionPlannerCfg:
 
     #: IK solutions requested per waypoint, before de-duplication; at most the IK solver's
     #: seeds, of which only the successful ones are kept.
-    ik_return_seeds: int = 32
+    ik_return_seeds: int = 64
 
     #: Joint-space distance (weighted L-infinity, rad or m) under which two IK solutions of a
     #: waypoint count as one.
@@ -87,7 +87,7 @@ class ViaPointMotionPlannerCfg:
         robot: Any,
         *,
         max_attempts: int = 3,
-        ik_return_seeds: int = 32,
+        ik_return_seeds: int = 64,
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 8,
@@ -98,6 +98,7 @@ class ViaPointMotionPlannerCfg:
         seed_bulge: float = 0.4,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
+        num_ik_seeds: int = 64,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
         """Build a configuration from a robot and via-point planning parameters.
@@ -119,10 +120,12 @@ class ViaPointMotionPlannerCfg:
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
-            num_trajopt_seeds: Trajectory optimization seeds, one per IK chain. More chains
-                cover more IK branches of the waypoints.
+            num_trajopt_seeds: Trajectory optimization seeds, one per IK chain.
+            num_ik_seeds: IK seeds per waypoint. More seeds find more of a waypoint's IK
+                solutions, so the shortest chain through them is closer to the shortest
+                possible one.
             **motion_planner_kwargs: Forwarded to :meth:`MotionPlannerCfg.create`, for example
-                ``scene_model`` or ``num_trajopt_seeds``.
+                ``scene_model``.
 
         Returns:
             The configuration.
@@ -132,6 +135,7 @@ class ViaPointMotionPlannerCfg:
                 robot,
                 num_knots=num_knots,
                 num_trajopt_seeds=num_trajopt_seeds,
+                num_ik_seeds=num_ik_seeds,
                 **motion_planner_kwargs,
             ),
             max_attempts=max_attempts,

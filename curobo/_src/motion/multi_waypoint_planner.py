@@ -587,11 +587,22 @@ class MultiWaypointMotionPlanner:
     def _start_cost(
         self, start_state: JointState, first_layer: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        """Time (s) the joints need from the start state to every first-waypoint solution."""
+        """Time (s) of a rest-to-rest move from the start state to every first-waypoint solution.
+
+        Every joint moves at its velocity and acceleration limits; the slowest joint sets the
+        time. Obstacles are not considered.
+        """
         if not self.config.start_state_cost:
             return None
-        velocity = self.kinematics.get_joint_limits().velocity[1]
-        return ((first_layer - start_state.position.view(1, -1)).abs() / velocity).amax(dim=-1)
+        limits = self.kinematics.get_joint_limits()
+        velocity, acceleration = limits.velocity[1], limits.acceleration[1]
+        distance = (first_layer - start_state.position.view(1, -1)).abs()
+        duration = torch.where(
+            distance >= velocity * velocity / acceleration,
+            distance / velocity + velocity / acceleration,
+            2.0 * torch.sqrt(distance / acceleration),
+        )
+        return duration.amax(dim=-1)
 
     def _filter_by_segment_bounds(
         self,

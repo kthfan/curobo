@@ -93,9 +93,10 @@ class MultiWaypointMotionPlannerCfg:
     #: keeps every solution.
     max_layer_nodes: Optional[int] = 8
 
-    #: Count the way from the start state to the first waypoint's IK solution (as the time the
-    #: joints need at their velocity limits) in the path search, so the trajectory starts at a
-    #: solution near the start state instead of at any solution of the first waypoint.
+    #: Count the way from the start state to the first waypoint's IK solution (as the time of a
+    #: rest-to-rest move at the joint velocity and acceleration limits) in the path search, so
+    #: the trajectory starts at a solution near the start state instead of at any solution of
+    #: the first waypoint.
     start_state_cost: bool = True
 
     @classmethod

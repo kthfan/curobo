@@ -127,7 +127,6 @@ def planner():
     config = ViaPointMotionPlannerCfg.create(
         robot="franka.yml",
         scene_model="collision_table.yml",
-        num_ik_seeds=32,
         use_cuda_graph=True,
     )
     planner = ViaPointMotionPlanner(config)
