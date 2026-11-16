@@ -11,4 +11,5 @@ Optimization & Planning
 
    multi_waypoint_planner
    via_point_planner
+   waypoint_path_optimality
    mesh_collision
