@@ -55,6 +55,26 @@ def revolute_joint_mask(kinematics_config: KinematicsParams) -> torch.Tensor:
     return mask
 
 
+def prefer_within_limits(
+    solutions: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor
+) -> torch.Tensor:
+    """Drop the configurations outside the limits, unless none would remain.
+
+    Used with limits that leave a margin to the joint limits: a trajectory optimizer keeps
+    away from the joint limits, so it cannot pass an IK solution that lies right at one.
+
+    Args:
+        solutions: Joint configurations ``[N, dof]``.
+        lower: Lower limits ``[dof]``.
+        upper: Upper limits ``[dof]``.
+
+    Returns:
+        The configurations within the limits, or all of them when none is.
+    """
+    inside = ((solutions >= lower) & (solutions <= upper)).all(dim=-1)
+    return solutions[inside] if bool(inside.any()) else solutions
+
+
 def dedup_joint_revolutions(
     solutions: torch.Tensor,
     tol: float,

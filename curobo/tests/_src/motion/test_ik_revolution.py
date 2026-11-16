@@ -8,7 +8,11 @@ import math
 
 import torch
 
-from curobo._src.motion.ik_revolution import dedup_joint_revolutions, expand_joint_revolutions
+from curobo._src.motion.ik_revolution import (
+    dedup_joint_revolutions,
+    expand_joint_revolutions,
+    prefer_within_limits,
+)
 from curobo._src.motion.ik_chain import select_ik_chains
 
 TURN = 2.0 * math.pi
@@ -64,6 +68,16 @@ def test_dedup_measures_distance_around_the_circle():
     cut = float(LOWER[0])
     solutions = torch.tensor([[cut + 0.01, 0.0, 0.0], [cut + TURN - 0.01, 0.0, 0.0]])
     assert dedup_joint_revolutions(solutions, 0.05, LOWER, UPPER, REVOLUTE).shape[0] == 1
+
+
+def test_solutions_at_a_limit_are_dropped_when_others_remain():
+    solutions = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.95, 0.0], [0.5, 0.5, 0.5]])
+    lower, upper = LOWER + 0.1, UPPER - 0.1
+    kept = prefer_within_limits(solutions, lower, upper)
+    assert torch.equal(kept, solutions[[0, 2]])
+    # A waypoint that is only reachable at a limit keeps its solutions.
+    at_limit = solutions[1:2]
+    assert torch.equal(prefer_within_limits(at_limit, lower, upper), at_limit)
 
 
 def test_chain_through_variants_avoids_unwinding_at_a_limit():

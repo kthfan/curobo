@@ -43,6 +43,7 @@ from curobo._src.motion.ik_dedup import dedup_joint_solutions
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
     expand_joint_revolutions,
+    prefer_within_limits,
     revolute_joint_mask,
 )
 from curobo._src.motion.motion_planner import (
@@ -287,8 +288,7 @@ class ViaPointMotionPlanner:
             for frame in self.tool_frames
         }
         kinematics = self._motion_planner.kinematics
-        limits = kinematics.get_joint_limits().position
-        self._position_limits = (limits[0].clone(), limits[1].clone())
+        self._joint_limits = kinematics.get_joint_limits().position.clone()
         self._revolute_joints = revolute_joint_mask(kinematics.kinematics_config)
 
     # -- Lifecycle --
@@ -326,6 +326,13 @@ class ViaPointMotionPlanner:
     def default_joint_state(self) -> JointState:
         """Default joint state of the robot."""
         return self._motion_planner.default_joint_state
+
+    @property
+    def _position_limits(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Joint position limits ``[dof]`` (lower, upper) with the configured margin."""
+        lower, upper = self._joint_limits[0], self._joint_limits[1]
+        margin = self.config.joint_limit_margin * (upper - lower)
+        return lower + margin, upper - margin
 
     @property
     def max_waypoints(self) -> int:
@@ -548,6 +555,7 @@ class ViaPointMotionPlanner:
             solutions = self._filter_by_bounds(solutions, bounds)
             if solutions.shape[0] == 0:
                 return None, f"No IK solution at waypoint {j} satisfies its segments' bounds."
+            solutions = prefer_within_limits(solutions, lower, upper)
             tol = self.config.ik_dedup_joint_tol
             if self.config.expand_revolutions:
                 previous = dedup_joint_revolutions(
@@ -605,7 +613,15 @@ class ViaPointMotionPlanner:
         lower, upper = self._position_limits
         start = state.position[0]
         num_seeds = solver.config.num_seeds
-        chains, _, distinct = select_ik_chains(start, layers, num_seeds, length_slack)
+        if length_slack is None:
+            chains, _, distinct = select_ik_chains(start, layers, num_seeds)
+        else:
+            # At most half as many chains as seeds: every chain gets a straight seed and at
+            # least one bent seed.
+            chains, _, distinct = select_ik_chains(
+                start, layers, max(1, num_seeds // 2), length_slack
+            )
+            chains = chains[torch.arange(num_seeds, device=chains.device) % distinct]
         best = torch.cat((start.unsqueeze(0), chains[0]), dim=0)
         distances = (best[1:] - best[:-1]).norm(dim=-1).tolist()
         indices = allocate_waypoint_indices(

@@ -65,9 +65,16 @@ class ViaPointMotionPlannerCfg:
     chain_length_slack: Optional[float] = 0.1
 
     #: Largest joint-space offset (rad or m) at the middle of every segment for the seeds that
-    #: repeat an IK chain, used when fewer chains than seeds are within ``chain_length_slack``.
-    #: Zero repeats the chain's straight seed.
+    #: repeat an IK chain. The first attempt seeds at most half as many chains as seeds, so every
+    #: chain has a straight seed and at least one bent one: the optimizer can cut the corner at
+    #: a waypoint from a straight seed and pass it from a bent one. Zero repeats the straight
+    #: seed.
     seed_bulge: float = 0.4
+
+    #: Fraction of every joint's range that IK solutions keep from the joint limits, when a
+    #: waypoint has other solutions. It matches the range in which the trajectory optimizer's
+    #: joint limit cost is active: the optimizer does not reach a solution closer to a limit.
+    joint_limit_margin: float = 0.01
 
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
@@ -80,6 +87,8 @@ class ViaPointMotionPlannerCfg:
             log_and_raise("chain_length_slack must be >= 0 or None")
         if self.seed_bulge < 0.0:
             log_and_raise("seed_bulge must be >= 0")
+        if not 0.0 <= self.joint_limit_margin < 0.5:
+            log_and_raise("joint_limit_margin must be in [0, 0.5)")
 
     @classmethod
     def create(
@@ -96,6 +105,7 @@ class ViaPointMotionPlannerCfg:
         seed_ik_from_previous: bool = True,
         chain_length_slack: Optional[float] = 0.1,
         seed_bulge: float = 0.4,
+        joint_limit_margin: float = 0.01,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
         num_ik_seeds: int = 64,
@@ -117,6 +127,7 @@ class ViaPointMotionPlannerCfg:
             chain_length_slack: Longest IK chain seeded on the first attempt, as a fraction
                 above the shortest chain; ``None`` for no limit.
             seed_bulge: Largest mid-segment offset of the seeds that repeat a chain.
+            joint_limit_margin: Fraction of every joint's range kept from the joint limits.
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
@@ -148,6 +159,7 @@ class ViaPointMotionPlannerCfg:
             seed_ik_from_previous=seed_ik_from_previous,
             chain_length_slack=chain_length_slack,
             seed_bulge=seed_bulge,
+            joint_limit_margin=joint_limit_margin,
         )
 
 
