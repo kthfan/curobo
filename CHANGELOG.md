@@ -52,8 +52,9 @@
   than one turn (`expand_revolutions`), so a joint is not turned into its limit at
   one waypoint and unwound at the next. `ViaPointMotionPlanner` seeds only IK chains
   near the shortest one on the first attempt (`chain_length_slack`), bends repeated
-  seeds (`seed_bulge`) and seeds each waypoint's IK from the previous one
-  (`seed_ik_from_previous`). `MultiWaypointMotionPlanner` keeps the IK solutions on
+  seeds (`seed_bulge`), seeds each waypoint's IK from the previous one
+  (`seed_ik_from_previous`), drops IK solutions at the joint limits
+  (`joint_limit_margin`) and uses 64 IK seeds by default. `MultiWaypointMotionPlanner` keeps the IK solutions on
   the shortest joint-space chains (`max_layer_nodes`, default 8) and counts the way
   from the start state to the first waypoint's solution (`start_state_cost`); its
   `ik_return_seeds` default is now 32. `benchmark/waypoint_optimality_benchmark.py`

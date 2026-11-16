@@ -104,6 +104,8 @@ into its limit at one waypoint and unwind it at the next. Three settings of
   space, for example through another arm configuration.
 - `seed_bulge` (default `0.4` rad) bends the seeds that repeat a chain. Raise it in cluttered
   scenes; zero repeats the straight seed.
+- `num_ik_seeds` (default `64`) sets how many IK solutions of a waypoint the planner can find.
+  With fewer seeds it plans a few milliseconds faster and misses the shortest chain more often.
 
 `result.attempts` above one means no trajectory was found along the shortest chains and the
 planner fell back to exploring longer ones. Compare `result.waypoint_configs` with the start

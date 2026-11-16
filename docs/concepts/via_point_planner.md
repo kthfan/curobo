@@ -53,10 +53,11 @@ the chain 0°, 90°, -100°, 0° takes 380°.
 
 **Chains near the shortest.** Dynamic programming over the layers gives the shortest chain
 through every IK solution. The first attempt seeds only chains at most `chain_length_slack`
-(10 %) longer than the shortest one, and returns the fastest trajectory among them. When fewer
-such chains exist than seeds, the chains repeat; every repeat bends the seed between the
-waypoints by up to `seed_bulge`, which gives the optimizer different starts around obstacles
-and corners for the same IK solutions.
+(10 %) longer than the shortest one, and returns the fastest trajectory among them. It uses at
+most half as many chains as seeds, so every chain has a straight seed and at least one seed
+that is bent between the waypoints by up to `seed_bulge`. From a straight seed the optimizer
+sometimes cuts the corner at a waypoint and misses its tolerance; the bent seeds pass it, and
+they give different starts around obstacles for the same IK solutions.
 
 **Retries explore.** If no seed of the first attempt gives a valid trajectory, the retries
 solve IK from random seeds only and seed the shortest chain to every IK solution of the last
@@ -64,7 +65,13 @@ waypoint, so they also try longer ways through other arm configurations.
 
 The IK of a waypoint starts from the current state, the previous waypoint's solutions
 (`seed_ik_from_previous`) and random seeds: the IK branches found at one waypoint then have
-their nearest continuation at the next.
+their nearest continuation at the next. The shortest chain can only be as good as the IK
+solutions found, so the planner uses 64 IK seeds per waypoint (`num_ik_seeds`).
+
+IK solutions closer to a joint limit than `joint_limit_margin` (1 % of the joint's range) are
+dropped when the waypoint has others. The trajectory optimizer's joint limit cost is active in
+that range, so a trajectory stays out of it and would miss a waypoint whose IK solution lies
+there.
 
 ## Criteria per sample
 
