@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from curobo._src.motion.ik_chain import ChainMetric, ChainMetricLike
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
 from curobo._src.state.state_joint import JointState
@@ -58,6 +59,12 @@ class ViaPointMotionPlannerCfg:
     #: their nearest continuation at the next one.
     seed_ik_from_previous: bool = True
 
+    #: How the length of an IK chain is measured when the planner looks for the shortest one:
+    #: Euclidean joint-space distance, total joint rotation, time at the joint velocity limits,
+    #: or the largest motion of one joint. See :class:`~curobo._src.motion.ik_chain.ChainMetric`.
+    #: Segments also get native reference samples in proportion to their length in this metric.
+    chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN
+
     #: The first attempt seeds the optimizer only with IK chains at most this fraction longer
     #: (in joint space) than the shortest chain, and returns the fastest trajectory among them.
     #: ``None`` seeds the shortest chain to every IK solution of the last waypoint instead, as
@@ -83,6 +90,7 @@ class ViaPointMotionPlannerCfg:
             log_and_raise("geometry_dt_scale must be positive")
         if self.ik_dedup_joint_tol < 0.0:
             log_and_raise("ik_dedup_joint_tol must be >= 0")
+        self.chain_metric = ChainMetric(self.chain_metric)
         if self.chain_length_slack is not None and self.chain_length_slack < 0.0:
             log_and_raise("chain_length_slack must be >= 0 or None")
         if self.seed_bulge < 0.0:
@@ -103,6 +111,7 @@ class ViaPointMotionPlannerCfg:
         geometry_dt_scale: float = 10.0,
         expand_revolutions: bool = True,
         seed_ik_from_previous: bool = True,
+        chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN,
         chain_length_slack: Optional[float] = 0.1,
         seed_bulge: float = 0.4,
         joint_limit_margin: float = 0.01,
@@ -124,6 +133,8 @@ class ViaPointMotionPlannerCfg:
             expand_revolutions: Add the full-turn variants of the IK solutions.
             seed_ik_from_previous: Seed every waypoint's IK with the previous waypoint's
                 solutions.
+            chain_metric: How IK chain length is measured: ``"euclidean"``,
+                ``"total_rotation"``, ``"time"`` or ``"max_norm"``.
             chain_length_slack: Longest IK chain seeded on the first attempt, as a fraction
                 above the shortest chain; ``None`` for no limit.
             seed_bulge: Largest mid-segment offset of the seeds that repeat a chain.
@@ -157,6 +168,7 @@ class ViaPointMotionPlannerCfg:
             geometry_dt_scale=geometry_dt_scale,
             expand_revolutions=expand_revolutions,
             seed_ik_from_previous=seed_ik_from_previous,
+            chain_metric=chain_metric,
             chain_length_slack=chain_length_slack,
             seed_bulge=seed_bulge,
             joint_limit_margin=joint_limit_margin,

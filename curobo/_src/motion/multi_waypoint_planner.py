@@ -580,7 +580,11 @@ class MultiWaypointMotionPlanner:
                 ik_sets.append(dedup_joint_solutions(good, tol))
         if self.config.max_layer_nodes is not None:
             ik_sets = prune_ik_layers(
-                start_state.position.view(-1), ik_sets, self.config.max_layer_nodes
+                start_state.position.view(-1),
+                ik_sets,
+                self.config.max_layer_nodes,
+                self.config.chain_metric,
+                self.kinematics.get_joint_limits().velocity[1],
             )
         return ik_sets, None
 

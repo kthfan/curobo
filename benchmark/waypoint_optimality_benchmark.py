@@ -1,29 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Measure how close waypoint plans are to the shortest joint-space path.
+"""Measure how close waypoint plans are to the shortest joint-space path, per chain metric.
 
 A trajectory through Cartesian waypoints passes one IK solution of every waypoint, so it is at
 least as long as the shortest *IK chain*: the choice of one IK solution per waypoint with the
-smallest sum of joint-space distances. This script builds a reference for that chain from a
-dense set of IK solutions per waypoint (many IK rounds, plus the full-turn variants ``q ± 2π`` of
-joints whose limits span more than one turn), and compares the chains and trajectories of
-:class:`ViaPointMotionPlanner` and :class:`MultiWaypointMotionPlanner` with it.
+smallest sum of joint-space steps. How a step is measured is the
+:class:`~curobo._src.motion.ik_chain.ChainMetric`: Euclidean distance, total joint rotation,
+time at the joint velocity limits, or the largest motion of one joint.
+
+For every metric this script builds a reference, the shortest chain in that metric through a
+dense set of IK solutions per waypoint (many IK rounds, plus the full-turn variants ``q ± 2π``
+of joints whose limits span more than one turn), and runs :class:`ViaPointMotionPlanner` and
+:class:`MultiWaypointMotionPlanner` with ``chain_metric`` set to that metric. Every planner's
+chain is then measured in all four metrics, so the table shows both whether a planner finds the
+shortest chain in its own metric (the diagonal) and what that costs in the others.
 
 The paths are built to punish a planner that only looks one waypoint ahead:
 
-- ``wrap``: a joint with more than one turn of range keeps turning the same way until the
-  next waypoint lies beyond its limit. A myopic planner unwinds a full turn there; the shortest
-  path takes the long way at the step where that costs least.
+- ``wrap_tool`` / ``wrap_pan``: a joint with more than one turn of range keeps turning the same
+  way until the next waypoint lies beyond its limit.
 - ``double_wrap``: two such joints with different step patterns.
 - ``random_reach``: waypoints at the tool poses of widely spread configurations, from a start
   near a joint limit.
 - ``pillar``: sweeps from one side of a pillar to the other; the shortest IK chain ignores it.
 
-Reported per planner: success, IK chain length over the reference (1.0 is optimal), trajectory
-arc length over the reference, how often the chain is more than 5 % longer than the reference,
-motion time, and planning time. ``greedy`` is the chain of a planner that always moves to the
-nearest IK solution of the next waypoint, from the same dense IK sets.
+``greedy_<metric>`` is the chain of a planner that always moves to the nearest IK solution of
+the next waypoint in that metric, from the same dense IK sets.
 
 Example::
 
@@ -38,7 +41,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-from curobo._src.motion.ik_chain import select_ik_chains
+from curobo._src.motion.ik_chain import (
+    ChainMetric,
+    chain_step_lengths,
+    pairwise_joint_distance,
+    select_ik_chains,
+)
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
     expand_joint_revolutions,
@@ -75,22 +83,12 @@ ROBOTS = {
     },
 }
 
-#: ViaPointMotionPlanner settings compared: (expand_revolutions, seed_ik_from_previous,
-#: chain_length_slack, seed_bulge, ik_return_seeds, joint_limit_margin) and the number of IK
-#: seeds of the planner. ``via_base`` is the planner before this study, ``via_new`` the current
-#: defaults, ``via_new32`` the same with 32 IK seeds.
-VIA_VARIANTS = {
-    "via_base": ((False, False, None, 0.0, 16, 0.0), 32),
-    "via_new32": ((True, True, 0.1, 0.4, 32, 0.01), 32),
-    "via_new": ((True, True, 0.1, 0.4, 64, 0.01), 64),
-}
-
-#: MultiWaypointMotionPlanner settings compared:
-#: (expand_revolutions, max_layer_nodes, start_state_cost, ik_return_seeds).
-#: ``multi_base`` is the planner before this study.
-MULTI_VARIANTS = {
-    "multi_base": (False, None, False, 20),
-    "multi_new": (True, 8, True, 32),
+#: Metrics compared, with short names for the tables.
+METRICS = {
+    ChainMetric.EUCLIDEAN: "l2",
+    ChainMetric.TOTAL_ROTATION: "rot",
+    ChainMetric.TIME: "time",
+    ChainMetric.MAX_NORM: "max",
 }
 
 
@@ -112,48 +110,32 @@ def table_scene(pillar: Optional[List[float]] = None) -> Scene:
 # -- Chains --
 
 
-def pair_cost(a: torch.Tensor, b: torch.Tensor, vmax: Optional[torch.Tensor]) -> torch.Tensor:
-    """Cost ``[A, B]`` between configurations: L2 distance, or the time bound with ``vmax``."""
-    if vmax is None:
-        return torch.cdist(a, b)
-    return ((a.unsqueeze(1) - b.unsqueeze(0)).abs() / vmax).amax(dim=-1)
-
-
 def shortest_chain(
-    start: torch.Tensor, layers: List[torch.Tensor], vmax: Optional[torch.Tensor] = None
+    start: torch.Tensor, layers: List[torch.Tensor], metric: ChainMetric, vmax: torch.Tensor
 ) -> torch.Tensor:
-    """Globally shortest IK chain ``[N, dof]`` through the layers, by dynamic programming."""
-    cost = pair_cost(start.view(1, -1), layers[0], vmax)[0]
-    parents = []
-    for previous, layer in zip(layers[:-1], layers[1:]):
-        cost, parent = (cost.unsqueeze(1) + pair_cost(previous, layer, vmax)).min(dim=0)
-        parents.append(parent)
-    node = int(cost.argmin())
-    nodes = [node]
-    for parent in reversed(parents):
-        node = int(parent[node])
-        nodes.append(node)
-    nodes.reverse()
-    return torch.stack([layer[i] for layer, i in zip(layers, nodes)])
+    """Globally shortest IK chain ``[N, dof]`` in ``metric``, by dynamic programming."""
+    chains, _, _ = select_ik_chains(start, layers, 1, 0.0, metric, vmax)
+    return chains[0]
 
 
-def greedy_chain(start: torch.Tensor, layers: List[torch.Tensor]) -> torch.Tensor:
+def greedy_chain(
+    start: torch.Tensor, layers: List[torch.Tensor], metric: ChainMetric, vmax: torch.Tensor
+) -> torch.Tensor:
     """IK chain ``[N, dof]`` that always moves to the nearest solution of the next waypoint."""
     chain, current = [], start
     for layer in layers:
-        current = layer[(layer - current).norm(dim=-1).argmin()]
+        step = pairwise_joint_distance(current.view(1, -1), layer, metric, vmax)[0]
+        current = layer[step.argmin()]
         chain.append(current)
     return torch.stack(chain)
 
 
-def chain_metrics(start: torch.Tensor, chain: torch.Tensor, vmax: torch.Tensor) -> Dict:
-    """Joint-space length (L2 and total rotation) and time bound of a chain from ``start``."""
-    steps = torch.cat((start.view(1, -1), chain))
-    delta = steps[1:] - steps[:-1]
+def chain_lengths(start: torch.Tensor, chain: torch.Tensor, vmax: torch.Tensor) -> Dict:
+    """Length of a chain from ``start`` in every metric, by short name."""
+    configs = torch.cat((start.view(1, -1), chain))
     return {
-        "l2": float(delta.norm(dim=-1).sum()),
-        "l1": float(delta.abs().sum()),
-        "time_bound": float((delta.abs() / vmax).amax(dim=-1).sum()),
+        short: float(chain_step_lengths(configs, metric, vmax).sum())
+        for metric, short in METRICS.items()
     }
 
 
@@ -326,45 +308,15 @@ def dense_ik_layers(
 # -- Planner runs --
 
 
-def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> Dict:
-    config = planner.config
-    (
-        config.expand_revolutions,
-        config.seed_ik_from_previous,
-        config.chain_length_slack,
-        config.seed_bulge,
-        config.ik_return_seeds,
-        config.joint_limit_margin,
-    ) = VIA_VARIANTS[variant][0]
-    # The IK solver rebuilds its result graphs when the number of returned seeds changes;
-    # keep that out of the planning time.
-    planner.plan_waypoints(waypoints, state, max_attempts=1)
-
-    # Record, per attempt, the shortest chain through the planner's own IK solutions and how
-    # many distinct chains it seeds.
-    attempts = []
-    plan_through = planner._plan_through
-
-    def record(*args):
-        layers, slack = args[3], args[-1]
-        seeds = planner._motion_planner.trajopt_solver.config.num_seeds
-        if slack is not None:
-            seeds = max(1, seeds // 2)
-        _, cost, distinct = select_ik_chains(state.position[0], layers, seeds, slack)
-        attempts.append({"shortest": float(cost[0]), "distinct": distinct})
-        return plan_through(*args)
-
-    planner._plan_through = record
+def run_via(planner: ViaPointMotionPlanner, waypoints, state, metric: ChainMetric) -> Dict:
+    planner.config.chain_metric = metric
     torch.cuda.synchronize()
     started = time.perf_counter()
-    try:
-        result = planner.plan_waypoints(waypoints, state)
-    finally:
-        planner._plan_through = plan_through
+    result = planner.plan_waypoints(waypoints, state)
     torch.cuda.synchronize()
     row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
     row["status"] = result.status
-    row["attempts"] = attempts
+    row["attempts"] = result.attempts
     if row["success"]:
         row["chain"] = result.waypoint_configs
         trajectory = result.get_interpolated_plan()
@@ -374,15 +326,9 @@ def run_via(planner: ViaPointMotionPlanner, waypoints, state, variant: str) -> D
 
 
 def run_multi(
-    planner: MultiWaypointMotionPlanner, start_pose, waypoints, state, variant: str
+    planner: MultiWaypointMotionPlanner, start_pose, waypoints, state, metric: ChainMetric
 ) -> Dict:
-    config = planner.config
-    (
-        config.expand_revolutions,
-        config.max_layer_nodes,
-        config.start_state_cost,
-        config.ik_return_seeds,
-    ) = MULTI_VARIANTS[variant]
+    planner.config.chain_metric = metric
     targets = [start_pose.as_goal()] + [
         GoalToolPose(
             waypoints.tool_frames,
@@ -409,12 +355,11 @@ def run_multi(
     row = {"success": bool(result.success.item()), "plan_time": time.perf_counter() - started}
     row["status"] = result.status
     if row["success"]:
-        nodes = torch.stack(
+        # The chain starts at the planner's IK solution of the start pose; measured from the
+        # current state it includes the way to that solution.
+        row["chain"] = torch.stack(
             [layer[i] for layer, i in zip(captured["layers"], result.chosen_ik_indices)]
         )
-        # The planner starts at an IK solution of the first target, not at the current state.
-        row["start_gap"] = float((nodes[0] - state.position.view(-1)).norm())
-        row["chain"] = nodes
         position = result.composed_trajectory.position
         row["arc"] = arc_length(position.view(-1, position.shape[-1]))
         row["motion_time"] = float(
@@ -424,48 +369,26 @@ def run_multi(
 
 
 def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
+    """Print, per planner, its chain length over the reference in every metric."""
     print(f"\n== {family}: {len(rows)} paths ==")
     if not rows:
         return
-    greedy = [r["greedy"]["l2"] / r["reference"]["l2"] for r in rows]
-    print(
-        f"{'greedy':>9}: chain/ref mean {sum(greedy) / len(greedy):.3f} max {max(greedy):.3f}, "
-        f"longer than 1.05x in {sum(g > 1.05 for g in greedy)}/{len(greedy)}"
-    )
+    header = " ".join(f"{short:>12}" for short in METRICS.values())
+    print(f"{'':>13} {'ok':>6} {header}   motion   plan")
     for name in planners:
         ran = [r for r in rows if name in r]
-        ok = [r for r in ran if r[name]["success"]]
+        ok = [r for r in ran if r[name].get("success", True)]
         if not ran:
             continue
-        line = f"{name:>9}: success {len(ok)}/{len(ran)}"
-        if ok:
-            chain = [r[name]["chain_l2"] / r["reference"]["l2"] for r in ok]
-            arc = [r[name]["arc"] / r["reference"]["l2"] for r in ok]
-            motion = [r[name]["motion_time"] / r["reference"]["time_bound"] for r in ok]
-            plan = [r[name]["plan_time"] for r in ran]
-            line += (
-                f", chain/ref mean {sum(chain) / len(chain):.3f} max {max(chain):.3f} "
-                f"(>1.05x in {sum(c > 1.05 for c in chain)}/{len(chain)}), "
-                f"arc/ref {sum(arc) / len(arc):.3f}, "
-                f"motion/time bound {sum(motion) / len(motion):.2f}, "
-                f"motion {sum(r[name]['motion_time'] for r in ok) / len(ok):.2f} s, "
-                f"plan {1000 * sum(plan) / len(plan):.0f} ms"
-            )
-            if name in VIA_VARIANTS:
-                first = [r[name]["attempts"][0] for r in ran if r[name]["attempts"]]
-                cover = [
-                    r[name]["attempts"][0]["shortest"] / r["reference"]["l2"]
-                    for r in ran
-                    if r[name]["attempts"]
-                ]
-                line += (
-                    f", own IK shortest/ref {sum(cover) / len(cover):.3f} max {max(cover):.3f}, "
-                    f"chains seeded {sum(a['distinct'] for a in first) / len(first):.1f}, "
-                    f"attempts {sum(len(r[name]['attempts']) for r in ran) / len(ran):.2f}"
-                )
-            if name in MULTI_VARIANTS:
-                gap = [r[name]["start_gap"] for r in ok]
-                line += f", start gap mean {sum(gap) / len(gap):.2f} max {max(gap):.2f} rad"
+        cells = []
+        for short in METRICS.values():
+            ratio = [r[name]["lengths"][short] / r["reference"][short] for r in ok]
+            cells.append(f"{sum(ratio) / len(ratio):.3f}/{max(ratio):.2f}" if ratio else "-")
+        line = f"{name:>13} {len(ok):>2}/{len(ran):<3} " + " ".join(f"{c:>12}" for c in cells)
+        if not name.startswith("greedy") and ok:
+            motion = sum(r[name]["motion_time"] for r in ok) / len(ok)
+            plan = sum(r[name]["plan_time"] for r in ran) / len(ran)
+            line += f"  {motion:5.2f}s {plan:6.2f}s"
         print(line)
 
 
@@ -474,7 +397,7 @@ def main():
     parser.add_argument("--robot", default="ur10e.yml", choices=sorted(ROBOTS))
     parser.add_argument("--num_problems", type=int, default=8, help="paths per family")
     parser.add_argument("--multi_problems", type=int, default=8, help="paths per family, multi")
-    parser.add_argument("--ik_rounds", type=int, default=40, help="reference IK calls per waypoint")
+    parser.add_argument("--ik_rounds", type=int, default=25, help="reference IK calls per waypoint")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--families", default="wrap_tool,wrap_pan,double_wrap,random_reach,pillar")
     parser.add_argument("--out", default=None, help="write the per-path results to this JSON")
@@ -487,13 +410,8 @@ def main():
         collision_cache={"cuboid": 4},
         use_cuda_graph=True,
     )
-    via_planners = {}
-    for seeds in sorted({seeds for _, seeds in VIA_VARIANTS.values()}):
-        via_planners[seeds] = ViaPointMotionPlanner(
-            ViaPointMotionPlannerCfg.create(num_ik_seeds=seeds, **common)
-        )
-        via_planners[seeds].warmup()
-    via = via_planners[32]
+    via = ViaPointMotionPlanner(ViaPointMotionPlannerCfg.create(**common))
+    via.warmup()
     multi = None
     if args.multi_problems > 0:
         multi = MultiWaypointMotionPlanner(MultiWaypointMotionPlannerCfg.create(**common))
@@ -519,7 +437,11 @@ def main():
         ),
         "pillar": lambda: pillar_problems(via, q0.to(device), spec, args.num_problems, generator),
     }
-    planners = list(VIA_VARIANTS) + list(MULTI_VARIANTS)
+    planners = (
+        [f"greedy_{short}" for short in METRICS.values()]
+        + [f"via_{short}" for short in METRICS.values()]
+        + [f"multi_{short}" for short in METRICS.values()]
+    )
     report = {}
     for family in args.families.split(","):
         rows = []
@@ -541,17 +463,16 @@ def main():
                     via.update_world(table_scene())
                     print(f"{family} {index}: no pillar leaves the path collision-free, skipped")
                     continue
-                scene_planners = [p for p in via_planners.values() if p is not via]
-                for planner in scene_planners + ([multi] if multi is not None else []):
-                    planner.update_world(table_scene(pillar))
+                if multi is not None:
+                    multi.update_world(table_scene(pillar))
             row = {"index": index, "start": start, "pillar": pillar}
             extra = [[] for _ in range(waypoints.horizon)]
-            for name, (_, seeds) in VIA_VARIANTS.items():
-                row[name] = run_via(via_planners[seeds], waypoints, state, name)
+            for metric, short in METRICS.items():
+                row[f"via_{short}"] = run_via(via, waypoints, state, metric)
             if multi is not None and index < args.multi_problems:
                 start_pose = via.compute_kinematics(state).tool_poses
-                for name in MULTI_VARIANTS:
-                    row[name] = run_multi(multi, start_pose, waypoints, state, name)
+                for metric, short in METRICS.items():
+                    row[f"multi_{short}"] = run_multi(multi, start_pose, waypoints, state, metric)
             for name in planners:
                 if name in row and row[name]["success"]:
                     chain = row[name]["chain"][-waypoints.horizon :]
@@ -559,24 +480,22 @@ def main():
                         extra[j].append(chain[j])
             layers = dense_ik_layers(via, waypoints, state, args.ik_rounds, extra)
             if pillar is not None:
-                for planner in list(via_planners.values()) + ([multi] if multi is not None else []):
+                for planner in [via] + ([multi] if multi is not None else []):
                     planner.update_world(table_scene())
             if layers is None:
                 print(f"{family} {index}: a waypoint has no IK solution, skipped")
                 continue
             row["layer_sizes"] = [int(layer.shape[0]) for layer in layers]
-            reference = shortest_chain(start, layers)
-            row["reference"] = chain_metrics(start, reference, vmax)
-            row["reference"]["time_bound"] = chain_metrics(
-                start, shortest_chain(start, layers, vmax), vmax
-            )["time_bound"]
-            row["reference"]["chain"] = reference
-            row["greedy"] = chain_metrics(start, greedy_chain(start, layers), vmax)
+            row["reference"], row["reference_chains"] = {}, {}
+            for metric, short in METRICS.items():
+                reference = shortest_chain(start, layers, metric, vmax)
+                row["reference"][short] = chain_lengths(start, reference, vmax)[short]
+                row["reference_chains"][short] = reference
+                greedy = greedy_chain(start, layers, metric, vmax)
+                row[f"greedy_{short}"] = {"lengths": chain_lengths(start, greedy, vmax)}
             for name in planners:
-                if name in row and row[name]["success"]:
-                    # A multi-waypoint chain starts at its own IK solution of the start pose;
-                    # measured from the current state it includes the way to that solution.
-                    row[name]["chain_l2"] = chain_metrics(start, row[name]["chain"], vmax)["l2"]
+                if name in row and row[name].get("success"):
+                    row[name]["lengths"] = chain_lengths(start, row[name]["chain"], vmax)
             rows.append(row)
         summarize(family, rows, planners)
         report[family] = rows
@@ -594,8 +513,7 @@ def main():
 
         with open(args.out, "w") as file:
             json.dump({"robot": args.robot, "families": plain(report)}, file)
-    for planner in via_planners.values():
-        planner.destroy()
+    via.destroy()
     if multi is not None:
         multi.destroy()
 

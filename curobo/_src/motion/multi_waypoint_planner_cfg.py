@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 # CuRobo
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import ChainMetric, ChainMetricLike
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 
 
@@ -93,6 +94,12 @@ class MultiWaypointMotionPlannerCfg:
     #: keeps every solution.
     max_layer_nodes: Optional[int] = 8
 
+    #: How the joint-space chains that ``max_layer_nodes`` ranks by are measured: Euclidean
+    #: distance, total joint rotation, time at the joint velocity limits, or the largest motion
+    #: of one joint. See :class:`~curobo._src.motion.ik_chain.ChainMetric`. The path search
+    #: itself compares the optimized edge trajectories.
+    chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN
+
     #: Count the way from the start state to the first waypoint's IK solution (as the time of a
     #: rest-to-rest move at the joint velocity and acceleration limits) in the path search, so
     #: the trajectory starts at a solution near the start state instead of at any solution of
@@ -113,6 +120,7 @@ class MultiWaypointMotionPlannerCfg:
         waypoint_constraint_merge_mode: str = "max_weights_min_tols",
         expand_revolutions: bool = True,
         max_layer_nodes: Optional[int] = 8,
+        chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN,
         start_state_cost: bool = True,
         **motion_planner_kwargs: Any,
     ) -> "MultiWaypointMotionPlannerCfg":
@@ -133,6 +141,8 @@ class MultiWaypointMotionPlannerCfg:
             waypoint_constraint_merge_mode: Shared-waypoint merge strategy.
             expand_revolutions: Add the full-turn variants of the IK solutions.
             max_layer_nodes: Most IK solutions kept per waypoint, ``None`` for all.
+            chain_metric: How the chains that rank the kept IK solutions are measured:
+                ``"euclidean"``, ``"total_rotation"``, ``"time"`` or ``"max_norm"``.
             start_state_cost: Count the way from the start state in the path search.
             **motion_planner_kwargs: Forwarded to ``MotionPlannerCfg.create``.
 
@@ -151,5 +161,6 @@ class MultiWaypointMotionPlannerCfg:
             waypoint_constraint_merge_mode=waypoint_constraint_merge_mode,
             expand_revolutions=expand_revolutions,
             max_layer_nodes=max_layer_nodes,
+            chain_metric=ChainMetric(chain_metric),
             start_state_cost=start_state_cost,
         )

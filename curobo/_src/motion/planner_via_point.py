@@ -38,7 +38,7 @@ from curobo._src.cost.cost_eef_bound_eval import tool_pose_bounds_violation
 from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import ToolPoseBound, ToolPoseBoundAnchor
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
-from curobo._src.motion.ik_chain import select_ik_chains
+from curobo._src.motion.ik_chain import chain_step_lengths, select_ik_chains
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
@@ -289,6 +289,7 @@ class ViaPointMotionPlanner:
         }
         kinematics = self._motion_planner.kinematics
         self._joint_limits = kinematics.get_joint_limits().position.clone()
+        self._velocity_limit = kinematics.get_joint_limits().velocity[1].clone()
         self._revolute_joints = revolute_joint_mask(kinematics.kinematics_config)
 
     # -- Lifecycle --
@@ -613,17 +614,18 @@ class ViaPointMotionPlanner:
         lower, upper = self._position_limits
         start = state.position[0]
         num_seeds = solver.config.num_seeds
+        metric = {"metric": self.config.chain_metric, "velocity_limit": self._velocity_limit}
         if length_slack is None:
-            chains, _, distinct = select_ik_chains(start, layers, num_seeds)
+            chains, _, distinct = select_ik_chains(start, layers, num_seeds, **metric)
         else:
             # At most half as many chains as seeds: every chain gets a straight seed and at
             # least one bent seed.
             chains, _, distinct = select_ik_chains(
-                start, layers, max(1, num_seeds // 2), length_slack
+                start, layers, max(1, num_seeds // 2), length_slack, **metric
             )
             chains = chains[torch.arange(num_seeds, device=chains.device) % distinct]
         best = torch.cat((start.unsqueeze(0), chains[0]), dim=0)
-        distances = (best[1:] - best[:-1]).norm(dim=-1).tolist()
+        distances = chain_step_lengths(best, **metric).tolist()
         indices = allocate_waypoint_indices(
             distances,
             layout.reference_intervals,

@@ -12,6 +12,7 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import ChainMetric
 from curobo._src.motion.planner_via_point import (
     ViaPointMotionPlanner,
     allocate_waypoint_indices,
@@ -277,28 +278,52 @@ def ur_planner():
     planner.destroy()
 
 
+def _wrist_roll_path(planner, angles_deg):
+    """Start with wrist 3 at 0 and waypoints at the tool poses of wrist 3 at ``angles_deg``."""
+    wrist = planner.joint_names.index("wrist_3_joint")
+    home = planner.default_joint_state.position.view(-1).clone()
+    home[wrist] = 0.0
+    start = JointState.from_position(home.view(1, -1), joint_names=planner.joint_names)
+    configs = home.repeat(len(angles_deg), 1)
+    configs[:, wrist] = torch.tensor(angles_deg, device=home.device) * math.pi / 180.0
+    poses = planner.compute_kinematics(
+        JointState.from_position(configs, joint_names=planner.joint_names)
+    ).tool_poses
+    n = len(angles_deg)
+    waypoints = GoalToolPose(
+        planner.tool_frames,
+        poses.position.view(1, n, 1, 1, 3).contiguous(),
+        poses.quaternion.view(1, n, 1, 1, 4).contiguous(),
+    )
+    return home, start, waypoints
+
+
 @cuda
 def test_tool_roll_beyond_the_joint_limit_does_not_unwind(ur_planner):
     """The tool rolls on by 90, 260 and 360 deg from wrist 3 at 0, but 360 deg is beyond the
     joint limit. Turning on to 260 deg forces 260 deg back to 0 (520 deg in total); the planner
     reaches the second waypoint the other way round, at -100 deg (380 deg in total)."""
     planner = ur_planner
-    wrist = planner.joint_names.index("wrist_3_joint")
-    home = planner.default_joint_state.position.view(-1).clone()
-    home[wrist] = 0.0
-    start = JointState.from_position(home.view(1, -1), joint_names=planner.joint_names)
-    configs = home.repeat(3, 1)
-    configs[:, wrist] = torch.tensor([90.0, 260.0, 360.0], device=home.device) * math.pi / 180.0
-    poses = planner.compute_kinematics(
-        JointState.from_position(configs, joint_names=planner.joint_names)
-    ).tool_poses
-    waypoints = GoalToolPose(
-        planner.tool_frames,
-        poses.position.view(1, 3, 1, 1, 3).contiguous(),
-        poses.quaternion.view(1, 3, 1, 1, 4).contiguous(),
-    )
+    home, start, waypoints = _wrist_roll_path(planner, [90.0, 260.0, 360.0])
     result = planner.plan_waypoints(waypoints, start)
     assert result.success.item(), result.status
     chain = torch.cat((home.view(1, -1), result.waypoint_configs))
     length = float((chain[1:] - chain[:-1]).norm(dim=-1).sum())
     assert length < 1.15 * math.radians(380.0)
+
+
+@cuda
+def test_total_rotation_metric_turns_the_wrist_back_in_place(ur_planner):
+    """With the total rotation metric the chain keeps the arm still and turns only the wrist:
+    0, 90, -100, 0 deg (380 deg). The Euclidean metric may move several joints instead."""
+    planner = ur_planner
+    home, start, waypoints = _wrist_roll_path(planner, [90.0, 260.0, 360.0])
+    planner.config.chain_metric = ChainMetric.TOTAL_ROTATION
+    try:
+        result = planner.plan_waypoints(waypoints, start)
+    finally:
+        planner.config.chain_metric = ChainMetric.EUCLIDEAN
+    assert result.success.item(), result.status
+    chain = torch.cat((home.view(1, -1), result.waypoint_configs))
+    rotation = float((chain[1:] - chain[:-1]).abs().sum())
+    assert rotation < 1.1 * math.radians(380.0)
