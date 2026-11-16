@@ -93,8 +93,19 @@ optimization with the status `No IK solution at waypoint k satisfies its segment
 ## Keep the joint-space path short
 
 The planner chooses the IK solutions of all waypoints together, so it does not turn a joint
-into its limit at one waypoint and unwind it at the next. Three settings of
+into its limit at one waypoint and unwind it at the next. These settings of
 `ViaPointMotionPlannerCfg.create` control this:
+
+- `chain_metric` sets what "short" means:
+
+  | Value | Length of a step `Δq` | Prefers |
+  | --- | --- | --- |
+  | `"euclidean"` (default) | `‖Δq‖₂` | many joints moving a little over one joint moving a lot |
+  | `"total_rotation"` | `Σ_j abs(Δq_j)` | the least joint motion in total, e.g. turning only the wrist |
+  | `"time"` | `max_j abs(Δq_j) / v_j` | the shortest motion at the joint velocity limits |
+  | `"max_norm"` | `max_j abs(Δq_j)` | the smallest largest joint motion, ignoring velocity limits |
+
+  `ChainMetric` from `curobo.via_point_planner` names the same values.
 
 - `expand_revolutions` (default `True`) lets joints with more than one turn of range, such as
   those of a UR arm, reach a waypoint at `q ± 2π`.

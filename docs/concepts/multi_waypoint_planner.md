@@ -66,7 +66,10 @@ only 100° to go.
 The variants multiply the nodes of a layer (by up to 32 for a UR arm), and every pair of nodes
 is one trajectory optimization. `max_layer_nodes` therefore keeps, per waypoint, the nodes with
 the shortest joint-space chain through them, from the start state to the last waypoint. The
-globally shortest chain is always kept. `None` keeps every node.
+globally shortest chain is always kept. `None` keeps every node. `chain_metric` sets how chain
+length is measured for this ranking (Euclidean distance, total joint rotation, time at the
+joint velocity limits, or the largest motion of one joint); the path search afterwards compares
+the optimized edge trajectories by their cost, whatever the metric.
 
 Tool pose bounds are not part of the waypoint IK problem, because their `"goal"` and `"start"`
 anchors refer to the endpoints of a segment. Instead, IK solutions that violate the bounds of

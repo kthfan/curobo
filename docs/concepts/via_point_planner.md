@@ -52,7 +52,10 @@ to 260° forces 260° back to 0°, 520° in total. With the variant -100° at th
 the chain 0°, 90°, -100°, 0° takes 380°.
 
 **Chains near the shortest.** Dynamic programming over the layers gives the shortest chain
-through every IK solution. The first attempt seeds only chains at most `chain_length_slack`
+through every IK solution. A chain's length is the sum of its steps, measured by
+`chain_metric`: Euclidean joint-space distance (the default), total joint rotation, time at the
+joint velocity limits, or the largest motion of one joint. Segments also get native reference
+samples in proportion to their length in that metric. The first attempt seeds only chains at most `chain_length_slack`
 (10 %) longer than the shortest one, and returns the fastest trajectory among them. It uses at
 most half as many chains as seeds, so every chain has a straight seed and at least one seed
 that is bent between the waypoints by up to `seed_bulge`. From a straight seed the optimizer
