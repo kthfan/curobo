@@ -72,9 +72,10 @@ def gather_joint_state_by_seed(joint_state: "JointState", idx: torch.Tensor) -> 
     dt = joint_state.dt.view(batch_size * num_seeds, -1)[flat_indices].view(batch_size, topk_seeds)
 
     if joint_state.knot is not None:
-        knots = joint_state.knot.shape[-2]
-        knot = joint_state.knot.view(batch_size * num_seeds, knots, dof)[flat_indices].view(
-            batch_size, topk_seeds, knots, dof
+        # Knots hold the optimized (active) joints, which can be fewer than the state's joints.
+        knots, knot_dof = joint_state.knot.shape[-2:]
+        knot = joint_state.knot.view(batch_size * num_seeds, knots, knot_dof)[flat_indices].view(
+            batch_size, topk_seeds, knots, knot_dof
         )
     else:
         knot = None

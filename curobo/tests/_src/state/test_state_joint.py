@@ -1345,3 +1345,29 @@ class TestJointState:
         assert torch.allclose(new_js.acceleration[0, 0, 3:], acceleration2)
         assert torch.allclose(new_js.jerk[0, 0, 3:], jerk2)
 
+
+
+def test_gather_by_seed_keeps_knots_of_fewer_joints():
+    """Knots hold the optimized joints only, so they can be narrower than the state."""
+    from curobo._src.state.state_joint_trajectory_ops import gather_joint_state_by_seed
+
+    batch, seeds, horizon, dof, knots, knot_dof = 1, 3, 5, 4, 2, 3
+    position = torch.arange(batch * seeds * horizon * dof, dtype=torch.float32)
+    position = position.view(batch, seeds, horizon, dof)
+    state = JointState(
+        position=position,
+        velocity=position + 1,
+        acceleration=position + 2,
+        jerk=position + 3,
+        joint_names=[f"j{i}" for i in range(dof)],
+        dt=torch.tensor([[0.1, 0.2, 0.3]]),
+        knot=torch.arange(batch * seeds * knots * knot_dof, dtype=torch.float32).view(
+            batch, seeds, knots, knot_dof
+        ),
+        knot_dt=torch.tensor([[1.0, 2.0, 3.0]]),
+    )
+    out = gather_joint_state_by_seed(state, torch.tensor([[2, 0]]))
+    torch.testing.assert_close(out.position, position[:, [2, 0]])
+    torch.testing.assert_close(out.knot, state.knot[:, [2, 0]])
+    torch.testing.assert_close(out.dt, torch.tensor([[0.3, 0.1]]))
+    torch.testing.assert_close(out.knot_dt, torch.tensor([[3.0, 1.0]]))
