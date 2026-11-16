@@ -515,10 +515,13 @@ class TrajOptSolverResult(BaseSolverResult):
 
         # Reshape back to [batch_size, topk, horizon, dof]
         new_result.solution = selected_flat.view(batch_size, topk, horizon, dof)
-        optimized_seeds_flat = self.optimized_seeds.view(batch_size * self.num_seeds, horizon, dof)
-        new_result.optimized_seeds = optimized_seeds_flat[flat_indices].view(
-            batch_size, topk, horizon, dof
-        )
+        if self.optimized_seeds is not None:
+            optimized_seeds_flat = self.optimized_seeds.view(
+                batch_size * self.num_seeds, horizon, dof
+            )
+            new_result.optimized_seeds = optimized_seeds_flat[flat_indices].view(
+                batch_size, topk, horizon, dof
+            )
 
         new_result.batch_size = batch_size
         new_result.num_seeds = topk

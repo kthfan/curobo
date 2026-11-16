@@ -661,8 +661,54 @@ class ViaPointMotionPlanner:
             path_tolerance=tolerance,
             final_tolerance=tolerance,
             track_orientation=True,
+            return_seeds=num_seeds,
         )
+        result = self._select_seed(result, start, indices)
         return indices, result
+
+    def _select_seed(self, result, start: torch.Tensor, indices: List[int]):
+        """Keep the trajectory to return: the fastest valid one whose IK chain is short.
+
+        Trajectory optimization only knows the Cartesian waypoints, so a trajectory can leave
+        the IK chain its seed followed and pass the waypoints on another IK branch. Every
+        valid trajectory's chain, its configurations at the waypoints, is measured with the
+        chain metric; the fastest trajectory whose chain is at most ``chain_length_slack``
+        longer than the shortest valid chain is returned.
+
+        Args:
+            result: Trajectory optimization result with all seeds, in seed order.
+            start: Start configuration ``[dof]``.
+            indices: Native sample of every waypoint.
+
+        Returns:
+            The result of the selected seed only.
+        """
+        solver = self._motion_planner.trajopt_solver
+        position = result.js_solution.position
+        seeds, horizon, full_dof = position.shape[-3:]
+        at_waypoints = position.reshape(seeds, horizon, full_dof)[:, indices]
+        configs = solver.get_active_js(
+            JointState.from_position(
+                at_waypoints.reshape(-1, full_dof).contiguous(),
+                joint_names=result.js_solution.joint_names,
+            )
+        ).position.view(seeds, len(indices), -1)
+        chain = torch.cat((start.view(1, 1, -1).expand(seeds, 1, -1), configs), dim=1)
+        length = chain_step_lengths(
+            chain, self.config.chain_metric, self._velocity_limit
+        ).sum(dim=-1)
+        success = result.success.view(seeds)
+        rank = result.seed_rank.view(seeds)
+        slack = self.config.chain_length_slack
+        if bool(success.any()) and slack is not None:
+            shortest = length[success].min()
+            short = success & (length <= shortest * (1.0 + slack) + 1e-6)
+            # Fastest first among the short valid chains: their order in the duration rank.
+            preferred = short[rank]
+            first = rank[int(torch.nonzero(preferred)[0])]
+            rank = torch.cat((first.view(1), rank[rank != first]))
+        result.seed_rank = rank.view(1, seeds)
+        return result.get_topk_seeds(1)
 
     def _seed_bulge(self, chains: torch.Tensor, distinct: int) -> Optional[torch.Tensor]:
         """Mid-segment offsets ``[S, N, dof]`` for the seeds that repeat a chain.
