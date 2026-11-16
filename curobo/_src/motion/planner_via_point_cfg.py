@@ -66,11 +66,9 @@ class ViaPointMotionPlannerCfg:
     chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN
 
     #: The first attempt seeds the optimizer only with IK chains at most this fraction longer
-    #: (in ``chain_metric``) than the shortest chain. Every attempt then returns the fastest
-    #: valid trajectory whose chain, its configurations at the waypoints, is at most this
-    #: fraction longer than the shortest chain among the valid trajectories. ``None`` returns
-    #: the fastest valid trajectory, whatever way it takes in joint space, and seeds the shortest
-    #: chain to every IK solution of the last waypoint.
+    #: (in joint space) than the shortest chain, and returns the fastest trajectory among them.
+    #: ``None`` seeds the shortest chain to every IK solution of the last waypoint instead, as
+    #: retries do: the fastest trajectory then may take a much longer way in joint space.
     chain_length_slack: Optional[float] = 0.1
 
     #: Largest joint-space offset (rad or m) at the middle of every segment for the seeds that

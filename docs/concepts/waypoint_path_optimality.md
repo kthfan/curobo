@@ -130,8 +130,8 @@ via-point planner still succeeds on all, in 148 ms to 212 ms.
 as shorter than one joint moving a lot. On the 0° → 90° → 270° → 360° path the shortest chain
 by this measure changes the arm configuration at the second waypoint (5.85 rad) instead of
 turning the wrist back and forth in place (6.28 rad), although the joints turn 35 % more in
-total. Both avoid the 540° of the nearest-solution choice. A planner that should minimize the
-total rotation, or the motion time, needs that measure in the chain search.
+total. Both avoid the 540° of the nearest-solution choice. `chain_metric` selects another
+measure; see the next section.
 
 **Obstacles between waypoints.** The chain search knows about collisions at the waypoints
 only. In the `pillar` family the via-point planner follows the shortest chain on all paths,
@@ -152,3 +152,59 @@ and slower on the others, among them both `pillar` families.
 **The reference.** It is the shortest chain through the IK solutions that were found. For the
 UR10e, with a finite number of IK solutions per pose, that is the shortest chain; for the
 Franka it is a dense sample of it.
+
+## Choosing a chain metric
+
+`chain_metric` sets the length of a joint step `Δq` in the chain search:
+
+| Metric | Length of `Δq` | Shortest chain |
+| --- | --- | --- |
+| `euclidean` | `‖Δq‖₂` | moves many joints a little rather than one joint a lot |
+| `total_rotation` | `Σ_j abs(Δq_j)` | turns the joints least in total |
+| `time` | `max_j abs(Δq_j) / v_j` | is fastest at the joint velocity limits, without acceleration |
+| `max_norm` | `max_j abs(Δq_j)` | has the smallest largest joint motion |
+
+The via-point planner uses the metric for the chain search, for the chain length slack and for
+spacing the waypoints along the trajectory. The multi-waypoint planner uses it only to keep
+the solutions on the shortest chains (`max_layer_nodes`); it chooses its chain by the duration
+of the optimized segments, so the metric changes its result little.
+
+Each variant measured in all four metrics, as the mean chain length over the reference that is
+shortest in that metric, on the 60 paths per robot of the benchmark above. Bold is the
+variant's own metric.
+
+**UR10e:**
+
+| Variant | `euclidean` | `total_rotation` | `time` | `max_norm` | Motion time |
+| --- | --- | --- | --- | --- | --- |
+| Via-point, `euclidean` | **1.007** | 1.161 | 1.020 | 1.012 | 3.40 s |
+| Via-point, `total_rotation` | 1.051 | **1.015** | 1.139 | 1.149 | 3.76 s |
+| Via-point, `time` | 1.147 | 1.464 | **1.010** | 1.087 | 3.35 s |
+| Via-point, `max_norm` | 1.019 | 1.193 | 1.024 | **1.007** | 3.38 s |
+| Nearest solution, own metric | 1.035 | 1.047 | 1.043 | 1.040 | |
+
+**Franka:**
+
+| Variant | `euclidean` | `total_rotation` | `time` | `max_norm` | Motion time |
+| --- | --- | --- | --- | --- | --- |
+| Via-point, `euclidean` | **1.011** | 1.259 | 1.176 | 1.151 | 2.68 s |
+| Via-point, `total_rotation` | 1.151 | **1.090** | 1.690 | 1.627 | 3.39 s |
+| Via-point, `time` | 1.044 | 1.372 | **1.054** | 1.074 | 2.60 s |
+| Via-point, `max_norm` | 1.040 | 1.363 | 1.079 | **1.053** | 2.58 s |
+| Nearest solution, own metric | 1.071 | 1.060 | 1.074 | 1.091 | |
+
+The last row lists, in each column, the nearest-solution chain chosen in that column's metric.
+
+A chain that is short in one metric can be long in another. `total_rotation` keeps the arm
+configuration and turns single joints, which gives the slowest motions. `time` and `max_norm`
+spread the motion over the joints and give the fastest ones: 3 % to 4 % faster than
+`euclidean` on the Franka, 1 % on the UR10e, where `time` takes chains 46 % longer in total
+rotation. `euclidean` stays the default: it is never far from the fastest motion, and its
+chains are the ones the trajectory optimizer follows best.
+
+The trajectory optimizer sees the waypoints, not the chain, and its smoothness cost favours
+`euclidean`-like paths. For the other metrics the trajectory can therefore leave the chosen
+chain: on the Franka the via-point planner's `total_rotation` result is longer in its own metric
+than the nearest-solution chain. Picking, among the optimized trajectories, the one whose chain
+is shortest in the metric did not help: on the UR10e it made the chains of all four variants
+longer and their motions 4 % to 8 % slower.
