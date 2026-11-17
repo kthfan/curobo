@@ -301,7 +301,7 @@ def _leave_a_via_plan_in_the_tables(planner):
         planner, [[0.1, 0.0, -0.05], [0.1, 0.15, -0.05], [0.0, 0.15, 0.05]]
     )
     frame = planner.tool_frames[0]
-    # A bound the single-goal motion below would violate, and a goal reached in position only.
+    # A bounded segment and a goal reached in position only, unlike a single-goal plan.
     bounded = ToolPoseCriteria(bounds=[ToolPoseBound(anchor="base", z=(None, 0.6))])
     criteria = [None, {frame: bounded}, {frame: ToolPoseCriteria.track_position()}]
     result = planner.plan_waypoints(waypoints, start, criteria)
@@ -312,7 +312,11 @@ DELTA = [0.4, -0.3, 0.2, -0.3, 0.3, 0.4, -0.5]
 
 
 def test_trajectory_optimization_after_a_via_plan_matches_a_motion_planner(planner, plain_planner):
-    """From identical seeds, the single-goal optimizer reproduces the ordinary optimizer."""
+    """From identical seeds, the single-goal optimizer reproduces the ordinary optimizer.
+
+    The cost-level equality of the single-goal table is tested in test_cost_tool_pose_segment.py;
+    this checks the whole optimization on the planner's solvers after a via-point plan.
+    """
     _leave_a_via_plan_in_the_tables(planner)
     start, goal = _joint_goal(planner, DELTA)
     goal_poses = planner.compute_kinematics(goal).tool_poses.as_goal()
@@ -323,7 +327,7 @@ def test_trajectory_optimization_after_a_via_plan_matches_a_motion_planner(plann
     ):
         seeds = goal.position.view(1, 1, -1).repeat(1, solver.config.num_seeds, 1)
         with context:
-            # Without an implicit goal the tool pose cost and its acceptance decide the result.
+            # The seed configurations fix the trajectory end in both optimizers.
             results.append(
                 solver.solve_pose(goal_poses, start, seed_config=seeds, use_implicit_goal=False)
             )
@@ -334,6 +338,32 @@ def test_trajectory_optimization_after_a_via_plan_matches_a_motion_planner(plann
     torch.testing.assert_close(
         via.js_solution.position, plain.js_solution.position, atol=1e-3, rtol=0.0
     )
+
+
+def test_single_goal_replaces_the_via_plan_in_the_tables(planner):
+    """The previous plan's slots, criteria and bounds are gone before a single-goal plan."""
+    _leave_a_via_plan_in_the_tables(planner)
+    table = planner._table
+    assert table.num_segments == 3
+    assert any(any(cost.tool_pose_bounds.values()) for cost in planner._bound_costs)
+    with planner._single_goal():
+        slots = table.native_slots.tolist()
+        assert slots == [0] * (table.horizon - 1) + [table.capacity]
+        assert table.offgrid_slot.item() == 0 and table.final_slot.item() == table.capacity
+        assert not any(any(cost.tool_pose_bounds.values()) for cost in planner._bound_costs)
+        for cost in planner._bound_costs:
+            assert (cost._anchor == -1).all()
+        # Only path slot 0 and reach slot 0 hold criteria.
+        links = len(table.tool_frames)
+        used = table.position_metric.abs().sum(dim=(-1, -2)) + table.rotation_metric.abs().sum(
+            dim=(-1, -2)
+        )
+        used_rows = set(torch.nonzero(used).view(-1).tolist())
+        assert used_rows <= set(range(links)) | set(
+            range(table.capacity * links, (table.capacity + 1) * links)
+        )
+    _leave_a_via_plan_in_the_tables(planner)
+    assert table.num_segments == 3 and table.offgrid_slot.item() == table.final_slot.item()
 
 
 def test_plan_pose_reaches_the_goal_between_via_plans(planner):
