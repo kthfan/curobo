@@ -301,7 +301,8 @@ def _leave_a_via_plan_in_the_tables(planner):
         planner, [[0.1, 0.0, -0.05], [0.1, 0.15, -0.05], [0.0, 0.15, 0.05]]
     )
     frame = planner.tool_frames[0]
-    bounded = ToolPoseCriteria(bounds=[ToolPoseBound(anchor="base", z=(0.2, 1.0))])
+    # A bound the single-goal motion below would violate, and a goal reached in position only.
+    bounded = ToolPoseCriteria(bounds=[ToolPoseBound(anchor="base", z=(None, 0.6))])
     criteria = [None, {frame: bounded}, {frame: ToolPoseCriteria.track_position()}]
     result = planner.plan_waypoints(waypoints, start, criteria)
     assert result.success.item(), result.status
@@ -322,8 +323,9 @@ def test_trajectory_optimization_after_a_via_plan_matches_a_motion_planner(plann
     ):
         seeds = goal.position.view(1, 1, -1).repeat(1, solver.config.num_seeds, 1)
         with context:
+            # Without an implicit goal the tool pose cost and its acceptance decide the result.
             results.append(
-                solver.solve_pose(goal_poses, start, seed_config=seeds, use_implicit_goal=True)
+                solver.solve_pose(goal_poses, start, seed_config=seeds, use_implicit_goal=False)
             )
     via, plain = results
     assert plain.success.item()
