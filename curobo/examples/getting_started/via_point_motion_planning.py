@@ -30,14 +30,15 @@ Step 2: Check the output
 When the tutorial finishes successfully you will see output like::
 
     === Via-Point Motion Planning ===
-    ✓ Via-point planning succeeded in 1 attempt(s), 0.21 s
-      Waypoint 0: 0.4 mm, 0.002 rad
-      Waypoint 1: 0.3 mm, 0.001 rad
-      Waypoint 2: 0.2 mm, 0.001 rad
-      Trajectory: 2.31 s, 116 steps of 0.020 s, 7 joints
+    ✓ Via-point planning succeeded in 1 attempt(s), 0.29 s
+      Waypoint 0: 0.5 mm, 0.000 rad
+      Waypoint 1: 1.1 mm, 0.001 rad
+      Waypoint 2: 0.0 mm, 0.000 rad
+      Trajectory: 1.38 s, 57 steps of 0.025 s, 9 joints
     Trajectory plot saved to: ~/.cache/curobo/examples/via_point_motion_planning/via_point_plan.pdf
 
 The errors, the planning time and the duration vary between runs and GPUs. The
+trajectory includes the locked finger joints, so it has 9 joints for 7 active ones. The
 first plan after construction compiles kernels and captures CUDA graphs, which
 ``warmup()`` does before the timed plan. Output files are written to
 ``~/.cache/curobo/`` by default; override with ``--output-dir``.
