@@ -59,7 +59,8 @@
   from the start state to the first waypoint's solution (`start_state_cost`); its
   `ik_return_seeds` default is now 32. `benchmark/waypoint_optimality_benchmark.py`
   compares both planners with a dense-IK reference on paths that punish a planner
-  that only looks one waypoint ahead. `chain_metric` on both planners sets how chain
+  that only looks one waypoint ahead; its results are in
+  `docs/reference/waypoint_planner_benchmarks.md`. `chain_metric` on both planners sets how chain
   length is measured: `ChainMetric.EUCLIDEAN` (default), `TOTAL_ROTATION`, `TIME` (at
   the joint velocity limits) or `MAX_NORM`.
 - Add `ToolPoseBound.anchored_at_base`, which turns a goal- or start-anchored bound

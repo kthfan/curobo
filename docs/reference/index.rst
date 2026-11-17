@@ -26,6 +26,7 @@ Performance & Benchmarks
    :maxdepth: 1
 
    benchmarks
+   waypoint_planner_benchmarks
 
 Reference Examples
 ------------------

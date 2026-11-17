@@ -42,7 +42,8 @@ A planner avoids this only if it
    IK solutions, instead of one waypoint at a time.
 
 Both planners did the second from the start. They lacked the first, and three more things kept
-them from the shortest chain. The benchmark below found all of them:
+them from the shortest chain. `benchmark/waypoint_optimality_benchmark.py`, which plans paths
+built to punish a planner that looks one waypoint ahead, found all of them:
 
 | Cause | Planner | Change |
 | --- | --- | --- |
@@ -53,78 +54,27 @@ them from the shortest chain. The benchmark below found all of them:
 | From a straight seed the optimizer cuts the corner at a waypoint and the shortest chain fails | via-point | every chain also gets a bent seed (`seed_bulge`) |
 | An IK solution lies inside the range where the optimizer's joint limit cost is active, so the trajectory cannot reach it | via-point | drop such solutions when a waypoint has others (`joint_limit_margin`) |
 
-## Benchmark
+## How close the planners get
 
-`benchmark/waypoint_optimality_benchmark.py` plans paths with both planners and compares them
-with a reference: the shortest IK chain through a dense set of IK solutions per waypoint (40 IK
-calls with 32 seeds each, the planners' own configurations, and all full-turn variants). The
-paths are made to punish a planner that looks one waypoint ahead:
+The benchmark compares each planner's IK chain with the shortest chain through a dense set of
+IK solutions, and with `greedy`, the chain of a planner that always moves to the nearest IK
+solution of the next waypoint. The {ref}`measured results <waypoint_planner_benchmarks>` show
+three things.
 
-| Family | Path |
-| --- | --- |
-| `wrap_tool` | The tool roll joint keeps turning one way, in 3 to 5 steps of 20° to 170°, until a waypoint lies beyond its limit. The first path is the 0° → 90° → 270° → 360° case. |
-| `wrap_pan` | The same for the base joint. |
-| `double_wrap` | Both joints, with different step patterns. |
-| `random_reach` | Four waypoints at the tool poses of widely spread configurations, from a start near a joint limit. |
-| `pillar` | Three sweeps of the base joint from one side of a pillar to the other; the shortest chain goes through the pillar. |
-
-`greedy` is the chain of a planner that moves to the nearest IK solution of the next waypoint
-every time, from the same dense IK sets as the reference. It shows how much looking ahead is
-worth on a path.
-
-```bash
-python benchmark/waypoint_optimality_benchmark.py --robot ur10e.yml --num_problems 12 --multi_problems 12
-```
-
-## Results
-
-Measured on a Tesla T4 with 12 paths per family, 60 per robot. *Chain* is the joint-space
-length of the planner's IK chain over the reference; 1.0 is the shortest possible. For the
-multi-waypoint planner it includes the way from the start state to its first configuration.
-*Before* is each planner with the settings it had before this study.
-
-**UR10e** (6 joints, five of them with ±354° of range):
-
-| | Success | Chain, mean | Chain, worst | Paths over 1.05 | Planning time |
-| --- | --- | --- | --- | --- | --- |
-| Nearest solution (`greedy`) | | 1.034 | 1.340 | 12 of 60 | |
-| Via-point, before | 59 of 60 | 1.565 | 3.574 | 49 of 59 | 0.19 s |
-| Via-point | 60 of 60 | 1.007 | 1.081 | 4 of 60 | 0.19 s |
-| Multi-waypoint, before | 60 of 60 | 1.657 | 5.595 | 43 of 60 | 19.7 s |
-| Multi-waypoint | 60 of 60 | 1.066 | 2.569 | 12 of 60 | 6.5 s |
-
-**Franka** (7 joints, none with more than one turn of range):
-
-| | Success | Chain, mean | Chain, worst | Paths over 1.05 | Planning time |
-| --- | --- | --- | --- | --- | --- |
-| Nearest solution (`greedy`) | | 1.072 | 1.770 | 20 of 60 | |
-| Via-point, before | 60 of 60 | 1.035 | 1.359 | 15 of 60 | 0.21 s |
-| Via-point | 60 of 60 | 1.010 | 1.131 | 4 of 60 | 0.21 s |
-| Multi-waypoint, before | 60 of 60 | 1.404 | 2.313 | 55 of 60 | 12.8 s |
-| Multi-waypoint | 60 of 60 | 1.057 | 1.335 | 26 of 60 | 7.2 s |
-
-Chain length over the reference and motion time per family, UR10e:
-
-| Family | Greedy | Via-point, before | Via-point | Multi-waypoint, before | Multi-waypoint |
-| --- | --- | --- | --- | --- | --- |
-| `wrap_tool` | 1.089 | 1.342, 4.05 s | 1.005, 3.40 s | 1.484, 4.47 s | 1.080, 3.68 s |
-| `wrap_pan` | 1.037 | 1.809, 4.54 s | 1.002, 3.16 s | 2.289, 4.28 s | 1.041, 3.38 s |
-| `double_wrap` | 1.023 | 1.352, 4.62 s | 1.012, 3.51 s | 1.355, 4.42 s | 1.000, 3.42 s |
-| `random_reach` | 1.023 | 1.644, 5.95 s | 1.018, 3.90 s | 1.755, 5.72 s | 1.078, 4.16 s |
-| `pillar` | 1.000 | 1.659, 4.31 s | 0.997, 3.03 s | 1.403, 2.83 s | 1.129, 2.77 s |
-
-The shorter chains are also faster: the via-point planner's motions take 16 % to 35 % less time
-than before on the UR10e. A value just below 1.0 means the trajectory passes a waypoint within
-its tolerance, slightly inside the IK solution.
-
-Before the changes both planners were often worse than `greedy`, although both search all
+Before these changes both planners were often worse than `greedy`, although both search all
 waypoints together. The search was not the problem; the IK solutions it had to choose from
-were.
+were. With the full-turn variants and the other changes, the via-point planner's chain is
+within about 1 % of the shortest on average, on the UR10e as on the Franka; the multi-waypoint
+planner's is within about 6 %.
 
-On the same 180 random Franka paths as `benchmark/via_point_benchmark.py` used before, the
-via-point planner still succeeds on all, in 148 ms to 212 ms.
+Shorter chains are also faster motions. On the UR10e the via-point planner's motions became
+16 % to 35 % shorter in time, family by family.
 
-## What the numbers do not show
+The multi-waypoint planner's planning time fell by half or more, because it keeps only the IK
+solutions on the shortest chains and so solves fewer segment problems. It remains seconds,
+against a fraction of a second for the via-point planner.
+
+## Limits of the chain search
 
 **The length measure.** Euclidean joint-space distance counts several joints moving a little
 as shorter than one joint moving a lot. On the 0° → 90° → 270° → 360° path the shortest chain
@@ -134,20 +84,19 @@ total. Both avoid the 540° of the nearest-solution choice. `chain_metric` selec
 measure; see the next section.
 
 **Obstacles between waypoints.** The chain search knows about collisions at the waypoints
-only. In the `pillar` family the via-point planner follows the shortest chain on all paths,
-but its trajectory around the pillar is 48 % longer than the reference chain on the UR10e,
-against 35 % for the multi-waypoint planner, which optimizes every edge separately and so also learns which
-chains are cheap to drive. When no way around is found along the shortest chains, the
-via-point planner's retries take longer chains.
+only. Around a pillar the via-point planner follows the shortest chain, but its trajectory is
+longer in joint space than that of the multi-waypoint planner, which optimizes every edge
+separately and so also learns which chains are cheap to drive. When no way around is found
+along the shortest chains, the via-point planner's retries take longer chains.
 
 **Redundant arms.** A 7-joint arm has a continuum of IK solutions per waypoint, and the chain
-can only be as short as the solutions that were sampled. With 32 IK seeds the via-point
-planner's mean chain on the Franka is 1.058; with 64 it is 1.010.
+can only be as short as the solutions that were sampled. This is why the via-point planner
+uses 64 IK seeds by default: with 32 its chains on the Franka are about 5 % longer.
 
 **Motion time.** The multi-waypoint planner chooses its chain by the summed duration of the
 segment trajectories, not by length, so a longer chain can be the faster one for it. It stops
-at every waypoint; the via-point planner does not, and is faster on six of the ten families
-and slower on the others, among them both `pillar` families.
+at every waypoint; the via-point planner does not. Neither is faster on every kind of path:
+around obstacles the multi-waypoint planner's motions tend to be faster.
 
 **The reference.** It is the shortest chain through the IK solutions that were found. For the
 UR10e, with a finite number of IK solutions per pose, that is the shortest chain; for the
@@ -169,42 +118,17 @@ spacing the waypoints along the trajectory. The multi-waypoint planner uses it o
 the solutions on the shortest chains (`max_layer_nodes`); it chooses its chain by the duration
 of the optimized segments, so the metric changes its result little.
 
-Each variant measured in all four metrics, as the mean chain length over the reference that is
-shortest in that metric, on the 60 paths per robot of the benchmark above. Bold is the
-variant's own metric.
-
-**UR10e:**
-
-| Variant | `euclidean` | `total_rotation` | `time` | `max_norm` | Motion time |
-| --- | --- | --- | --- | --- | --- |
-| Via-point, `euclidean` | **1.007** | 1.161 | 1.020 | 1.012 | 3.40 s |
-| Via-point, `total_rotation` | 1.051 | **1.015** | 1.139 | 1.149 | 3.76 s |
-| Via-point, `time` | 1.147 | 1.464 | **1.010** | 1.087 | 3.35 s |
-| Via-point, `max_norm` | 1.019 | 1.193 | 1.024 | **1.007** | 3.38 s |
-| Nearest solution, own metric | 1.035 | 1.047 | 1.043 | 1.040 | |
-
-**Franka:**
-
-| Variant | `euclidean` | `total_rotation` | `time` | `max_norm` | Motion time |
-| --- | --- | --- | --- | --- | --- |
-| Via-point, `euclidean` | **1.011** | 1.259 | 1.176 | 1.151 | 2.68 s |
-| Via-point, `total_rotation` | 1.151 | **1.090** | 1.690 | 1.627 | 3.39 s |
-| Via-point, `time` | 1.044 | 1.372 | **1.054** | 1.074 | 2.60 s |
-| Via-point, `max_norm` | 1.040 | 1.363 | 1.079 | **1.053** | 2.58 s |
-| Nearest solution, own metric | 1.071 | 1.060 | 1.074 | 1.091 | |
-
-The last row lists, in each column, the nearest-solution chain chosen in that column's metric.
-
 A chain that is short in one metric can be long in another. `total_rotation` keeps the arm
 configuration and turns single joints, which gives the slowest motions. `time` and `max_norm`
-spread the motion over the joints and give the fastest ones: 3 % to 4 % faster than
-`euclidean` on the Franka, 1 % on the UR10e, where `time` takes chains 46 % longer in total
-rotation. `euclidean` stays the default: it is never far from the fastest motion, and its
-chains are the ones the trajectory optimizer follows best.
+spread the motion over the joints and give the fastest ones, a few percent faster than
+`euclidean`, at the price of much more total rotation. `euclidean` stays the default: it is
+never far from the fastest motion, and its chains are the ones the trajectory optimizer
+follows best.
 
 The trajectory optimizer sees the waypoints, not the chain, and its smoothness cost favours
 `euclidean`-like paths. For the other metrics the trajectory can therefore leave the chosen
-chain: on the Franka the via-point planner's `total_rotation` result is longer in its own metric
-than the nearest-solution chain. Picking, among the optimized trajectories, the one whose chain
-is shortest in the metric did not help: on the UR10e it made the chains of all four variants
-longer and their motions 4 % to 8 % slower.
+chain: on the Franka the via-point planner's `total_rotation` result can be longer in its own
+metric than the nearest-solution chain. Picking, among the optimized trajectories, the one
+whose chain is shortest in the metric did not help: it made the chains longer and the motions
+slower, so the planner returns the fastest trajectory. The
+{ref}`benchmark results <waypoint_planner_benchmarks>` list every metric on both robots.
