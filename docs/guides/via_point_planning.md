@@ -132,6 +132,43 @@ into its limit at one waypoint and unwind it at the next. These settings of
 planner fell back to exploring longer ones. Compare `result.waypoint_configs` with the start
 state to see which IK solutions the trajectory passes.
 
+## Hold an object or change the gripper
+
+The planner's IK and trajectory solvers share one robot model. Change it in place between
+plans; the warmed CUDA graphs stay valid. Do not change it while a plan runs.
+
+- **Attach a grasped object**: `planner.attachment_manager.attach_from_scene(grasp_state,
+  ["box"])` fits spheres on the reserved `attached_object` link and disables the box's world
+  copy; `attach(grasp_state, [obstacle])` takes an obstacle that is not in the scene.
+  `planner.attachment_manager.detach()` restores the link and re-enables the world copy.
+- **Payload dynamics**: attaching sets only collision geometry. Pass the combined link and payload
+  inertial to `planner.update_link_inertial("attached_object", mass, com, inertia)` (or several
+  links to `update_links_inertial`); this needs a robot loaded with dynamics. Restore the
+  unloaded inertial on release.
+- **Locked joint values**, such as a gripper opening:
+
+  ```python
+  import torch
+  from curobo.kinematics import KinematicsCfg
+
+  updated = KinematicsCfg.from_robot_yaml_file(
+      "franka.yml", lock_joints={"panda_finger_joint1": 0.02, "panda_finger_joint2": 0.02}
+  )
+  torch.cuda.synchronize()
+  planner.kinematics.update_kinematics_config(updated.kinematics_config)
+  planner.reset_seed()
+  ```
+
+  The new parameters replace the attachments, collision masks and payload inertials as well:
+  build them from the live model's state. The set of locked joints cannot change.
+- **Contact links**: `planner.disable_link_collision(["panda_hand"])` stops scene collision
+  checks of a link, for example while the gripper touches a part;
+  `planner.enable_link_collision` turns them back on.
+
+These are the same operations as on {py:class}`~curobo.motion_planner.MotionPlanner`. The
+via-point planner does not plan single poses: use a separate `MotionPlanner` for those, and apply
+the same model updates to both.
+
 ## Diagnose a failed plan
 
 `result.status` names the stage that failed:

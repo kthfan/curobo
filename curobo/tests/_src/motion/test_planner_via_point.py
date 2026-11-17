@@ -12,6 +12,8 @@ import torch
 
 from curobo._src.cost.tool_pose_bound import ToolPoseBound
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.geom.sphere_fit.types import SphereFitType
+from curobo._src.geom.types import Cuboid
 from curobo._src.motion.ik_chain import ChainMetric
 from curobo._src.motion.planner_via_point import (
     ViaPointMotionPlanner,
@@ -21,9 +23,11 @@ from curobo._src.motion.planner_via_point import (
     knot_space_seeds,
 )
 from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg
+from curobo._src.robot.kinematics.kinematics import KinematicsCfg
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
+from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 
 CPU = DeviceCfg(device=torch.device("cpu"))
 IDENTITY = [1.0, 0.0, 0.0, 0.0]
@@ -265,6 +269,130 @@ def test_back_and_forth_path_reaches_every_waypoint(planner):
 # --------------------------------------------------------------------------- #
 # Joints with more than one turn of range (UR10e)
 # --------------------------------------------------------------------------- #
+
+
+FINGERS = ["panda_finger_joint1", "panda_finger_joint2"]
+
+
+def _finger_lock(value):
+    """Franka kinematics parameters with both fingers locked at ``value`` (m)."""
+    cfg = KinematicsCfg.from_robot_yaml_file(
+        "franka.yml", lock_joints={name: value for name in FINGERS}
+    )
+    return cfg.kinematics_config
+
+
+def test_locked_joint_values_reach_the_next_plan(planner):
+    """New locked finger values are used without rebuilding the planner or its graphs."""
+    start, waypoints = _offsets(planner, [[0.1, 0.0, 0.0], [0.1, 0.1, 0.0]])
+    torch.cuda.synchronize()
+    planner.kinematics.update_kinematics_config(_finger_lock(0.02))
+    planner.reset_seed()
+    try:
+        result = planner.plan_waypoints(waypoints, start)
+        assert result.success.item(), result.status
+        trajectory = result.get_interpolated_plan()
+        position = trajectory.position.reshape(-1, trajectory.position.shape[-1])
+        fingers = position[:, [trajectory.joint_names.index(name) for name in FINGERS]]
+        torch.testing.assert_close(fingers, torch.full_like(fingers, 0.02))
+    finally:
+        torch.cuda.synchronize()
+        planner.kinematics.update_kinematics_config(_finger_lock(0.04))
+        planner.reset_seed()
+
+
+def test_attached_object_follows_the_gripper(planner):
+    """An attached box gets spheres on the attachment link that move with the gripper."""
+    start, home = _home(planner)
+    w, x, y, z = home.quaternion[0, 0, 0].tolist()
+    tool_z = torch.tensor([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)])
+    center = home.position[0, 0, 0].cpu() + 0.1 * tool_z
+    box = Cuboid(name="held_box", dims=[0.04, 0.04, 0.04], pose=[*center.tolist(), 1, 0, 0, 0])
+    params = planner.kinematics.config.kinematics_config
+    index = params.get_sphere_index_from_link_name("attached_object")
+    planner.attachment_manager.attach(
+        start, [box], num_spheres=4, sphere_fit_type=SphereFitType.VOXEL
+    )
+    try:
+        spheres = params.link_spheres[0, index]
+        assert (spheres[:, 3] > 0).all()
+        at_start = planner.compute_kinematics(start).robot_spheres.reshape(-1, 4)[index]
+        assert (at_start[:, :3].mean(0).cpu() - center).norm() < 0.02
+
+        _, waypoints = _offsets(planner, [[0.1, 0.0, 0.0], [0.1, 0.1, 0.0]])
+        result = planner.plan_waypoints(waypoints, start)
+        assert result.success.item(), result.status
+        at_end = planner.compute_kinematics(
+            JointState.from_position(result.waypoint_configs[-1:], joint_names=planner.joint_names)
+        )
+        moved = at_end.robot_spheres.reshape(-1, 4)[index, :3].mean(0)
+        gripper = at_end.tool_poses.position[0, 0, 0]
+        assert (moved - gripper).norm() < 0.12
+        assert (moved.cpu() - center).norm() > 0.05
+    finally:
+        planner.attachment_manager.detach()
+    torch.testing.assert_close(
+        params.link_spheres[0, index], params.reference_link_spheres[0, index]
+    )
+
+
+def test_link_collision_switches_off_and_back_on(planner):
+    """Disabled links lose their spheres in the model every solver uses; enabling restores them."""
+    params = planner.kinematics.config.kinematics_config
+    index = params.get_sphere_index_from_link_name("panda_hand")
+    planner.disable_link_collision(["panda_hand"])
+    try:
+        assert (params.link_spheres[:, index, 3] < 0).all()
+        ik_params = planner._motion_planner.ik_solver.kinematics.config.kinematics_config
+        assert (ik_params.link_spheres[:, index, 3] < 0).all()
+    finally:
+        planner.enable_link_collision(["panda_hand"])
+    torch.testing.assert_close(
+        params.link_spheres[:, index, 3], params.reference_link_spheres[:, index, 3]
+    )
+
+
+def test_payload_inertials_reach_every_dynamics_model():
+    """A payload update changes the torques of the IK and trajectory dynamics models alike."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))["robot_cfg"]
+    robot["load_dynamics"] = True
+    planner = ViaPointMotionPlanner(
+        ViaPointMotionPlannerCfg.create(robot=robot, use_cuda_graph=False)
+    )
+    try:
+        mp = planner._motion_planner
+        models = [
+            model
+            for core in (mp.ik_solver.core, mp.trajopt_solver.core)
+            for rollout in core.get_all_rollout_instances()
+            + list(core.additional_metrics_rollouts.values())
+            for model in (rollout.transition_model, rollout.metrics_transition_model)
+            if model.robot_dynamics is not None
+        ]
+        assert models
+        position = mp.trajopt_solver.default_joint_state.position.reshape(1, 1, -1).clone()
+        state = JointState(
+            position=position,
+            velocity=torch.full_like(position, 0.1),
+            acceleration=torch.full_like(position, 0.2),
+        )
+        for model in models:
+            model.robot_dynamics.setup_batch_size(1, 1)
+        before = models[0].robot_dynamics.compute_inverse_dynamics(state).clone()
+        com = torch.tensor([0.0, 0.0, 0.1], device=position.device)
+        inertia = torch.tensor([0.002, 0.002, 0.002, 0.0, 0.0, 0.0], device=position.device)
+        planner.update_link_inertial("attached_object", mass=1.5, com=com, inertia=inertia)
+        after = models[0].robot_dynamics.compute_inverse_dynamics(state).clone()
+        assert not torch.allclose(before, after)
+        for model in models:
+            torch.testing.assert_close(model.robot_dynamics.compute_inverse_dynamics(state), after)
+        planner.update_links_inertial({"attached_object": {"mass": 0.0}})
+        for model in models:
+            assert not torch.allclose(model.robot_dynamics.compute_inverse_dynamics(state), after)
+    finally:
+        planner.destroy()
 
 
 @pytest.fixture(scope="module")

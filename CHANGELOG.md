@@ -47,6 +47,9 @@
   path with one trajectory optimization, so the robot does not stop at the
   intermediate waypoints. The tool pose and tool pose bound costs gain optional
   per-segment criteria for it; without them they behave as before.
+- `ViaPointMotionPlanner` exposes the shared robot model updates of `MotionPlanner`:
+  `kinematics` (locked-joint values), `attachment_manager`, `update_link_inertial`,
+  `update_links_inertial`, `enable_link_collision` and `disable_link_collision`.
 - Choose globally shortest IK chains in the waypoint planners. Both planners add the
   full-turn variants (`q ± 2π`) of IK solutions for joints whose limits span more
   than one turn (`expand_revolutions`), so a joint is not turned into its limit at

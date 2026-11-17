@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from curobo._src.collision.attachment_manager import AttachmentManager
 from curobo._src.cost.cost_eef_bound_eval import tool_pose_bounds_violation
 from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import ToolPoseBound, ToolPoseBoundAnchor
@@ -52,6 +53,7 @@ from curobo._src.motion.motion_planner import (
     _waypoint_start_state,
 )
 from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg, ViaPointPlanResult
+from curobo._src.robot.kinematics.kinematics import Kinematics
 from curobo._src.state.state_joint import JointState
 from curobo._src.trajectory.trajectory_pose_reference import _slerp, pose_errors
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
@@ -348,6 +350,80 @@ class ViaPointMotionPlanner:
     def update_world(self, scene_cfg) -> None:
         """Replace the collision scene."""
         self._motion_planner.update_world(scene_cfg)
+
+    # -- Robot model updates --
+    #
+    # The IK and trajectory solvers share one kinematics model, so every update below reaches
+    # both. The updates copy into the existing tensors: CUDA graphs captured by warmup() stay
+    # valid. Serialize them against plan_waypoints().
+
+    @property
+    def kinematics(self) -> Kinematics:
+        """Kinematics model shared by the IK and trajectory solvers.
+
+        To change the values of locked joints, pass compatible parameters to
+        ``kinematics.update_kinematics_config``; they replace the attachments, collision masks
+        and payload inertials too, so carry those forward. The set of locked joints, the tool
+        frames and the sphere capacity must not change.
+        """
+        return self._motion_planner.kinematics
+
+    @property
+    def attachment_manager(self) -> AttachmentManager:
+        """Attach scene obstacles to a robot link, or detach them.
+
+        ``attach_from_scene`` fits spheres to obstacles of the scene and disables their world
+        copies; ``detach`` restores the link's spheres and re-enables them. The robot
+        configuration must reserve the attachment link and its spheres.
+        """
+        return self._motion_planner.attachment_manager
+
+    def enable_link_collision(self, enable_collision_links: List[str]) -> None:
+        """Re-enable scene collision of links, on their spheres and their meshes.
+
+        Args:
+            enable_collision_links: Names of links with collision spheres.
+        """
+        self._motion_planner.enable_link_collision(enable_collision_links)
+
+    def disable_link_collision(self, disable_collision_links: List[str]) -> None:
+        """Disable scene collision of links, on their spheres and their meshes.
+
+        Args:
+            disable_collision_links: Names of links with collision spheres.
+        """
+        self._motion_planner.disable_link_collision(disable_collision_links)
+
+    def update_link_inertial(
+        self,
+        link_name: str,
+        mass: Optional[float] = None,
+        com: Optional[torch.Tensor] = None,
+        inertia: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Replace inertial properties of one link in the IK and trajectory solvers.
+
+        Collision attachment does not set payload dynamics; combine the link's and the
+        payload's inertials and pass the result here. Needs a robot loaded with dynamics.
+
+        Args:
+            link_name: Link to update.
+            mass: Mass (kg).
+            com: Center of mass in the link frame ``[3]`` (m).
+            inertia: Inertia ``[6]`` as ``[ixx, iyy, izz, ixy, ixz, iyz]`` (kg m²).
+        """
+        self._motion_planner.update_link_inertial(link_name, mass, com, inertia)
+
+    def update_links_inertial(
+        self, link_properties: Dict[str, Dict[str, Union[float, torch.Tensor]]]
+    ) -> None:
+        """Replace inertial properties of several links in the IK and trajectory solvers.
+
+        Args:
+            link_properties: Map from link name to any of ``"mass"``, ``"com"`` and
+                ``"inertia"``, as in :meth:`update_link_inertial`.
+        """
+        self._motion_planner.update_links_inertial(link_properties)
 
     def reset_seed(self) -> None:
         """Reset the random seeds of the solvers."""
