@@ -196,9 +196,7 @@ def select_ik_chains(
     # The shortest chain through every node; a chain appears once per node it passes, so the
     # num_chains * n shortest entries hold at least num_chains distinct chains.
     through = torch.cat([f + b for f, b in zip(forward, backward)])
-    layer_of = torch.cat(
-        [torch.full_like(f, j, dtype=torch.long) for j, f in enumerate(forward)]
-    )
+    layer_of = torch.cat([torch.full_like(f, j, dtype=torch.long) for j, f in enumerate(forward)])
     node_of = torch.cat([torch.arange(f.numel(), device=device) for f in forward])
     count = min(through.numel(), num_chains * n)
     cost, top = torch.topk(through, count, largest=False, sorted=True)

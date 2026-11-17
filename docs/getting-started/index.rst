@@ -14,6 +14,7 @@ Getting Started
    humanoid_retargeting
    motion_planning
    multi_waypoint_motion_planning
+   via_point_motion_planning
    cartesian_waypoints
    volumetric_mapping
    feature_mapping

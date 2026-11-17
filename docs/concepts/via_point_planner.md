@@ -8,7 +8,8 @@ an ordered list of Cartesian waypoints. Like the {ref}`multi-waypoint planner
 {py:class}`~curobo.types.ToolPoseCriteria` and {py:class}`~curobo.types.ToolPoseBound` limits,
 and the planner chooses among the IK solutions of every waypoint. Like
 `MotionPlanner.plan_pose_waypoints`, it solves the whole path with a single trajectory
-optimization. To use it, see {ref}`guide_via_point_planning`.
+optimization. To run it, see {ref}`tutorial_via_point_motion_planning`; to constrain
+segments, see {ref}`guide_via_point_planning`.
 
 ## Overview
 

@@ -17,7 +17,7 @@ Example::
 import argparse
 import time
 from collections import Counter
-from typing import Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -51,7 +51,8 @@ def random_paths(home, num_problems: int, num_waypoints: int, seed: int) -> List
     return paths
 
 
-def time_call(fn):
+def time_call(fn: Callable[[], Any]) -> Tuple[Any, float]:
+    """Call ``fn`` and return its output and the synchronized wall time in seconds."""
     torch.cuda.synchronize()
     start = time.perf_counter()
     out = fn()
@@ -60,6 +61,7 @@ def time_call(fn):
 
 
 def summarize(name: str, rows: List[Dict[str, float]]) -> None:
+    """Print the success rate, planning time and motion time of one planner."""
     success = [r for r in rows if r["success"]]
     times = np.array([r["time"] for r in rows])
     motion = np.array([r["motion"] for r in success]) if success else np.array([np.nan])
@@ -70,7 +72,8 @@ def summarize(name: str, rows: List[Dict[str, float]]) -> None:
     )
 
 
-def main():
+def main() -> None:
+    """Run the benchmark."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num_problems", type=int, default=20)
     parser.add_argument("--num_waypoints", type=int, default=4)

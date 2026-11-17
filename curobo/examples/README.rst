@@ -17,6 +17,8 @@ Getting Started
 - ``forward_kinematics.py``: Compute forward kinematics from joint configurations.
 - ``inverse_kinematics.py``: Solve inverse kinematics for end-effector poses.
 - ``motion_planning.py``: Plan collision-free trajectories.
+- ``via_point_motion_planning.py``: Move through several poses in one continuous motion,
+  with per-segment constraints.
 - ``cartesian_waypoints.py``: Follow Cartesian waypoints and preview a planned trajectory.
 - ``reactive_control.py``: Run model-predictive control.
 - ``humanoid_retargeting.py``: Retarget humanoid motions with self-collision.

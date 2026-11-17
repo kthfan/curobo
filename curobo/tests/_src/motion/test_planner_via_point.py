@@ -251,8 +251,10 @@ def test_a_bound_no_waypoint_ik_satisfies_fails_before_optimization(planner):
 
 @cuda
 def test_back_and_forth_path_reaches_every_waypoint(planner):
-    """Large swings miss the first waypoints at the default geometry time step; a retry with a
-    slower geometric optimization passes them."""
+    """A retry with a slower geometric optimization passes waypoints the first attempt misses.
+
+    Large swings miss the first waypoints at the default geometry time step.
+    """
     offsets = [[0.076, -0.214, 0.073], [0.144, 0.222, -0.004], [0.05, -0.235, -0.08]]
     start, waypoints = _offsets(planner, offsets + [[0.073, -0.228, 0.218]])
     result = planner.plan_waypoints(waypoints, start)
@@ -300,9 +302,12 @@ def _wrist_roll_path(planner, angles_deg):
 
 @cuda
 def test_tool_roll_beyond_the_joint_limit_does_not_unwind(ur_planner):
-    """The tool rolls on by 90, 260 and 360 deg from wrist 3 at 0, but 360 deg is beyond the
+    """The planner turns the wrist back at the second waypoint instead of into its limit.
+
+    The tool rolls on by 90, 260 and 360 deg from wrist 3 at 0, but 360 deg is beyond the
     joint limit. Turning on to 260 deg forces 260 deg back to 0 (520 deg in total); the planner
-    reaches the second waypoint the other way round, at -100 deg (380 deg in total)."""
+    reaches the second waypoint the other way round, at -100 deg (380 deg in total).
+    """
     planner = ur_planner
     home, start, waypoints = _wrist_roll_path(planner, [90.0, 260.0, 360.0])
     result = planner.plan_waypoints(waypoints, start)
@@ -314,8 +319,11 @@ def test_tool_roll_beyond_the_joint_limit_does_not_unwind(ur_planner):
 
 @cuda
 def test_total_rotation_metric_turns_the_wrist_back_in_place(ur_planner):
-    """With the total rotation metric the chain keeps the arm still and turns only the wrist:
-    0, 90, -100, 0 deg (380 deg). The Euclidean metric may move several joints instead."""
+    """With the total rotation metric the chain keeps the arm still and turns only the wrist.
+
+    The wrist goes 0, 90, -100, 0 deg (380 deg). The Euclidean metric may move several joints
+    instead.
+    """
     planner = ur_planner
     home, start, waypoints = _wrist_roll_path(planner, [90.0, 260.0, 360.0])
     planner.config.chain_metric = ChainMetric.TOTAL_ROTATION

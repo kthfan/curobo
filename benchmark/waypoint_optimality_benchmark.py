@@ -309,6 +309,7 @@ def dense_ik_layers(
 
 
 def run_via(planner: ViaPointMotionPlanner, waypoints, state, metric: ChainMetric) -> Dict:
+    """Plan with the via-point planner in ``metric``; return success, timing and its chain."""
     planner.config.chain_metric = metric
     torch.cuda.synchronize()
     started = time.perf_counter()
@@ -328,6 +329,7 @@ def run_via(planner: ViaPointMotionPlanner, waypoints, state, metric: ChainMetri
 def run_multi(
     planner: MultiWaypointMotionPlanner, start_pose, waypoints, state, metric: ChainMetric
 ) -> Dict:
+    """Plan with the multi-waypoint planner in ``metric``; return success, timing and its chain."""
     planner.config.chain_metric = metric
     targets = [start_pose.as_goal()] + [
         GoalToolPose(
@@ -392,12 +394,15 @@ def summarize(family: str, rows: List[Dict], planners: List[str]) -> None:
         print(line)
 
 
-def main():
+def main() -> None:
+    """Run the benchmark."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--robot", default="ur10e.yml", choices=sorted(ROBOTS))
     parser.add_argument("--num_problems", type=int, default=8, help="paths per family")
     parser.add_argument("--multi_problems", type=int, default=8, help="paths per family, multi")
-    parser.add_argument("--ik_rounds", type=int, default=25, help="reference IK calls per waypoint")
+    parser.add_argument(
+        "--ik_rounds", type=int, default=25, help="reference IK calls per waypoint"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--families", default="wrap_tool,wrap_pan,double_wrap,random_reach,pillar")
     parser.add_argument("--out", default=None, help="write the per-path results to this JSON")
@@ -428,10 +433,11 @@ def main():
     )
 
     wrap = spec["wrap_joints"]
+    count = args.num_problems
     families = {
-        "wrap_tool": lambda: wrap_problems(q0, lower, upper, wrap[:1], args.num_problems, generator),
-        "wrap_pan": lambda: wrap_problems(q0, lower, upper, wrap[1:], args.num_problems, generator),
-        "double_wrap": lambda: wrap_problems(q0, lower, upper, wrap, args.num_problems, generator),
+        "wrap_tool": lambda: wrap_problems(q0, lower, upper, wrap[:1], count, generator),
+        "wrap_pan": lambda: wrap_problems(q0, lower, upper, wrap[1:], count, generator),
+        "double_wrap": lambda: wrap_problems(q0, lower, upper, wrap, count, generator),
         "random_reach": lambda: random_reach_problems(
             q0, lower, upper, spec, args.num_problems, generator
         ),

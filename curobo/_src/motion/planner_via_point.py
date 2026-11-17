@@ -86,9 +86,7 @@ def allocate_waypoint_indices(
     raw = [extra * w for w in weights]
     gaps = [gap + int(math.floor(r)) for r in raw]
     remainder = intervals - sum(gaps)
-    for k in sorted(range(n), key=lambda k: raw[k] - math.floor(raw[k]), reverse=True)[
-        :remainder
-    ]:
+    for k in sorted(range(n), key=lambda k: raw[k] - math.floor(raw[k]), reverse=True)[:remainder]:
         gaps[k] += 1
     indices, index = [], padding
     for g in gaps:
@@ -301,13 +299,16 @@ class ViaPointMotionPlanner:
         self._destroyed = True
         self._motion_planner.destroy()
 
-    def __del__(self):
+    def __del__(self) -> None:
+        """Release the CUDA graph resources when the planner is garbage collected."""
         self.destroy()
 
     def __enter__(self) -> ViaPointMotionPlanner:
+        """Return the planner for use as a context manager."""
         return self
 
     def __exit__(self, *exc) -> bool:
+        """Release the CUDA graph resources on leaving the context; do not suppress errors."""
         self.destroy()
         return False
 

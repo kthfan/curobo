@@ -29,9 +29,7 @@ from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise
 
 
-def native_sample_slots(
-    waypoint_indices: Sequence[int], horizon: int, capacity: int
-) -> List[int]:
+def native_sample_slots(waypoint_indices: Sequence[int], horizon: int, capacity: int) -> List[int]:
     """Return the criteria slot of every native sample.
 
     Args:

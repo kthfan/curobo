@@ -66,8 +66,10 @@ def test_shortest_chain_to_every_last_solution():
 
 
 def test_a_nearer_solution_now_can_cost_a_long_way_back_later():
-    """The nearest solution of the first waypoint leads away from the only solution of the
-    second one; the shortest chain takes the farther solution first."""
+    """The shortest chain takes the farther solution of the first waypoint first.
+
+    The nearest solution of the first waypoint leads away from the only solution of the second.
+    """
     start = torch.zeros(1)
     layers = [torch.tensor([[1.0], [-1.2]]), torch.tensor([[-3.0]])]
     chains, cost, _ = select_ik_chains(start, layers, num_chains=1, length_slack=0.0)
@@ -122,7 +124,8 @@ def test_step_lengths_follow_the_metric(metric):
     expected = torch.tensor([[_step(y - x, metric) for y in b] for x in a])
     torch.testing.assert_close(pairwise, expected)
     steps = chain_step_lengths(a, metric.value, VELOCITY)
-    torch.testing.assert_close(steps, torch.tensor([_step(y - x, metric) for x, y in zip(a, a[1:])]))
+    expected_steps = torch.tensor([_step(y - x, metric) for x, y in zip(a, a[1:])])
+    torch.testing.assert_close(steps, expected_steps)
 
 
 @pytest.mark.parametrize("metric", list(ChainMetric))
@@ -139,7 +142,8 @@ def test_chains_are_the_shortest_in_every_metric(metric):
         for chain, length in zip(chains, cost):
             assert abs(_chain_length(start, chain, metric) - float(length)) < 1e-4
         pruned = prune_ik_layers(start, layers, 1, metric, VELOCITY)
-        assert abs(_chain_length(start, torch.stack([p[0] for p in pruned]), metric) - lengths[0]) < 1e-4
+        kept = torch.stack([p[0] for p in pruned])
+        assert abs(_chain_length(start, kept, metric) - lengths[0]) < 1e-4
 
 
 def test_metrics_choose_different_chains():

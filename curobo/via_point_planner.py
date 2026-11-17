@@ -37,10 +37,9 @@ Example:
     ```
 """
 
+from curobo._src.motion.ik_chain import ChainMetric
 from curobo._src.motion.planner_via_point import ViaPointMotionPlanner
 from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg, ViaPointPlanResult
-
-from curobo._src.motion.ik_chain import ChainMetric
 
 __all__ = [
     "ChainMetric",

@@ -83,7 +83,8 @@ class ViaPointMotionPlannerCfg:
     #: joint limit cost is active: the optimizer does not reach a solution closer to a limit.
     joint_limit_margin: float = 0.01
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Validate the settings and convert ``chain_metric`` to a :class:`ChainMetric`."""
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
             log_and_raise("max_attempts, ik_return_seeds and min_segment_intervals must be >= 1")
         if self.geometry_dt_scale <= 0.0:

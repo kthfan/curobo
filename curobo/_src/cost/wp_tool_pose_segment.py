@@ -231,6 +231,7 @@ class SegmentToolPoseDistance(ToolPoseDistance):
         """Compute tool-pose costs with the criteria slot of every sample.
 
         Args:
+            ctx: torch.autograd.Function context.
             current_position: Tool positions ``[batch, horizon, links, 3]``.
             current_quat: Tool quaternions (wxyz) ``[batch, horizon, links, 4]``.
             goal_position: Goals ``[goals, goal_horizon, links, goalset, 3]``, with

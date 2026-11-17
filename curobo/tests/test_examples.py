@@ -31,6 +31,7 @@ EXAMPLES = [
     "curobo.examples.getting_started.inverse_kinematics",
     "curobo.examples.getting_started.motion_planning",
     "curobo.examples.getting_started.cartesian_waypoints",
+    "curobo.examples.getting_started.via_point_motion_planning",
     "curobo.examples.getting_started.reactive_control",
     "curobo.examples.getting_started.build_robot_model",
 ]

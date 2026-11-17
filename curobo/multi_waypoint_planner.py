@@ -27,14 +27,13 @@ Example:
     ```
 """
 
+from curobo._src.motion.ik_chain import ChainMetric
 from curobo._src.motion.multi_waypoint_planner import MultiWaypointMotionPlanner
 from curobo._src.motion.multi_waypoint_planner_cfg import (
     MultiWaypointMotionPlannerCfg,
     SegmentPlanCfg,
 )
 from curobo._src.motion.multi_waypoint_planner_result import MultiWaypointPlanResult
-
-from curobo._src.motion.ik_chain import ChainMetric
 
 __all__ = [
     "ChainMetric",

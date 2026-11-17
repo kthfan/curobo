@@ -8,12 +8,12 @@ import math
 
 import torch
 
+from curobo._src.motion.ik_chain import select_ik_chains
 from curobo._src.motion.ik_revolution import (
     dedup_joint_revolutions,
     expand_joint_revolutions,
     prefer_within_limits,
 )
-from curobo._src.motion.ik_chain import select_ik_chains
 
 TURN = 2.0 * math.pi
 DEG = math.pi / 180.0

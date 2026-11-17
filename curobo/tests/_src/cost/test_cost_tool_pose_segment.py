@@ -204,4 +204,3 @@ def test_eef_bound_applies_each_segment_bounds(device_cfg):
     assert len(cost.tool_pose_bounds["a"]) == 2
     with pytest.raises(ValueError):
         cost.update_tool_pose_bounds({"a": floor})
-
