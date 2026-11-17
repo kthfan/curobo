@@ -138,8 +138,12 @@ The planner's IK and trajectory solvers share one robot model. Change it in plac
 plans; the warmed CUDA graphs stay valid. Do not change it while a plan runs.
 
 - **Attach a grasped object**: `planner.attachment_manager.attach_from_scene(grasp_state,
-  ["box"])` fits spheres on the reserved `attached_object` link and disables the box's world
-  copy; `attach(grasp_state, [obstacle])` takes an obstacle that is not in the scene.
+  ["box"], world_objects_pose_offset=Pose.from_list([0, 0, 0, 1, 0, 0, 0]))` fits spheres on
+  the reserved `attached_object` link and disables the box's world copy; `attach(grasp_state,
+  [obstacle], ...)` takes an obstacle that is not in the scene.
+  `world_objects_pose_offset` is the pose of the frame the obstacle poses are given in: the
+  identity for scene obstacles, whose poses are in the base frame. Without it the obstacle pose
+  is read in the tool frame, and the spheres end up far from the object.
   `planner.attachment_manager.detach()` restores the link and re-enables the world copy.
 - **Payload dynamics**: attaching sets only collision geometry. Pass the combined link and payload
   inertial to `planner.update_link_inertial("attached_object", mass, com, inertia)` (or several

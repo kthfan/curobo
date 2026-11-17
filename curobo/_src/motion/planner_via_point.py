@@ -373,8 +373,10 @@ class ViaPointMotionPlanner:
         """Attach scene obstacles to a robot link, or detach them.
 
         ``attach_from_scene`` fits spheres to obstacles of the scene and disables their world
-        copies; ``detach`` restores the link's spheres and re-enables them. The robot
-        configuration must reserve the attachment link and its spheres.
+        copies; ``detach`` restores the link's spheres and re-enables them. Pass the identity
+        as ``world_objects_pose_offset`` for obstacles posed in the base frame; without an
+        offset the obstacle poses are read in the tool frame. The robot configuration must
+        reserve the attachment link and its spheres.
         """
         return self._motion_planner.attachment_manager
 

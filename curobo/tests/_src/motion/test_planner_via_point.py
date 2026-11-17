@@ -26,6 +26,7 @@ from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg
 from curobo._src.robot.kinematics.kinematics import KinematicsCfg
 from curobo._src.state.state_joint import JointState
 from curobo._src.types.device_cfg import DeviceCfg
+from curobo._src.types.pose import Pose
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
 from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
 
@@ -310,8 +311,13 @@ def test_attached_object_follows_the_gripper(planner):
     box = Cuboid(name="held_box", dims=[0.04, 0.04, 0.04], pose=[*center.tolist(), 1, 0, 0, 0])
     params = planner.kinematics.config.kinematics_config
     index = params.get_sphere_index_from_link_name("attached_object")
+    # The box pose is in the base frame: pass that frame's pose (identity) as the offset.
     planner.attachment_manager.attach(
-        start, [box], num_spheres=4, sphere_fit_type=SphereFitType.VOXEL
+        start,
+        [box],
+        num_spheres=4,
+        sphere_fit_type=SphereFitType.VOXEL,
+        world_objects_pose_offset=Pose.from_list([0, 0, 0, 1, 0, 0, 0]),
     )
     try:
         spheres = params.link_spheres[0, index]
