@@ -169,9 +169,24 @@ plans; the warmed CUDA graphs stay valid. Do not change it while a plan runs.
   checks of a link, for example while the gripper touches a part;
   `planner.enable_link_collision` turns them back on.
 
-These are the same operations as on {py:class}`~curobo.motion_planner.MotionPlanner`. The
-via-point planner does not plan single poses: use a separate `MotionPlanner` for those, and apply
-the same model updates to both.
+These are the same operations as on {py:class}`~curobo.motion_planner.MotionPlanner`.
+
+## Move to and from the path
+
+The planner also plans ordinary motions on the same solvers and robot model, so a pick or a
+place needs only one planner:
+
+```python
+planner.warmup(single_goal=True)  # once, after construction
+
+pre_grasp = planner.plan_pose(goal_tool_poses, start)       # MotionPlanner.plan_pose
+retreat = planner.plan_cspace(home_state, current_state)    # MotionPlanner.plan_cspace
+```
+
+Both take the arguments of their `MotionPlanner` counterparts and return a
+`TrajOptSolverResult`, or `None` on failure. They use the default tool pose criteria and no tool
+pose bounds; segment criteria apply to `plan_waypoints` only. Run one plan at a time:
+`plan_pose`, `plan_cspace` and `plan_waypoints` share the optimizer.
 
 ## Diagnose a failed plan
 

@@ -50,6 +50,12 @@
 - `ViaPointMotionPlanner` exposes the shared robot model updates of `MotionPlanner`:
   `kinematics` (locked-joint values), `attachment_manager`, `update_link_inertial`,
   `update_links_inertial`, `enable_link_collision` and `disable_link_collision`.
+- `ViaPointMotionPlanner.plan_pose` and `plan_cspace` run ordinary pose and joint-space
+  plans on the via-point planner's own solvers, so a pick or a place needs one planner;
+  `warmup(single_goal=True)` warms them. The per-segment tool pose tables gain a
+  single-goal mode that reproduces the terminal/path criteria of the upstream cost. After
+  a via-point plan the IK criteria return to their configured values rather than to
+  generic defaults.
 - Choose globally shortest IK chains in the waypoint planners. Both planners add the
   full-turn variants (`q ± 2π`) of IK solutions for joints whose limits span more
   than one turn (`expand_revolutions`), so a joint is not turned into its limit at

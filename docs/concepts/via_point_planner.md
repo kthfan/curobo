@@ -103,6 +103,18 @@ The slot tables have a fixed size, the spline's native reference intervals (at m
 waypoints), and every plan only rewrites their values. The optimizer's CUDA graphs are captured
 once and replayed for every plan.
 
+## Single-goal plans on the same solvers
+
+The optimizer's costs read the slot tables from the first captured graph on, so they cannot
+switch back to the upstream kernel. They do not need to: an ordinary single-goal solve is a
+table with one segment. Before `plan_pose` or `plan_cspace`, the planner writes the optimizer's
+own path criteria into path slot 0 and its terminal criteria into reach slot 0, with the
+criteria's tolerances as cost deadbands and their enforce flags for acceptance; every sample but
+the last valid one reads path slot 0. The segment kernel then evaluates what the upstream kernel
+evaluates, and the segment bounds are cleared. The IK criteria are restored to their configured
+values after every via-point plan, so single-goal plans also start their IK as a
+`MotionPlanner` does. One planner and one robot model serve both kinds of plan.
+
 ## Bounds per segment
 
 The bounds of segment {math}`k` hold on its path samples and at its waypoint. Before a plan,
