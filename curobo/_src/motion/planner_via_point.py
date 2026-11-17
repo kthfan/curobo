@@ -24,13 +24,20 @@ A plan runs these steps:
 
 The trajectory does not stop at intermediate waypoints. It starts at rest at the current state
 and ends at rest at the last waypoint.
+
+The planner also runs ordinary pose and joint-space plans (:meth:`ViaPointMotionPlanner.plan_pose`,
+:meth:`ViaPointMotionPlanner.plan_cspace`) on the same solvers. Its optimizer costs always read the
+segment tables, so before such a plan the tables are rewritten to hold the optimizer's own
+terminal and path criteria and no bounds; the segment kernels then evaluate what the ordinary
+kernels evaluate, and the captured CUDA graphs stay valid.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -54,6 +61,7 @@ from curobo._src.motion.motion_planner import (
 )
 from curobo._src.motion.planner_via_point_cfg import ViaPointMotionPlannerCfg, ViaPointPlanResult
 from curobo._src.robot.kinematics.kinematics import Kinematics
+from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
 from curobo._src.state.state_joint import JointState
 from curobo._src.trajectory.trajectory_pose_reference import _slerp, pose_errors
 from curobo._src.types.tool_pose import GoalToolPose, ToolPose
@@ -270,6 +278,7 @@ class ViaPointMotionPlanner:
             device_cfg=self._motion_planner.device_cfg,
         )
         self._bound_costs = []
+        self._pose_costs = []
         rollouts = [(r, False) for r in trajopt.get_all_rollout_instances()]
         rollouts += [
             (r, name == "interpolated_rollout")
@@ -279,6 +288,7 @@ class ViaPointMotionPlanner:
             for cost in rollout.get_cost_component_by_name("tool_pose"):
                 if cost is not None:
                     cost.attach_segment_table(self._table, dense)
+                    self._pose_costs.append(cost)
             for cost in rollout.get_cost_component_by_name("eef_bound"):
                 if cost is not None:
                     cost.attach_segment_table(self._table, dense)
@@ -287,6 +297,21 @@ class ViaPointMotionPlanner:
             frame: ToolPoseCriteria(device_cfg=self._motion_planner.device_cfg)
             for frame in self.tool_frames
         }
+        # The IK criteria as configured; per-waypoint IK changes them and restores this copy.
+        ik_core = self._motion_planner.ik_solver.core
+        self._ik_pose_costs = [
+            cost
+            for rollout in ik_core.get_all_rollout_instances()
+            for cost in rollout.get_cost_component_by_name("tool_pose")
+            if cost is not None
+        ]
+        self._ik_criteria = [
+            {
+                name: getattr(cost._stacked_tool_pose_criteria, name).clone()
+                for name in cost._stacked_tool_pose_criteria.tensor_field_names()
+            }
+            for cost in self._ik_pose_costs
+        ]
         kinematics = self._motion_planner.kinematics
         self._joint_limits = kinematics.get_joint_limits().position.clone()
         self._velocity_limit = kinematics.get_joint_limits().velocity[1].clone()
@@ -431,12 +456,20 @@ class ViaPointMotionPlanner:
         """Reset the random seeds of the solvers."""
         self._motion_planner.reset_seed()
 
-    def warmup(self, num_waypoints: int = 2, num_warmup_iterations: int = 2) -> None:
+    def warmup(
+        self,
+        num_waypoints: int = 2,
+        num_warmup_iterations: int = 2,
+        single_goal: bool = False,
+    ) -> None:
         """Plan small motions from the default state to compile kernels and capture graphs.
 
         Args:
             num_waypoints: Waypoints of the warmup plan.
             num_warmup_iterations: Number of warmup plans.
+            single_goal: Also warm up :meth:`plan_pose`, including graph-planner seeding, as
+                ``MotionPlanner.warmup`` does. Set it when the application calls
+                :meth:`plan_pose` or :meth:`plan_cspace`.
         """
         state = JointState.from_position(
             self.default_joint_state.position.unsqueeze(0), joint_names=self.joint_names
@@ -453,6 +486,114 @@ class ViaPointMotionPlanner:
         )
         for _ in range(num_warmup_iterations):
             self.plan_waypoints(waypoints, state, max_attempts=1)
+        if single_goal:
+            with self._single_goal():
+                self._motion_planner.warmup(num_warmup_iterations=num_warmup_iterations)
+
+    def plan_pose(
+        self,
+        goal_tool_poses: GoalToolPose,
+        current_state: JointState,
+        use_implicit_goal: bool = True,
+        max_attempts: int = 20,
+        enable_graph_attempt: int = 1,
+        finetune_attempts: int = 1,
+        outer_iterations: int = 2,
+        ik_seed_config: Optional[torch.Tensor] = None,
+    ) -> Optional[TrajOptSolverResult]:
+        """Plan a trajectory to tool poses, as :meth:`MotionPlanner.plan_pose` does.
+
+        The plan uses this planner's solvers, robot model and scene, with the default tool pose
+        criteria and no tool pose bounds; for example, move to a pre-grasp pose before a
+        :meth:`plan_waypoints` approach. Do not run it while another plan runs.
+
+        Args:
+            goal_tool_poses: Goal poses ``[1, 1, tool frames, goalset, 3/4]``.
+            current_state: Start joint state ``[1, dof]``.
+            use_implicit_goal: Let the optimizer choose the final joint configuration.
+            max_attempts: Maximum planning attempts.
+            enable_graph_attempt: Attempt from which graph-planner seeds are used.
+            finetune_attempts: Additional time-optimal refinement passes.
+            outer_iterations: Initial solve/check passes per optimization.
+            ik_seed_config: Optional IK seeds ``[1, n, dof]``.
+
+        Returns:
+            The trajectory optimization result, or ``None`` if planning failed.
+        """
+        with self._single_goal():
+            return self._motion_planner.plan_pose(
+                goal_tool_poses,
+                current_state,
+                use_implicit_goal=use_implicit_goal,
+                max_attempts=max_attempts,
+                enable_graph_attempt=enable_graph_attempt,
+                finetune_attempts=finetune_attempts,
+                outer_iterations=outer_iterations,
+                ik_seed_config=ik_seed_config,
+            )
+
+    def plan_cspace(
+        self,
+        goal_state: JointState,
+        current_state: JointState,
+        max_attempts: int = 20,
+        enable_graph_attempt: int = 1,
+        finetune_attempts: int = 1,
+    ) -> Optional[TrajOptSolverResult]:
+        """Plan a trajectory to a joint configuration, as :meth:`MotionPlanner.plan_cspace` does.
+
+        Args:
+            goal_state: Goal joint state ``[1, dof]``.
+            current_state: Start joint state ``[1, dof]``.
+            max_attempts: Maximum planning attempts.
+            enable_graph_attempt: Attempt from which graph-planner seeds are used.
+            finetune_attempts: Additional time-optimal refinement passes.
+
+        Returns:
+            The trajectory optimization result, or ``None`` if planning failed.
+        """
+        with self._single_goal():
+            return self._motion_planner.plan_cspace(
+                goal_state,
+                current_state,
+                max_attempts=max_attempts,
+                enable_graph_attempt=enable_graph_attempt,
+                finetune_attempts=finetune_attempts,
+            )
+
+    @contextmanager
+    def _single_goal(self) -> Iterator[None]:
+        """Set the segment tables to the optimizer's own criteria for an ordinary plan.
+
+        Every optimizer tool-pose cost reads the shared segment table, so the table takes the
+        criteria those costs hold, which must agree, and the bound costs lose their segment
+        bounds. :meth:`plan_waypoints` rewrites both before its own optimization.
+        """
+        reference = self._pose_costs[0]
+        criteria = reference._stacked_tool_pose_criteria
+        names = criteria.tensor_field_names()
+        for cost in self._pose_costs[1:]:
+            other = cost._stacked_tool_pose_criteria
+            if not all(torch.equal(getattr(criteria, n), getattr(other, n)) for n in names):
+                log_and_raise("the trajectory optimizer's tool pose costs hold different criteria")
+            if not torch.equal(cost._apply_tolerance_to_cost, reference._apply_tolerance_to_cost):
+                log_and_raise("the trajectory optimizer's tool pose costs use different deadbands")
+        self._table.set_single_goal(criteria, reference._apply_tolerance_to_cost)
+        for cost in self._bound_costs:
+            cost.update_segment_tool_pose_bounds([])
+        self._restore_ik_criteria()
+        yield
+
+    def _restore_ik_criteria(self) -> None:
+        """Restore the IK tool-pose criteria and bounds as configured, in place."""
+        self._motion_planner.ik_solver.update_tool_pose_bounds(
+            {frame: None for frame in self.tool_frames}
+        )
+        for cost, saved in zip(self._ik_pose_costs, self._ik_criteria):
+            criteria = cost._stacked_tool_pose_criteria
+            for name, value in saved.items():
+                getattr(criteria, name).copy_(value)
+            cost._refresh_pose_metric_buffers()
 
     # -- Planning --
 
@@ -546,7 +687,7 @@ class ViaPointMotionPlanner:
                     break
                 result.status = "Trajectory optimization found no valid trajectory."
         finally:
-            planner.ik_solver.update_tool_pose_criteria(self._baseline_criteria)
+            self._restore_ik_criteria()
         if result.trajopt_result is not None:
             self._attach_waypoint_errors(result, waypoints)
         result.planning_time = time.time() - started

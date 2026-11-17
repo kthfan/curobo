@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import replace
 
@@ -15,6 +16,7 @@ from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 from curobo._src.geom.sphere_fit.types import SphereFitType
 from curobo._src.geom.types import Cuboid
 from curobo._src.motion.ik_chain import ChainMetric
+from curobo._src.motion.motion_planner import MotionPlanner
 from curobo._src.motion.planner_via_point import (
     ViaPointMotionPlanner,
     allocate_waypoint_indices,
@@ -270,6 +272,123 @@ def test_back_and_forth_path_reaches_every_waypoint(planner):
 # --------------------------------------------------------------------------- #
 # Joints with more than one turn of range (UR10e)
 # --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def plain_planner():
+    """A MotionPlanner with the via-point planner's configuration and no segment tables."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    config = ViaPointMotionPlannerCfg.create(
+        robot="franka.yml", scene_model="collision_table.yml", use_cuda_graph=True
+    )
+    planner = MotionPlanner(config.motion_planner_cfg)
+    planner.warmup(num_warmup_iterations=1)
+    yield planner
+    planner.destroy()
+
+
+def _joint_goal(planner, delta):
+    """A start at the default configuration and a goal ``delta`` (rad) away from it."""
+    start, _ = _home(planner)
+    goal = start.clone()
+    goal.position = goal.position + torch.tensor(delta, device=goal.position.device)
+    return start, goal
+
+
+def _leave_a_via_plan_in_the_tables(planner):
+    start, waypoints = _offsets(
+        planner, [[0.1, 0.0, -0.05], [0.1, 0.15, -0.05], [0.0, 0.15, 0.05]]
+    )
+    frame = planner.tool_frames[0]
+    bounded = ToolPoseCriteria(bounds=[ToolPoseBound(anchor="base", z=(0.2, 1.0))])
+    criteria = [None, {frame: bounded}, {frame: ToolPoseCriteria.track_position()}]
+    result = planner.plan_waypoints(waypoints, start, criteria)
+    assert result.success.item(), result.status
+
+
+DELTA = [0.4, -0.3, 0.2, -0.3, 0.3, 0.4, -0.5]
+
+
+def test_trajectory_optimization_after_a_via_plan_matches_a_motion_planner(planner, plain_planner):
+    """From identical seeds, the single-goal optimizer reproduces the ordinary optimizer."""
+    _leave_a_via_plan_in_the_tables(planner)
+    start, goal = _joint_goal(planner, DELTA)
+    goal_poses = planner.compute_kinematics(goal).tool_poses.as_goal()
+    results = []
+    for solver, context in (
+        (planner._motion_planner.trajopt_solver, planner._single_goal()),
+        (plain_planner.trajopt_solver, contextlib.nullcontext()),
+    ):
+        seeds = goal.position.view(1, 1, -1).repeat(1, solver.config.num_seeds, 1)
+        with context:
+            results.append(
+                solver.solve_pose(goal_poses, start, seed_config=seeds, use_implicit_goal=True)
+            )
+    via, plain = results
+    assert plain.success.item()
+    assert via.success.item() == plain.success.item()
+    torch.testing.assert_close(via.solution, plain.solution, atol=1e-3, rtol=0.0)
+    torch.testing.assert_close(
+        via.js_solution.position, plain.js_solution.position, atol=1e-3, rtol=0.0
+    )
+
+
+def test_plan_pose_reaches_the_goal_between_via_plans(planner):
+    """plan_pose works after a via-point plan, and a via-point plan works after it."""
+    _leave_a_via_plan_in_the_tables(planner)
+    start, goal = _joint_goal(planner, DELTA)
+    goal_poses = planner.compute_kinematics(goal).tool_poses.as_goal()
+    planner.reset_seed()
+    result = planner.plan_pose(goal_poses, start, max_attempts=2)
+    assert result is not None and result.success.item()
+    trajectory = result.get_interpolated_plan()
+    final = trajectory.position.reshape(-1, trajectory.position.shape[-1])[-1:]
+    final = JointState.from_position(final, joint_names=trajectory.joint_names)
+    final = planner._motion_planner.trajopt_solver.get_active_js(final)
+    reached = planner.compute_kinematics(final).tool_poses
+    error = (reached.position[0, 0, 0] - goal_poses.position[0, 0, 0, 0]).norm()
+    assert error < 0.005
+    _leave_a_via_plan_in_the_tables(planner)
+
+
+def test_plan_cspace_reaches_the_joint_goal(planner):
+    _leave_a_via_plan_in_the_tables(planner)
+    start, goal = _joint_goal(planner, DELTA)
+    planner.reset_seed()
+    result = planner.plan_cspace(goal, start, max_attempts=2)
+    assert result is not None and result.success.item()
+    trajectory = result.get_interpolated_plan()
+    final = JointState.from_position(
+        trajectory.position.reshape(-1, trajectory.position.shape[-1])[-1:],
+        joint_names=trajectory.joint_names,
+    )
+    final = planner._motion_planner.trajopt_solver.get_active_js(final)
+    torch.testing.assert_close(final.position, goal.position, atol=0.01, rtol=0.0)
+
+
+def test_single_goal_restores_the_configured_ik_criteria(planner, plain_planner):
+    """The IK criteria after a via-point plan are the configured ones, not generic defaults."""
+    _leave_a_via_plan_in_the_tables(planner)
+    names = planner._ik_pose_costs[0]._stacked_tool_pose_criteria.tensor_field_names()
+    plain = [
+        cost
+        for rollout in plain_planner.ik_solver.core.get_all_rollout_instances()
+        for cost in rollout.get_cost_component_by_name("tool_pose")
+        if cost is not None
+    ]
+    assert len(plain) == len(planner._ik_pose_costs)
+    for ours, theirs in zip(planner._ik_pose_costs, plain):
+        for name in names:
+            torch.testing.assert_close(
+                getattr(ours._stacked_tool_pose_criteria, name),
+                getattr(theirs._stacked_tool_pose_criteria, name),
+            )
+
+
+def test_warmup_covers_single_goal_plans(planner):
+    planner.warmup(num_warmup_iterations=1, single_goal=True)
+    _leave_a_via_plan_in_the_tables(planner)
 
 
 FINGERS = ["panda_finger_joint1", "panda_finger_joint2"]

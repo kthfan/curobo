@@ -12,6 +12,12 @@ criteria of one *slot*:
   fields of segment ``j``'s criteria and an enforced reach tolerance. The samples after the last
   waypoint, where the trajectory rests at the goal, use the last reach slot.
 
+:meth:`ToolPoseSegmentTable.set_single_goal` instead writes the criteria of an ordinary
+single-goal solve: path slot 0 on every sample but the last valid one, which uses reach slot 0,
+with the criteria's own tolerances as cost deadbands. The slot-indexed kernel then evaluates
+exactly what the upstream terminal/path kernel evaluates, so a solver with an attached table can
+also run ordinary pose and joint-space solves.
+
 :class:`ToolPoseSegmentTable` holds the fixed-capacity criteria tables shared by every tool-pose
 cost of one trajectory optimizer. :class:`ToolPoseSegmentState` maps each cost's samples to slots,
 for native samples (fixed per plan) or dense validation samples (from their reference progress).
@@ -24,7 +30,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.cost.tool_pose_criteria import StackedToolPoseCriteria, ToolPoseCriteria
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.util.logging import log_and_raise
 
@@ -110,6 +116,9 @@ class ToolPoseSegmentTable:
         self.last_segment = torch.zeros((), device=device, dtype=torch.int64)
         #: Reach slot of the last waypoint (0-d, int32).
         self.final_slot = torch.full((), capacity, device=device, dtype=torch.int32)
+        #: Slot of the samples before the last one in evaluations off the native grid (0-d,
+        #: int32): the final slot for a planned trajectory, path slot 0 for a single goal.
+        self.offgrid_slot = torch.full((), capacity, device=device, dtype=torch.int32)
         #: Dense validation progress and sample counts, bound by the dense tool-pose cost.
         self.dense_progress: Optional[torch.Tensor] = None
         self.dense_counts: Optional[torch.Tensor] = None
@@ -159,11 +168,7 @@ class ToolPoseSegmentTable:
                         fields["enf"].append(self.enforce.new_ones(()))
         stacked = {key: torch.stack(values) for key, values in fields.items()}
         index = torch.tensor(rows, device=self.device_cfg.device, dtype=torch.long)
-        self.position_metric.zero_()
-        self.rotation_metric.zero_()
-        self.error_frame.zero_()
-        self.tolerance.zero_()
-        self.enforce.zero_()
+        self._clear()
         self.position_metric.index_copy_(0, index, _metric(stacked["pp"], stacked["ps"]))
         self.rotation_metric.index_copy_(0, index, _metric(stacked["rp"], stacked["rs"]))
         self.error_frame.index_copy_(0, index, stacked["frame"].to(torch.int32))
@@ -175,7 +180,69 @@ class ToolPoseSegmentTable:
         self.waypoint_indices.copy_(indices)
         self.last_segment.fill_(n - 1)
         self.final_slot.fill_(cap + n - 1)
+        self.offgrid_slot.fill_(cap + n - 1)
         self.num_segments = n
+
+    def set_single_goal(self, criteria: StackedToolPoseCriteria, deadband_scale: torch.Tensor):
+        """Write the criteria of an ordinary single-goal solve in place.
+
+        The table then reproduces the upstream tool-pose cost: the path fields of ``criteria`` on
+        every sample but the last valid one, the terminal fields on the last valid sample, the
+        criteria's enforce flags for acceptance, and their tolerances times ``deadband_scale``
+        as cost deadbands.
+
+        Args:
+            criteria: Stacked criteria ``[links, ...]`` of the solver's tool-pose costs.
+            deadband_scale: 0-d factor of the cost deadbands (``1`` unless waypoint tracking
+                disabled them).
+        """
+        cap, links = self.capacity, len(self.tool_frames)
+        if criteria.path_tolerance.shape[0] != links:
+            log_and_raise(f"single-goal criteria must hold {links} tool frames")
+        path = torch.arange(links, device=self.device_cfg.device)
+        reach = cap * links + path
+        self._clear()
+        for rows, prefix in ((path, "path"), (reach, "terminal")):
+            self.position_metric.index_copy_(
+                0,
+                rows,
+                _metric(
+                    getattr(criteria, f"{prefix}_position_projector"),
+                    getattr(criteria, f"{prefix}_position_axis_scale"),
+                ),
+            )
+            self.rotation_metric.index_copy_(
+                0,
+                rows,
+                _metric(
+                    getattr(criteria, f"{prefix}_rotation_projector"),
+                    getattr(criteria, f"{prefix}_rotation_axis_scale"),
+                ),
+            )
+            self.error_frame.index_copy_(0, rows, criteria.error_frame.to(torch.int32))
+            tolerance = getattr(criteria, f"{prefix}_tolerance")
+            self.tolerance.view(-1, 2).index_copy_(0, rows, tolerance)
+            self.deadband.index_copy_(0, rows, tolerance * deadband_scale)
+            enforce = getattr(criteria, f"enforce_{prefix}_tolerance").reshape(-1)
+            self.enforce.view(-1).index_copy_(0, rows, enforce.to(self.enforce.dtype))
+        slots = [0] * (self.horizon - 1) + [cap]
+        self.native_slots.copy_(self.native_slots.new_tensor(slots))
+        indices = torch.full((cap,), torch.inf, dtype=self.waypoint_indices.dtype)
+        indices[0] = float(self.horizon - 1)
+        self.waypoint_indices.copy_(indices)
+        self.last_segment.fill_(0)
+        self.final_slot.fill_(cap)
+        self.offgrid_slot.fill_(0)
+        self.num_segments = 0
+
+    def _clear(self) -> None:
+        """Zero every criteria table."""
+        self.position_metric.zero_()
+        self.rotation_metric.zero_()
+        self.deadband.zero_()
+        self.error_frame.zero_()
+        self.tolerance.zero_()
+        self.enforce.zero_()
 
     def write_sample_slots(
         self,
@@ -193,8 +260,12 @@ class ToolPoseSegmentTable:
         """
         if progress is None:
             if out.shape[1] != self.horizon:
-                # Evaluations off the native grid (such as goal-only checks) reach the goal.
-                out.copy_(self.final_slot.expand_as(out))
+                # Evaluations off the native grid (such as goal-only checks): the last sample
+                # reaches the goal; the others do too for a planned trajectory and follow the
+                # path criteria for a single goal, as in the upstream kernel.
+                sample = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
+                last = (sample == out.shape[1] - 1).expand_as(out)
+                out.copy_(torch.where(last, self.final_slot, self.offgrid_slot))
             else:
                 out.copy_(self.native_slots.unsqueeze(0).expand_as(out))
             return out
@@ -241,8 +312,11 @@ class ToolPoseSegmentState:
             )
         if self.dense:
             if progress is None or counts is None:
-                # Dense samples without a reference rest at the goal reached by the last slot.
-                self.slots.copy_(self.table.final_slot.expand_as(self.slots))
+                # Dense samples without a reference: as off the native grid, the last sample
+                # reaches the goal and the others use the table's off-grid slot.
+                sample = torch.arange(horizon, device=self.slots.device).unsqueeze(0)
+                last = (sample == horizon - 1).expand_as(self.slots)
+                self.slots.copy_(torch.where(last, self.table.final_slot, self.table.offgrid_slot))
                 return self.slots
             return self.table.write_sample_slots(
                 self.slots, counts, progress.reshape(batch_size, horizon)

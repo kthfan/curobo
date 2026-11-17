@@ -204,3 +204,139 @@ def test_eef_bound_applies_each_segment_bounds(device_cfg):
     assert len(cost.tool_pose_bounds["a"]) == 2
     with pytest.raises(ValueError):
         cost.update_tool_pose_bounds({"a": floor})
+
+
+def _tolerant_criteria(device_cfg):
+    """Criteria with path and terminal tolerances, enforced on one frame only."""
+    from dataclasses import replace
+
+    return {
+        "a": replace(
+            ToolPoseCriteria.linear_motion("z", device_cfg=device_cfg),
+            path_tolerance=(10.0, 2.0),
+            terminal_tolerance=(0.3, 0.2),
+            enforce_path_tolerance=True,
+            enforce_terminal_tolerance=True,
+        ),
+        "b": replace(
+            ToolPoseCriteria.track_pose(non_terminal_scale=0.3, device_cfg=device_cfg),
+            path_tolerance=(0.2, 0.1),
+            terminal_tolerance=(0.5, 0.4),
+        ),
+    }
+
+
+def _single_goal_pair(device_cfg, horizon, table_horizon, dense):
+    criteria = _tolerant_criteria(device_cfg)
+    reference, segmented = _cost(device_cfg, criteria), _cost(device_cfg, criteria)
+    table = ToolPoseSegmentTable(FRAMES, 4, table_horizon, 1, device_cfg)
+    # A previous via-point plan must not leak into the single-goal table.
+    table.set_plan([criteria, criteria], [criteria, criteria], [2, table_horizon - 2])
+    segmented.attach_segment_table(table, dense=dense)
+    table.set_single_goal(
+        reference._stacked_tool_pose_criteria, reference._apply_tolerance_to_cost
+    )
+    for cost in (reference, segmented):
+        cost.setup_batch_tensors(2, horizon)
+    return reference, segmented
+
+
+def _single_goal_problem(device_cfg, horizon, seed):
+    current, goal = _random_problem(device_cfg, 2, horizon, torch.Generator().manual_seed(seed))
+    # Single-goal solves pass one goal per problem, not one per sample.
+    goal = GoalToolPose(
+        FRAMES, goal.position[:, :1].contiguous(), goal.quaternion[:, :1].contiguous()
+    )
+    routes = torch.tensor([[0], [1]], device=device_cfg.device, dtype=torch.int32)
+    return current, goal, routes
+
+
+def _assert_same_evaluation(reference, segmented, current, goal, routes):
+    expected = _evaluate(reference, current, goal, routes)
+    actual = _evaluate(segmented, current, goal, routes)
+    for e, a in zip(expected, actual):
+        torch.testing.assert_close(a, e, atol=1e-6, rtol=1e-5)
+    position_error, rotation_error = expected[1], expected[2]
+    torch.testing.assert_close(
+        segmented.get_path_feasibility(position_error, rotation_error, current),
+        reference.get_path_feasibility(position_error, rotation_error, current),
+    )
+    for e, a in zip(
+        reference.get_convergence_errors(position_error, rotation_error),
+        segmented.get_convergence_errors(position_error, rotation_error),
+    ):
+        torch.testing.assert_close(a, e)
+
+
+@pytest.mark.parametrize("table_horizon", [9, 6], ids=["native", "off_grid"])
+def test_single_goal_table_reproduces_the_terminal_path_cost(device_cfg, table_horizon):
+    """With tolerances as deadbands and enforce flags, on and off the native grid."""
+    horizon = 9
+    reference, segmented = _single_goal_pair(device_cfg, horizon, table_horizon, dense=False)
+    current, goal, routes = _single_goal_problem(device_cfg, horizon, seed=2)
+    _assert_same_evaluation(reference, segmented, current, goal, routes)
+    position_error, rotation_error = _evaluate(reference, current, goal, routes)[1:3]
+    feasible = reference.get_path_feasibility(position_error, rotation_error, current)
+    # Path samples are within the wide path tolerance; the last sample misses the goal.
+    assert feasible[:, :-1].all() and not feasible[:, -1].any()
+
+
+def test_single_goal_table_reproduces_dense_validation(device_cfg):
+    """Dense samples with reference progress and fewer valid samples than the buffer."""
+    horizon = 7
+    reference, segmented = _single_goal_pair(device_cfg, horizon, 9, dense=True)
+    progress = torch.linspace(0.0, 1.0, horizon, device=device_cfg.device).repeat(2, 1)
+    counts = torch.tensor([5, 7], device=device_cfg.device, dtype=torch.int32)
+    for cost in (reference, segmented):
+        cost.set_reference_samples(progress, counts, padding=1)
+    current, goal, routes = _single_goal_problem(device_cfg, horizon, seed=3)
+    _assert_same_evaluation(reference, segmented, current, goal, routes)
+
+
+def test_a_plan_after_a_single_goal_has_no_deadband_and_ends_off_grid_at_the_goal(device_cfg):
+    table = ToolPoseSegmentTable(FRAMES, 4, 9, 1, device_cfg)
+    criteria = _tolerant_criteria(device_cfg)
+    cost = _cost(device_cfg, criteria)
+    table.set_single_goal(cost._stacked_tool_pose_criteria, cost._apply_tolerance_to_cost)
+    assert table.deadband.abs().sum() > 0
+    table.set_plan([criteria, criteria], [criteria, criteria], [3, 7])
+    assert table.deadband.abs().sum() == 0
+    slots = torch.zeros((1, 4), device=device_cfg.device, dtype=torch.int32)
+    table.write_sample_slots(slots)
+    assert slots[0].tolist() == [4 + 1] * 4
+
+
+def test_single_goal_clears_segment_bounds(device_cfg):
+    """Clearing the segment bounds, as a single-goal plan does, leaves no bound cost."""
+    horizon = 9
+    cost = EEFBoundCost(
+        EEFBoundCostCfg(weight=1.0, device_cfg=device_cfg, tool_frames=["a"], metric=True)
+    )
+    table = ToolPoseSegmentTable(["a"], 4, horizon, 1, device_cfg)
+    free = {"a": ToolPoseCriteria(device_cfg=device_cfg)}
+    table.set_plan([free, free], [free, free], [3, 6])
+    cost.attach_segment_table(table, dense=False)
+    cost.update_segment_tool_pose_bounds([{"a": ToolPoseBound(anchor="base", z=(None, 0.5))}])
+    position = torch.ones((1, horizon, 1, 3), device=device_cfg.device)
+    quaternion = torch.zeros((1, horizon, 1, 4), device=device_cfg.device)
+    quaternion[..., 0] = 1.0
+    poses = ToolPose(["a"], position, quaternion)
+    assert (cost.forward(poses) > 0).any()
+    table.set_single_goal(
+        _single_frame_criteria(device_cfg), torch.ones((), device=device_cfg.device)
+    )
+    cost.update_segment_tool_pose_bounds([])
+    assert not cost.tool_pose_bounds["a"]
+    assert (cost.forward(poses) == 0).all()
+
+
+def _single_frame_criteria(device_cfg):
+    cost = ToolPoseCost(
+        ToolPoseCostCfg(
+            weight=[1.0, 1.0],
+            tool_frames=["a"],
+            tool_pose_criteria={"a": _tolerant_criteria(device_cfg)["a"]},
+            device_cfg=device_cfg,
+        )
+    )
+    return cost._stacked_tool_pose_criteria
