@@ -76,21 +76,24 @@ The terminal fields set how the segment's waypoint is reached. For example
 ## Bound a segment
 
 {py:class}`~curobo.types.ToolPoseBound` limits in a segment's criteria hold inside that segment
-only. Here the gripper, whose z axis points down, must stay within 10° of straight down while
-it moves to the second waypoint:
+only. Here the gripper axis (tool z) must stay within 10° of its direction at the start while
+the tool moves to the second waypoint:
 
 ```python
 from curobo.types import ToolPoseBound
 
-pointing_down = ToolPoseCriteria(
-    bounds=[ToolPoseBound.axis_tilt(reference_axis=(0.0, 0.0, -1.0), max_angle=0.17, anchor="base")]
+w, x, y, z = home.quaternion[0, 0, 0].tolist()
+gripper_axis = [2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)]  # base frame
+steady = ToolPoseCriteria(
+    bounds=[ToolPoseBound.axis_tilt(reference_axis=gripper_axis, max_angle=0.17, anchor="base")]
 )
-result = planner.plan_waypoints(waypoints, start, [None, {frame: pointing_down}, None])
+result = planner.plan_waypoints(waypoints, start, [None, {frame: steady}, None])
 ```
 
-The reference axis must match the tool's orientation at the waypoints: with the default
-`reference_axis` of `+z`, this bound would require the gripper to point up, which no IK
-solution of these waypoints satisfies.
+The reference axis must match the tool's orientation at the waypoints. With the default
+`reference_axis` of `+z`, the bound would ask the downward-pointing gripper to point up; and the
+Franka's default gripper axis is about 17° off vertical, so even a cone around `-z` would exclude
+these waypoints, which keep that orientation.
 
 A `"goal"` anchor is the segment's waypoint, and a `"start"` anchor is the previous waypoint
 (the current pose for the first segment). IK solutions of a waypoint that violate the bounds of

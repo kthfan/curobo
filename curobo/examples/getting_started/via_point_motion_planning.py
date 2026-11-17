@@ -7,14 +7,14 @@ A pick usually takes more than one pose: move above the part, then go straight
 down onto it. The via-point planner takes an *ordered list* of Cartesian
 waypoints and returns one trajectory that passes through all of them without
 stopping. The motion that ends at a waypoint, its segment, can have its own
-constraints: here the last segment moves straight down while the gripper keeps
-pointing down.
+constraints: here the last segment moves straight down without tilting the
+gripper.
 
 By the end of this tutorial you will have:
 
 - Created and warmed up a via-point planner for the Franka Panda robot
 - Built three Cartesian waypoints from the robot's current tool pose
-- Constrained the last segment to a straight descent with the gripper pointing down
+- Constrained the last segment to a straight descent that keeps the gripper's direction
 - Planned one trajectory through all waypoints and saved a plot
 
 Step 1: Run the tutorial
@@ -62,8 +62,11 @@ Step 3: Understand the pipeline
    entry combines ``ToolPoseCriteria.linear_motion("z")`` with
    ``enforce_path_tolerance``, so the descent fails rather than leaving its
    line by more than 5 mm, and a ``ToolPoseBound.axis_tilt`` bound that keeps
-   the tool z axis within 10° of the base -z axis: the Franka gripper points
-   along its z axis, which points down here.
+   the gripper axis (tool z) within 10° of its direction at the start. The
+   reference axis must match the waypoints' orientation: the default ``+z``
+   would ask the downward-pointing gripper to point up, and the Franka's
+   default gripper axis is about 17° off vertical, so a cone around ``-z``
+   would exclude every waypoint.
 
 4. **Plan and execute**: ``plan_waypoints`` returns a ``ViaPointPlanResult``.
    Check ``success`` before using the trajectory; ``status`` explains a
@@ -127,6 +130,13 @@ def _waypoints_from_offsets(
     )
 
 
+def _tool_z_axis(planner: ViaPointMotionPlanner, state: JointState) -> List[float]:
+    """Return the z axis of the first tool frame in the base frame at ``state``."""
+    quaternion = planner.compute_kinematics(state).tool_poses.quaternion
+    w, x, y, z = quaternion.reshape(-1, 4)[0].tolist()
+    return [2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)]
+
+
 def _plot_trajectory(
     positions: torch.Tensor,
     joint_names: List[str],
@@ -157,7 +167,7 @@ def _plot_trajectory(
 
 
 def via_point_planning_example(output_dir: Optional[Path] = None) -> bool:
-    """Plan through three waypoints, the last one reached by a straight downward descent.
+    """Plan through three waypoints, the last one reached by a straight, untilted descent.
 
     Args:
         output_dir: Where to save output files. Defaults to
@@ -189,15 +199,16 @@ def via_point_planning_example(output_dir: Optional[Path] = None) -> bool:
     waypoints = _waypoints_from_offsets(planner, start, offsets)
 
     frame = planner.tool_frames[0]
+    gripper_axis = _tool_z_axis(planner, start)
     descent = replace(
         ToolPoseCriteria.linear_motion("z"),
         # 5 mm off the line, 0.05 rad of rotation (expressed as 2 * sin(angle / 2)).
         path_tolerance=(0.005, 2.0 * math.sin(0.05 / 2.0)),
         enforce_path_tolerance=True,
-        # The gripper's z axis stays within 10 deg of straight down (the base -z axis).
+        # The gripper axis stays within 10 deg of its direction at the start.
         bounds=[
             ToolPoseBound.axis_tilt(
-                reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10.0), anchor="base"
+                reference_axis=gripper_axis, max_angle=math.radians(10.0), anchor="base"
             )
         ],
     )
