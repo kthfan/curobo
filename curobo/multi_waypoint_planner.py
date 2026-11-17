@@ -34,7 +34,10 @@ from curobo._src.motion.multi_waypoint_planner_cfg import (
 )
 from curobo._src.motion.multi_waypoint_planner_result import MultiWaypointPlanResult
 
+from curobo._src.motion.ik_chain import ChainMetric
+
 __all__ = [
+    "ChainMetric",
     "MultiWaypointMotionPlanner",
     "MultiWaypointMotionPlannerCfg",
     "SegmentPlanCfg",

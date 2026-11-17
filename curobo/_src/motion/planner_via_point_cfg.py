@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from curobo._src.motion.ik_chain import ChainMetric, ChainMetricLike
 from curobo._src.motion.motion_planner_cfg import MotionPlannerCfg
 from curobo._src.solver.solver_trajopt_result import TrajOptSolverResult
 from curobo._src.state.state_joint import JointState
@@ -25,8 +26,9 @@ class ViaPointMotionPlannerCfg:
     #: Whole-plan retries; each one solves the waypoint IK again with new seeds.
     max_attempts: int = 3
 
-    #: IK solutions requested per waypoint, before de-duplication.
-    ik_return_seeds: int = 16
+    #: IK solutions requested per waypoint, before de-duplication; at most the IK solver's
+    #: seeds, of which only the successful ones are kept.
+    ik_return_seeds: int = 64
 
     #: Joint-space distance (weighted L-infinity, rad or m) under which two IK solutions of a
     #: waypoint count as one.
@@ -47,6 +49,40 @@ class ViaPointMotionPlannerCfg:
     #: limited by the optimizer's ``maximum_trajectory_dt``.
     geometry_dt_scale: float = 10.0
 
+    #: Add the full-turn variants of every IK solution (``q ± 2π`` on revolute joints whose
+    #: limits span more than one turn) to the waypoint's IK solutions, so the IK chain can
+    #: reach a waypoint "the other way round" when that makes the whole path shorter.
+    expand_revolutions: bool = True
+
+    #: Seed the IK of every waypoint with the current state and the IK solutions of the
+    #: previous waypoint, besides random seeds, so the IK branches found at a waypoint have
+    #: their nearest continuation at the next one.
+    seed_ik_from_previous: bool = True
+
+    #: How the length of an IK chain is measured when the planner looks for the shortest one:
+    #: Euclidean joint-space distance, total joint rotation, time at the joint velocity limits,
+    #: or the largest motion of one joint. See :class:`~curobo._src.motion.ik_chain.ChainMetric`.
+    #: Segments also get native reference samples in proportion to their length in this metric.
+    chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN
+
+    #: The first attempt seeds the optimizer only with IK chains at most this fraction longer
+    #: (in joint space) than the shortest chain, and returns the fastest trajectory among them.
+    #: ``None`` seeds the shortest chain to every IK solution of the last waypoint instead, as
+    #: retries do: the fastest trajectory then may take a much longer way in joint space.
+    chain_length_slack: Optional[float] = 0.1
+
+    #: Largest joint-space offset (rad or m) at the middle of every segment for the seeds that
+    #: repeat an IK chain. The first attempt seeds at most half as many chains as seeds, so every
+    #: chain has a straight seed and at least one bent one: the optimizer can cut the corner at
+    #: a waypoint from a straight seed and pass it from a bent one. Zero repeats the straight
+    #: seed.
+    seed_bulge: float = 0.4
+
+    #: Fraction of every joint's range that IK solutions keep from the joint limits, when a
+    #: waypoint has other solutions. It matches the range in which the trajectory optimizer's
+    #: joint limit cost is active: the optimizer does not reach a solution closer to a limit.
+    joint_limit_margin: float = 0.01
+
     def __post_init__(self):
         if self.max_attempts < 1 or self.ik_return_seeds < 1 or self.min_segment_intervals < 1:
             log_and_raise("max_attempts, ik_return_seeds and min_segment_intervals must be >= 1")
@@ -54,6 +90,13 @@ class ViaPointMotionPlannerCfg:
             log_and_raise("geometry_dt_scale must be positive")
         if self.ik_dedup_joint_tol < 0.0:
             log_and_raise("ik_dedup_joint_tol must be >= 0")
+        self.chain_metric = ChainMetric(self.chain_metric)
+        if self.chain_length_slack is not None and self.chain_length_slack < 0.0:
+            log_and_raise("chain_length_slack must be >= 0 or None")
+        if self.seed_bulge < 0.0:
+            log_and_raise("seed_bulge must be >= 0")
+        if not 0.0 <= self.joint_limit_margin < 0.5:
+            log_and_raise("joint_limit_margin must be in [0, 0.5)")
 
     @classmethod
     def create(
@@ -61,13 +104,20 @@ class ViaPointMotionPlannerCfg:
         robot: Any,
         *,
         max_attempts: int = 3,
-        ik_return_seeds: int = 16,
+        ik_return_seeds: int = 64,
         ik_dedup_joint_tol: float = 0.05,
         waypoint_tolerance: Tuple[float, float] = (0.005, 0.05),
         min_segment_intervals: int = 8,
         geometry_dt_scale: float = 10.0,
+        expand_revolutions: bool = True,
+        seed_ik_from_previous: bool = True,
+        chain_metric: ChainMetricLike = ChainMetric.EUCLIDEAN,
+        chain_length_slack: Optional[float] = 0.1,
+        seed_bulge: float = 0.4,
+        joint_limit_margin: float = 0.01,
         num_knots: int = 64,
         num_trajopt_seeds: int = 8,
+        num_ik_seeds: int = 64,
         **motion_planner_kwargs: Any,
     ) -> ViaPointMotionPlannerCfg:
         """Build a configuration from a robot and via-point planning parameters.
@@ -80,13 +130,24 @@ class ViaPointMotionPlannerCfg:
             waypoint_tolerance: Default reach tolerance (m, rad).
             min_segment_intervals: Fewest native reference intervals per segment.
             geometry_dt_scale: Time step scale of the geometric optimization.
+            expand_revolutions: Add the full-turn variants of the IK solutions.
+            seed_ik_from_previous: Seed every waypoint's IK with the previous waypoint's
+                solutions.
+            chain_metric: How IK chain length is measured: ``"euclidean"``,
+                ``"total_rotation"``, ``"time"`` or ``"max_norm"``.
+            chain_length_slack: Longest IK chain seeded on the first attempt, as a fraction
+                above the shortest chain; ``None`` for no limit.
+            seed_bulge: Largest mid-segment offset of the seeds that repeat a chain.
+            joint_limit_margin: Fraction of every joint's range kept from the joint limits.
             num_knots: Spline controls of the trajectory optimizer. More controls follow sharp
                 corners at the waypoints more closely and hold more waypoints; fewer give
                 somewhat shorter motions and miss more corners.
-            num_trajopt_seeds: Trajectory optimization seeds, one per IK chain. More chains
-                cover more IK branches of the waypoints.
+            num_trajopt_seeds: Trajectory optimization seeds, one per IK chain.
+            num_ik_seeds: IK seeds per waypoint. More seeds find more of a waypoint's IK
+                solutions, so the shortest chain through them is closer to the shortest
+                possible one.
             **motion_planner_kwargs: Forwarded to :meth:`MotionPlannerCfg.create`, for example
-                ``scene_model`` or ``num_trajopt_seeds``.
+                ``scene_model``.
 
         Returns:
             The configuration.
@@ -96,6 +157,7 @@ class ViaPointMotionPlannerCfg:
                 robot,
                 num_knots=num_knots,
                 num_trajopt_seeds=num_trajopt_seeds,
+                num_ik_seeds=num_ik_seeds,
                 **motion_planner_kwargs,
             ),
             max_attempts=max_attempts,
@@ -104,6 +166,12 @@ class ViaPointMotionPlannerCfg:
             waypoint_tolerance=waypoint_tolerance,
             min_segment_intervals=min_segment_intervals,
             geometry_dt_scale=geometry_dt_scale,
+            expand_revolutions=expand_revolutions,
+            seed_ik_from_previous=seed_ik_from_previous,
+            chain_metric=chain_metric,
+            chain_length_slack=chain_length_slack,
+            seed_bulge=seed_bulge,
+            joint_limit_margin=joint_limit_margin,
         )
 
 

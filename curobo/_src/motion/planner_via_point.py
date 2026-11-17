@@ -38,7 +38,14 @@ from curobo._src.cost.cost_eef_bound_eval import tool_pose_bounds_violation
 from curobo._src.cost.cost_tool_pose_segment import ToolPoseSegmentTable
 from curobo._src.cost.tool_pose_bound import ToolPoseBound, ToolPoseBoundAnchor
 from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
+from curobo._src.motion.ik_chain import chain_step_lengths, select_ik_chains
 from curobo._src.motion.ik_dedup import dedup_joint_solutions
+from curobo._src.motion.ik_revolution import (
+    dedup_joint_revolutions,
+    expand_joint_revolutions,
+    prefer_within_limits,
+    revolute_joint_mask,
+)
 from curobo._src.motion.motion_planner import (
     MotionPlanner,
     _initial_iteration_budget,
@@ -139,39 +146,6 @@ def interpolate_via_point_reference(
     )
 
 
-def select_ik_chains(
-    start: torch.Tensor, layers: Sequence[torch.Tensor], num_chains: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pick IK chains through the waypoint layers by shortest joint-space path.
-
-    Every chain is the shortest path from the start to one IK solution of the last waypoint;
-    the ``num_chains`` chains end on the solutions with the shortest paths, repeated when the
-    last waypoint has fewer solutions.
-
-    Args:
-        start: Start configuration ``[dof]``.
-        layers: IK solutions of every waypoint, ``[M_j, dof]`` each.
-        num_chains: Number of chains to return.
-
-    Returns:
-        Chains ``[num_chains, N, dof]`` and their joint-space path lengths ``[num_chains]``.
-    """
-    cost = (layers[0] - start).norm(dim=-1)
-    parents = []
-    for previous, layer in zip(layers[:-1], layers[1:]):
-        total = cost.unsqueeze(1) + torch.cdist(previous, layer)
-        cost, parent = total.min(dim=0)
-        parents.append(parent)
-    order = torch.argsort(cost)
-    picks = order[torch.arange(num_chains, device=order.device) % order.numel()]
-    nodes = [picks]
-    for parent in reversed(parents):
-        nodes.append(parent[nodes[-1]])
-    nodes.reverse()
-    chains = torch.stack([layer[index] for layer, index in zip(layers, nodes)], dim=1)
-    return chains, cost[picks]
-
-
 def knot_space_seeds(
     start: torch.Tensor,
     chains: torch.Tensor,
@@ -179,6 +153,7 @@ def knot_space_seeds(
     padding: int,
     intervals: int,
     num_knots: int,
+    bulge: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Spline control seeds that follow each IK chain at its waypoints' reference progress.
 
@@ -189,6 +164,8 @@ def knot_space_seeds(
         padding: Native index of the start sample.
         intervals: Native reference intervals.
         num_knots: Number of spline controls.
+        bulge: Joint-space offset ``[S, N, dof]`` of every seed at the middle of every segment.
+            It fades to zero at the segment's ends, so the seed still passes the chain.
 
     Returns:
         Seeds ``[S, num_knots, dof]``; the last control is the chain's last configuration.
@@ -204,7 +181,10 @@ def knot_space_seeds(
     segment = (torch.searchsorted(progress, knots, right=True) - 1).clamp(0, n - 1)
     t = ((knots - progress[segment]) / (progress[segment + 1] - progress[segment])).clamp(0, 1)
     t = t.view(1, num_knots, 1)
-    return (1 - t) * configs[:, segment] + t * configs[:, segment + 1]
+    knot_seeds = (1 - t) * configs[:, segment] + t * configs[:, segment + 1]
+    if bulge is not None:
+        knot_seeds = knot_seeds + torch.sin(math.pi * t) * bulge[:, segment]
+    return knot_seeds
 
 
 def base_anchored_segment_bounds(
@@ -307,6 +287,10 @@ class ViaPointMotionPlanner:
             frame: ToolPoseCriteria(device_cfg=self._motion_planner.device_cfg)
             for frame in self.tool_frames
         }
+        kinematics = self._motion_planner.kinematics
+        self._joint_limits = kinematics.get_joint_limits().position.clone()
+        self._velocity_limit = kinematics.get_joint_limits().velocity[1].clone()
+        self._revolute_joints = revolute_joint_mask(kinematics.kinematics_config)
 
     # -- Lifecycle --
 
@@ -343,6 +327,13 @@ class ViaPointMotionPlanner:
     def default_joint_state(self) -> JointState:
         """Default joint state of the robot."""
         return self._motion_planner.default_joint_state
+
+    @property
+    def _position_limits(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Joint position limits ``[dof]`` (lower, upper) with the configured margin."""
+        lower, upper = self._joint_limits[0], self._joint_limits[1]
+        margin = self.config.joint_limit_margin * (upper - lower)
+        return lower + margin, upper - margin
 
     @property
     def max_waypoints(self) -> int:
@@ -442,9 +433,15 @@ class ViaPointMotionPlanner:
         )
         try:
             for attempt in range(max_attempts or self.config.max_attempts):
-                # Retries keep the random state, so they solve IK with new seeds.
+                # The first attempt follows the shortest IK chains: IK continues the previous
+                # waypoint's solutions and only chains near the shortest are seeded. Retries
+                # explore: they keep the random state, solve IK from random seeds only, and
+                # seed the shortest chain to every IK solution of the last waypoint.
                 result.attempts = attempt + 1
-                layers, status = self._ik_layers(waypoints, state, criteria, segment_bounds)
+                explore = attempt > 0
+                layers, status = self._ik_layers(
+                    waypoints, state, criteria, segment_bounds, explore
+                )
                 if layers is None:
                     result.status = status
                     continue
@@ -459,6 +456,7 @@ class ViaPointMotionPlanner:
                     tolerance,
                     finetune_attempts,
                     initial_iters,
+                    None if explore else self.config.chain_length_slack,
                 )
                 indices, trajopt_result = trajopt
                 result.waypoint_indices = indices
@@ -523,11 +521,18 @@ class ViaPointMotionPlanner:
         state: JointState,
         criteria: List[Dict[str, ToolPoseCriteria]],
         segment_bounds: List[Dict[str, List[ToolPoseBound]]],
+        explore: bool = False,
     ) -> Tuple[Optional[List[torch.Tensor]], str]:
-        """Solve, bound-filter and de-duplicate IK at every waypoint."""
+        """Solve, bound-filter and de-duplicate IK at every waypoint.
+
+        With ``explore``, IK starts from random seeds only instead of also continuing the
+        previous waypoint's solutions.
+        """
         ik_solver = self._motion_planner.ik_solver
         return_seeds = min(self.config.ik_return_seeds, ik_solver.config.num_seeds)
+        lower, upper = self._position_limits
         layers = []
+        previous = state.position.view(1, -1)
         for j in range(waypoints.horizon):
             ik_solver.update_tool_pose_criteria(_without_bounds(criteria[j]))
             target = GoalToolPose(
@@ -535,7 +540,15 @@ class ViaPointMotionPlanner:
                 waypoints.position[:, j : j + 1].contiguous(),
                 waypoints.quaternion[:, j : j + 1].contiguous(),
             )
-            ik = ik_solver.solve_pose(target, current_state=state, return_seeds=return_seeds)
+            seed_config = None
+            if self.config.seed_ik_from_previous and not explore and j > 0:
+                # The current state and a quarter of the seeds continue the previous
+                # waypoint's solutions; the rest stay random to find other IK branches.
+                continued = previous[: max(1, ik_solver.config.num_seeds // 4)]
+                seed_config = torch.cat((state.position.view(1, -1), continued)).unsqueeze(0)
+            ik = ik_solver.solve_pose(
+                target, current_state=state, seed_config=seed_config, return_seeds=return_seeds
+            )
             solutions = ik.solution.reshape(-1, ik.solution.shape[-1])[ik.success.view(-1)]
             if solutions.shape[0] == 0:
                 return None, f"No IK solution at waypoint {j}."
@@ -543,7 +556,16 @@ class ViaPointMotionPlanner:
             solutions = self._filter_by_bounds(solutions, bounds)
             if solutions.shape[0] == 0:
                 return None, f"No IK solution at waypoint {j} satisfies its segments' bounds."
-            layers.append(dedup_joint_solutions(solutions, self.config.ik_dedup_joint_tol))
+            solutions = prefer_within_limits(solutions, lower, upper)
+            tol = self.config.ik_dedup_joint_tol
+            if self.config.expand_revolutions:
+                previous = dedup_joint_revolutions(
+                    solutions, tol, lower, upper, self._revolute_joints
+                )
+                layer = expand_joint_revolutions(previous, lower, upper, self._revolute_joints)
+            else:
+                previous = layer = dedup_joint_solutions(solutions, tol)
+            layers.append(layer)
         return layers, ""
 
     def _filter_by_bounds(
@@ -583,15 +605,27 @@ class ViaPointMotionPlanner:
         tolerance: Tuple[float, float],
         finetune_attempts: int,
         initial_iters: int,
+        length_slack: Optional[float],
     ):
         """Seed and run one trajectory optimization through the IK layers."""
         planner = self._motion_planner
         solver = planner.trajopt_solver
         layout = planner.config.spline_layout
+        lower, upper = self._position_limits
         start = state.position[0]
-        chains, _ = select_ik_chains(start, layers, solver.config.num_seeds)
+        num_seeds = solver.config.num_seeds
+        metric = {"metric": self.config.chain_metric, "velocity_limit": self._velocity_limit}
+        if length_slack is None:
+            chains, _, distinct = select_ik_chains(start, layers, num_seeds, **metric)
+        else:
+            # At most half as many chains as seeds: every chain gets a straight seed and at
+            # least one bent seed.
+            chains, _, distinct = select_ik_chains(
+                start, layers, max(1, num_seeds // 2), length_slack, **metric
+            )
+            chains = chains[torch.arange(num_seeds, device=chains.device) % distinct]
         best = torch.cat((start.unsqueeze(0), chains[0]), dim=0)
-        distances = (best[1:] - best[:-1]).norm(dim=-1).tolist()
+        distances = chain_step_lengths(best, **metric).tolist()
         indices = allocate_waypoint_indices(
             distances,
             layout.reference_intervals,
@@ -611,7 +645,9 @@ class ViaPointMotionPlanner:
             layout.padding,
             layout.reference_intervals,
             solver.action_horizon,
+            self._seed_bulge(chains, distinct),
         )
+        seed_traj = torch.maximum(torch.minimum(seed_traj, upper), lower)
         result = solver.solve_pose(
             reference,
             state,
@@ -627,6 +663,25 @@ class ViaPointMotionPlanner:
             track_orientation=True,
         )
         return indices, result
+
+    def _seed_bulge(self, chains: torch.Tensor, distinct: int) -> Optional[torch.Tensor]:
+        """Mid-segment offsets ``[S, N, dof]`` for the seeds that repeat a chain.
+
+        When fewer distinct chains than seeds are near the shortest, the chains repeat. Each
+        repeat bends every segment in a fixed pseudo-random joint-space direction, more for
+        later repeats, so the seeds try different ways around obstacles between the same IK
+        solutions.
+        """
+        seeds, n, dof = chains.shape
+        scale = self.config.seed_bulge
+        if scale <= 0.0 or distinct >= seeds:
+            return None
+        generator = torch.Generator().manual_seed(0)
+        direction = torch.randn(seeds, n, dof, generator=generator)
+        direction = direction / direction.norm(dim=-1, keepdim=True)
+        repeat = torch.arange(seeds) // distinct
+        amplitude = scale * repeat / repeat.max()
+        return (direction * amplitude.view(seeds, 1, 1)).to(chains)
 
     def _attach_waypoint_errors(self, result: ViaPointPlanResult, waypoints: GoalToolPose) -> None:
         """Record the configurations and pose errors of the trajectory at the waypoints."""
