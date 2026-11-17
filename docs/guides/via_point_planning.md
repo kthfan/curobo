@@ -76,14 +76,21 @@ The terminal fields set how the segment's waypoint is reached. For example
 ## Bound a segment
 
 {py:class}`~curobo.types.ToolPoseBound` limits in a segment's criteria hold inside that segment
-only. Here the tool must stay upright while it moves to the second waypoint:
+only. Here the gripper, whose z axis points down, must stay within 10° of straight down while
+it moves to the second waypoint:
 
 ```python
 from curobo.types import ToolPoseBound
 
-upright = ToolPoseCriteria(bounds=[ToolPoseBound.axis_tilt(max_angle=0.17, anchor="base")])
-result = planner.plan_waypoints(waypoints, start, [None, {frame: upright}, None])
+pointing_down = ToolPoseCriteria(
+    bounds=[ToolPoseBound.axis_tilt(reference_axis=(0.0, 0.0, -1.0), max_angle=0.17, anchor="base")]
+)
+result = planner.plan_waypoints(waypoints, start, [None, {frame: pointing_down}, None])
 ```
+
+The reference axis must match the tool's orientation at the waypoints: with the default
+`reference_axis` of `+z`, this bound would require the gripper to point up, which no IK
+solution of these waypoints satisfies.
 
 A `"goal"` anchor is the segment's waypoint, and a `"start"` anchor is the previous waypoint
 (the current pose for the first segment). IK solutions of a waypoint that violate the bounds of

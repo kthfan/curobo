@@ -7,14 +7,14 @@ A pick usually takes more than one pose: move above the part, then go straight
 down onto it. The via-point planner takes an *ordered list* of Cartesian
 waypoints and returns one trajectory that passes through all of them without
 stopping. The motion that ends at a waypoint, its segment, can have its own
-constraints: here the last segment moves straight down while the tool stays
-upright.
+constraints: here the last segment moves straight down while the gripper keeps
+pointing down.
 
 By the end of this tutorial you will have:
 
 - Created and warmed up a via-point planner for the Franka Panda robot
 - Built three Cartesian waypoints from the robot's current tool pose
-- Constrained the last segment to a straight, upright descent
+- Constrained the last segment to a straight descent with the gripper pointing down
 - Planned one trajectory through all waypoints and saved a plot
 
 Step 1: Run the tutorial
@@ -62,7 +62,8 @@ Step 3: Understand the pipeline
    entry combines ``ToolPoseCriteria.linear_motion("z")`` with
    ``enforce_path_tolerance``, so the descent fails rather than leaving its
    line by more than 5 mm, and a ``ToolPoseBound.axis_tilt`` bound that keeps
-   the tool upright within 10°.
+   the tool z axis within 10° of the base -z axis: the Franka gripper points
+   along its z axis, which points down here.
 
 4. **Plan and execute**: ``plan_waypoints`` returns a ``ViaPointPlanResult``.
    Check ``success`` before using the trajectory; ``status`` explains a
@@ -156,7 +157,7 @@ def _plot_trajectory(
 
 
 def via_point_planning_example(output_dir: Optional[Path] = None) -> bool:
-    """Plan through three waypoints, the last one reached by a straight, upright descent.
+    """Plan through three waypoints, the last one reached by a straight downward descent.
 
     Args:
         output_dir: Where to save output files. Defaults to
@@ -193,7 +194,12 @@ def via_point_planning_example(output_dir: Optional[Path] = None) -> bool:
         # 5 mm off the line, 0.05 rad of rotation (expressed as 2 * sin(angle / 2)).
         path_tolerance=(0.005, 2.0 * math.sin(0.05 / 2.0)),
         enforce_path_tolerance=True,
-        bounds=[ToolPoseBound.axis_tilt(max_angle=math.radians(10.0), anchor="base")],
+        # The gripper's z axis stays within 10 deg of straight down (the base -z axis).
+        bounds=[
+            ToolPoseBound.axis_tilt(
+                reference_axis=(0.0, 0.0, -1.0), max_angle=math.radians(10.0), anchor="base"
+            )
+        ],
     )
     # One entry per waypoint: entry k constrains the motion that ends at waypoint k.
     segment_criteria = [None, None, {frame: descent}]
