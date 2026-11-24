@@ -6,6 +6,11 @@
 Validates the CUDA kernel output against the NumPy reference and Pinocchio.
 """
 
+import copy
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -191,6 +196,192 @@ def _run_numpy_rnea(kp, q_np, qd_np, qdd_np, gravity=-9.81, f_ext_np=None):
             )
             taus.append(tau)
         return np.stack(taus)
+
+
+@pytest.fixture(params=[0, 1, 2], ids=["prismatic_x", "prismatic_y", "prismatic_z"])
+def prismatic_model(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> tuple[KinematicsParams, DeviceCfg]:
+    """Build a slider with a rotating parent perpendicular to its sliding axis."""
+    from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
+
+    axes = ["1 0 0", "0 1 0", "0 0 1"]
+    axis = request.param
+    urdf_path = tmp_path / "rotating_slider.urdf"
+    urdf_path.write_text(f"""<robot name="rotating_slider">
+  <link name="base"/>
+  <link name="rotor">
+    <inertial>
+      <mass value="2"/><origin xyz="0.1 0.2 0.15"/>
+      <inertia ixx="0.2" iyy="0.3" izz="0.4" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="slider">
+    <inertial>
+      <mass value="1.5"/><origin xyz="0.1 0.2 0.15"/>
+      <inertia ixx="0.1" iyy="0.2" izz="0.25" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="rotation" type="revolute">
+    <parent link="base"/><child link="rotor"/>
+    <axis xyz="{axes[(axis + 1) % 3]}"/>
+    <limit lower="-3" upper="3" effort="100" velocity="5"/>
+  </joint>
+  <joint name="translation" type="prismatic">
+    <parent link="rotor"/><child link="slider"/>
+    <origin xyz="0.2 -0.1 0.3"/><axis xyz="{axes[axis]}"/>
+    <limit lower="-1" upper="1" effort="100" velocity="5"/>
+  </joint>
+</robot>""")
+    device_cfg = DeviceCfg()
+    cfg = KinematicsCfg.from_data_dict(
+        {"urdf_path": str(urdf_path), "base_link": "base", "tool_frames": ["slider"]},
+        device_cfg=device_cfg,
+    )
+    params = cfg.kinematics_config
+    assert params.joint_names == ["rotation", "translation"]
+    assert (params.joint_map_type == axis).any()
+    return params, device_cfg
+
+
+def test_prismatic_coriolis_matches_numpy(
+    prismatic_model: tuple[KinematicsParams, DeviceCfg],
+) -> None:
+    """Moving sliders under angular velocity produce the correct inverse dynamics."""
+    params, device_cfg = prismatic_model
+    q = np.array([[0.3, 0.2], [-0.4, -0.1], [0.5, 0.3], [0.1, -0.2]], dtype=np.float32)
+    qd = np.array([[1.2, 0.7], [-0.8, 0.4], [0.0, 0.7], [1.2, 0.0]], dtype=np.float32)
+    qdd = np.zeros_like(q)
+    actual = _run_cuda_rnea(params, device_cfg, q, qd, qdd, gravity=0.0)
+    expected = _run_numpy_rnea(params, q, qd, qdd, gravity=0.0)
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_prismatic_gradients_match_numpy(
+    prismatic_model: tuple[KinematicsParams, DeviceCfg],
+) -> None:
+    """Prismatic RNEA gradients match the independent spatial-algebra reference."""
+    params, device_cfg = prismatic_model
+    q = np.array([[0.3, 0.2], [-0.4, -0.1]], dtype=np.float32)
+    qd = np.array([[1.2, 0.7], [-0.8, 0.4]], dtype=np.float32)
+    qdd = np.array([[0.2, -0.3], [-0.1, 0.4]], dtype=np.float32)
+    tau_bar = np.array([[0.7, -0.4], [-0.3, 1.1]], dtype=np.float32)
+    actual = _run_cuda_backward(params, device_cfg, q, qd, qdd, tau_bar, gravity=0.0)
+    expected = _run_numpy_backward(params, q, qd, qdd, tau_bar, gravity=0.0)
+    for gradient, reference in zip(actual, expected):
+        np.testing.assert_allclose(gradient, reference, atol=1e-4, rtol=1e-4)
+
+
+def test_link_inertials_outside_the_tree_match_the_closed_form(lumped_inertial_robot) -> None:
+    """Mass the loader folds in from links outside the tree reaches the RNEA torque."""
+    from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
+
+    robot = lumped_inertial_robot
+    device_cfg = DeviceCfg()
+    kp = KinematicsCfg.from_data_dict(
+        {"urdf_path": str(robot.urdf_path), "base_link": "base_link", "tool_frames": ["arm_link"]},
+        device_cfg=device_cfg,
+    ).kinematics_config
+    q = np.linspace(-2.5, 2.5, 11, dtype=np.float32)[:, None]
+    qdd = np.linspace(-8.0, 8.0, 11, dtype=np.float32)[:, None]
+    tau = _run_cuda_rnea(kp, device_cfg, q, np.zeros_like(q), qdd)[:, 0]
+
+    gravity, com, qs, qdds = 9.81, robot.com, q[:, 0], qdd[:, 0]
+    # about y, COM c rotated by Ry(q): height z = -c_x sin q + c_z cos q, V = m g z
+    d_potential = robot.mass * gravity * (-com[0] * np.cos(qs) - com[2] * np.sin(qs))
+    inertia_yy = robot.inertia[1, 1] + robot.mass * (com[0] ** 2 + com[2] ** 2)
+    np.testing.assert_allclose(tau, inertia_yy * qdds + d_potential, atol=2e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("branch_mode", "axis"),
+    [
+        ("fixed", "0 0 1"),
+        ("locked", "0 0 1"),
+        ("default_locked", "0 0 1"),
+        ("mimic", "0 1 0"),
+        ("mimic", "0 -1 0"),
+        ("locked_prismatic", "0 -1 0"),
+        ("mimic_locked_source", "0 -1 0"),
+        ("mimic_locked_parent", "0 1 0"),
+    ],
+    ids=[
+        "fixed", "locked", "default_locked", "mimic_positive", "mimic_negative",
+        "locked_prismatic", "mimic_locked_source", "mimic_locked_parent",
+    ],
+)
+def test_inertial_branch_dynamics_do_not_depend_on_tool_frames(
+    lumped_inertial_robot: Any, branch_mode: str, axis: str
+) -> None:
+    """Omitting a branch's tool frame preserves its locked or mimic dynamics."""
+    from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
+
+    tree = ET.parse(lumped_inertial_robot.urdf_path)
+    root = tree.getroot()
+    bar = root.find("joint[@name='bar']")
+    bar.find("axis").set("xyz", axis)
+    if branch_mode == "fixed":
+        bar.set("type", "fixed")
+    elif branch_mode.startswith("mimic"):
+        driver = "source" if branch_mode == "mimic_locked_source" else "swing"
+        ET.SubElement(bar, "mimic", joint=driver, multiplier="2", offset="0.2")
+    elif branch_mode == "locked_prismatic":
+        bar.set("type", "prismatic")
+
+    joint_names, default_position, locks = ["swing"], [0.0], {}
+    locked = branch_mode in ("locked", "default_locked", "locked_prismatic")
+    if locked:
+        joint_names.append("bar")
+        default_position.append(0.7)
+        if branch_mode != "default_locked":
+            locks["bar"] = 0.7
+    if branch_mode in ("mimic_locked_source", "mimic_locked_parent"):
+        joint_names.append("source")
+        default_position.append(0.7)
+        locks["source"] = 0.7
+        ET.SubElement(root, "link", name="source_link")
+        source = ET.SubElement(root, "joint", name="source", type="revolute")
+        parent = "base_link" if branch_mode == "mimic_locked_source" else "arm_link"
+        ET.SubElement(source, "parent", link=parent)
+        ET.SubElement(source, "child", link="source_link")
+        ET.SubElement(source, "axis", xyz="0 0 1")
+        ET.SubElement(source, "limit", lower="-1", upper="1", velocity="1", effort="10")
+        if branch_mode == "mimic_locked_parent":
+            bar.find("parent").set("link", "source_link")
+    tree.write(lumped_inertial_robot.urdf_path)
+
+    config = {
+        "urdf_path": str(lumped_inertial_robot.urdf_path),
+        "base_link": "base_link",
+        "tool_frames": ["arm_link"],
+        "load_collision_spheres": False,
+        "cspace": {
+            "joint_names": joint_names,
+            "default_joint_position": default_position,
+            "max_acceleration": 10.0,
+            "max_jerk": 500.0,
+        },
+    }
+    if locks:
+        config["lock_joints"] = locks
+    reference_config = copy.deepcopy(config)
+    reference_config["tool_frames"].append("bar_link")
+    if locked:
+        reference_config["lock_joints"] = {"bar": 0.7}
+
+    device_cfg = DeviceCfg()
+    params = KinematicsCfg.from_data_dict(config, device_cfg=device_cfg).kinematics_config
+    reference = KinematicsCfg.from_data_dict(
+        reference_config, device_cfg=device_cfg
+    ).kinematics_config
+    assert params.joint_names == reference.joint_names == ["swing"]
+    q = np.linspace(-0.8, 0.8, 11, dtype=np.float32)[:, None]
+    qd = np.linspace(-0.5, 0.5, 11, dtype=np.float32)[:, None]
+    qdd = np.linspace(-2.0, 2.0, 11, dtype=np.float32)[:, None]
+    actual = _run_cuda_rnea(params, device_cfg, q, qd, qdd)
+    expected = _run_cuda_rnea(reference, device_cfg, q, qd, qdd)
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=1e-5)
+
 
 
 # ---------------------------------------------------------------------------

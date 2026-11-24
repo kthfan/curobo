@@ -135,6 +135,7 @@ def create_metrics_rollout_config(
         RobotStateTransitionCfg
     ] = RobotStateTransitionCfg,
     cost_manager_config_instance_type: Type[RobotCostManagerCfg] = RobotCostManagerCfg,
+    self_collision_check: bool = True,
 ) -> RobotRolloutCfg:
     """Build the metrics rollout config from resolved YAML dicts.
 
@@ -145,6 +146,7 @@ def create_metrics_rollout_config(
         device_cfg: Device configuration.
         transition_model_config_instance_type: Transition model config class.
         cost_manager_config_instance_type: Cost manager config class.
+        self_collision_check: Whether to enable self-collision validation.
 
     Returns:
         RobotRolloutCfg for metrics evaluation.
@@ -159,6 +161,9 @@ def create_metrics_rollout_config(
         transition_model_config_instance_type=transition_model_config_instance_type,
         cost_manager_config_instance_type=cost_manager_config_instance_type,
     )
+    if not self_collision_check:
+        for cost_cfg in metrics_rollout_config.get_cost_manager_configs():
+            cost_cfg.disable_self_collision()
     return metrics_rollout_config
 
 
@@ -527,6 +532,7 @@ def create_solver_core_cfg(
             device_cfg,
             transition_model_config_instance_type,
             cost_manager_config_instance_type,
+            self_collision_check=self_collision_check,
         )
 
     auxiliary_rollout_config = None

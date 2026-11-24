@@ -6,7 +6,11 @@
 
 ### New Features
 - Improve RRT growth sampling to have signifcantly higher chance of finding a path.
-- Add flag to disable inverse dynamics during motion planning.
+- Add flag to disable inverse dynamics during motion planning, including TimeOpt
+  and final validation.
+- Support moving starts in Cartesian waypoint planning and previous-trajectory
+  warm starts in the C++ motion planner.
+- Add C++ spline sampling and time-window interpolation.
 - Add exact robot-mesh collision checking. `mesh_collision_check=True` on
   `MotionPlannerCfg.create`, `InverseKinematicsCfg.create`,
   `TrajectoryOptimizerCfg.create`, and `ModelPredictiveControlCfg.create`
@@ -93,6 +97,34 @@
   on the `ToolPoseCriteria` instead.
 
 ### Bug Fixes & Misc.
+
+- Honor `self_collision_check=False` during solver validation as well as optimization.
+- Preserve omitted URDF link inertials at configured locked positions and retain
+  moving mimic branches in the dynamics model. Re-export affected C++ models.
+- Fix mimic-joint offsets on negative axes so active and locked joints match URDF
+  forward kinematics. Re-export affected models for the C++ runtime.
+- Apply joint-limit scales once during robot loading and preserve scaled limits
+  when cloning the model.
+- Avoid planner cleanup during interpreter shutdown and safely release initialized
+  components after construction failures.
+- Fix ESDF seeding and sign recovery for mixed stamped and sensor TSDFs in Python and C++.
+- Accelerate L-BFGS in Python and C++, and fuse native IK/TrajOpt cost reductions.
+- Speed up swept collision checks with oriented bounding-box rejection.
+- Fix B-spline interpolation gradients and derivative scaling in native
+  moving-start trajectory seeds.
+- Allocate MPC validation buffers independently and reduce motion-planning
+  buffer memory.
+- Fix `motion_cross_S` writing the prismatic-joint velocity-product term to the
+  angular components instead of the linear components of the spatial vector.
+- Speed up self-collision pair extraction during robot configuration construction
+  and handle empty or fully ignored collision topologies.
+- Fix B-spline goal boundary control-point ordering and derivative signs so
+  trajectories satisfy the requested goal position, velocity, acceleration, and jerk.
+- Fix voxel grid dimension rounding in static and swept collision queries to
+  prevent false collisions and missed obstacles caused by float32 truncation.
+- Use the tensor device's cached shared-memory capacity when sizing RNEA launch
+  configurations instead of assuming a fixed 100 KB per SM. Export C++ runtime
+  launch profiles using the target GPU's per-SM capacity.
 - `mesh_collision_ignored_link_names` now only leaves links out of the mesh scene check.
   Their meshes are loaded and still tested by the mesh self-collision check, so a base link
   bolted to the table is still protected from the hand. Leave link pairs out of the
@@ -124,6 +156,10 @@
   gradient reaches the joints exactly, so the optimizers receive the same
   rotation gradient as before and the reported rotation cost is half its
   previous value. The Lie group rotation methods are unchanged.
+
+### Breaking Changes
+
+- Re-export robot and mapper artifacts for TrajOpt schema 25 and mapper schema 2.
 
 ## Version 0.9.0
 
