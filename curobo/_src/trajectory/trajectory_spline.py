@@ -204,7 +204,7 @@ class SplineTrajectory:
             interpolate_spline,
         )
 
-        values = interpolate_spline(self, intervals + 1, actual_dt)
+        values = interpolate_spline(self, intervals + 1, actual_dt, duration)
         return JointState(
             position=values[0],
             velocity=values[1],
