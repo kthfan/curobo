@@ -320,6 +320,41 @@ def disable_sphere_collision_success(metrics_rollout_dict: Dict) -> Dict:
     return metrics_rollout_dict
 
 
+def mesh_only_success_rollout(
+    rollout: Union[str, Dict[str, Any]],
+    mesh_collision_check: bool = False,
+    mesh_collision_margin: float = 0.0,
+    mesh_self_collision_check: bool = False,
+    mesh_self_collision_margin: float = 0.0,
+) -> Dict:
+    """Resolve a rollout config whose collision success the exact meshes decide.
+
+    Adds the enabled mesh constraints and removes the sphere constraints they replace, as the
+    solvers' metrics rollout does with ``mesh_only_success``. The graph planner validates its
+    samples and edges with the result.
+
+    Args:
+        rollout: Rollout config, a YAML path relative to the task configs or a dict. Not
+            modified.
+        mesh_collision_check: Add the exact mesh collision constraint.
+        mesh_collision_margin: Clearance in meters for the exact mesh collision constraint.
+        mesh_self_collision_check: Add the mesh self-collision constraint.
+        mesh_self_collision_margin: Clearance in meters for the mesh self-collision constraint.
+
+    Returns:
+        New rollout dict.
+
+    Raises:
+        ValueError: If neither mesh check is enabled.
+    """
+    rollout_dict = deepcopy(resolve_config(join_path(get_task_configs_path(), rollout)))
+    if mesh_collision_check:
+        rollout_dict = enable_mesh_collision(rollout_dict, mesh_collision_margin)
+    if mesh_self_collision_check:
+        rollout_dict = enable_mesh_self_collision(rollout_dict, mesh_self_collision_margin)
+    return disable_sphere_collision_success(rollout_dict)
+
+
 def mesh_only_collision_checks(
     metrics_rollout_dict: Dict, self_collision_check: bool = True
 ) -> Tuple[str, ...]:

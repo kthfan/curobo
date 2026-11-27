@@ -18,7 +18,11 @@ from curobo._src.graph_planner.rrt import (
     RRTGraphPlannerCfg,
 )
 from curobo._src.rollout.cost_manager.cost_manager_robot_cfg import RobotCostManagerCfg
-from curobo._src.solver.solver_core_cfg import resolve_robot_config, uses_link_meshes
+from curobo._src.solver.solver_core_cfg import (
+    mesh_only_success_rollout,
+    resolve_robot_config,
+    uses_link_meshes,
+)
 from curobo._src.solver.solver_ik_cfg import IKSolverCfg
 from curobo._src.solver.solver_trajopt_cfg import TrajOptSolverCfg
 from curobo._src.transition.robot_state_transition_cfg import (
@@ -28,7 +32,7 @@ from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.robot import RobotCfg
 from curobo._src.types.spline_layout import SplineLayout
 from curobo._src.util.config_io import join_path, resolve_config
-from curobo._src.util.logging import log_and_raise
+from curobo._src.util.logging import log_and_raise, log_warn
 from curobo.content import get_scene_configs_path, get_task_configs_path
 
 RRT_GRAPH_PLANNER_ALGORITHMS = ("rrt",)
@@ -271,8 +275,9 @@ class MotionPlannerCfg:
             mesh_only_success: Let the exact mesh checks decide whether IK and TrajOpt
                 solutions succeed, instead of the sphere collision checks they replace: scene
                 spheres when ``mesh_collision_check`` is True, self-collision spheres when
-                ``mesh_self_collision_check`` is True. The spheres still steer the optimizers,
-                and graph planner validation stays sphere-based. Solutions may have spheres
+                ``mesh_self_collision_check`` is True. The PRM graph planner validates its
+                paths with the same mesh checks; the RRT graph planner stays sphere-based.
+                The spheres still steer the optimizers. Solutions may have spheres
                 overlapping obstacles; set the mesh margins to keep a clearance. Needs at
                 least one of the two mesh checks.
             device_cfg: Tensor device and dtype configuration.
@@ -478,6 +483,22 @@ class MotionPlannerCfg:
             multi_env=multi_env,
             max_goalset=max_goalset,
         )
+
+        if mesh_only_success:
+            if graph_planner_algorithm == "prm":
+                graph_planner_rollout = mesh_only_success_rollout(
+                    graph_planner_rollout,
+                    mesh_collision_check=mesh_collision_check,
+                    mesh_collision_margin=mesh_collision_margin,
+                    mesh_self_collision_check=mesh_self_collision_check,
+                    mesh_self_collision_margin=mesh_self_collision_margin,
+                )
+            else:
+                log_warn(
+                    "mesh_only_success: the RRT graph planner still validates its paths with "
+                    "the collision spheres, so it rejects goals whose spheres overlap obstacles "
+                    "even when their meshes are clear; use graph_planner_algorithm='prm'"
+                )
 
         prm_graph_planner_config = None
         resolved_rrt_graph_planner_config = None

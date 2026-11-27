@@ -258,8 +258,12 @@ MotionPlannerCfg.create(
 - The scene spheres stop deciding success when `mesh_collision_check` is on, the
   self-collision spheres when `mesh_self_collision_check` is on. With neither, the option
   raises an error. It exists on the same `create` methods as the mesh checks.
-- The spheres still steer the optimizers, `sample_configs` still rejects configurations with
-  the spheres, and graph planner validation stays sphere-based.
+- The spheres still steer the optimizers, and `sample_configs` still rejects configurations
+  with the spheres.
+- The PRM graph planner (`graph_planner_algorithm="prm"`, the default of
+  `MotionPlannerCfg.create`) validates its samples and edges with the same mesh checks, so it
+  accepts start and goal configurations whose spheres overlap obstacles. The RRT graph
+  planner still uses the spheres, and `create` warns when it is combined with this option.
 - A solution may have spheres overlapping obstacles, and the margin the spheres kept around the
   meshes is gone. Set `mesh_collision_margin` and `mesh_self_collision_margin` to the clearance
   your application needs.
@@ -418,8 +422,9 @@ is_valid = checker.validate(joint_positions)
 - Trajectory optimization checks the optimized steps and every step of the interpolated
   trajectory. Both sample the motion, so an obstacle thinner than the distance a link moves
   between two samples (about 1 to 2 cm for the hand in typical plans) can be missed.
-- The graph planner that seeds trajectory optimization uses the spheres only; the trajectory
-  optimization that follows the seed applies the mesh check.
+- The graph planner that seeds trajectory optimization uses the spheres only, unless
+  `mesh_only_success` makes the PRM planner use the meshes; the trajectory optimization that
+  follows the seed applies the mesh check.
 - Voxel (ESDF) obstacles are checked by sampling, so features thinner than the voxel size can
   be missed, and nothing outside the voxel grid is seen. Large robot triangles on fine grids
   are checked slightly conservatively. Cuboid and mesh obstacles are checked exactly.

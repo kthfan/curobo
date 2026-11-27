@@ -15,6 +15,7 @@ from curobo._src.solver.solver_core_cfg import (
     enable_mesh_collision,
     enable_mesh_self_collision,
     mesh_only_collision_checks,
+    mesh_only_success_rollout,
     resolve_robot_config,
     resolve_yaml_configs,
     uses_link_meshes,
@@ -99,6 +100,20 @@ def test_mesh_only_collision_checks_name_the_replaced_sphere_checks(metrics_base
     assert mesh_only_collision_checks(both) == ("scene", "self-collision")
     assert mesh_only_collision_checks(both, self_collision_check=False) == ("scene",)
     assert mesh_only_collision_checks(metrics_base_dict) == ()
+
+
+def test_mesh_only_success_rollout_for_the_graph_planner(metrics_base_dict):
+    rollout = mesh_only_success_rollout(
+        "metrics_base.yml", mesh_self_collision_check=True, mesh_self_collision_margin=0.01
+    )
+    constraints = rollout["rollout"]["constraint_cfg"]
+    assert "self_collision_cfg" not in constraints and "scene_collision_cfg" in constraints
+    assert constraints["mesh_self_collision_cfg"]["margin"] == 0.01
+    assert "mesh_collision_cfg" not in constraints
+    # The shared YAML stays untouched.
+    assert "self_collision_cfg" in metrics_base_dict["rollout"]["constraint_cfg"]
+    with pytest.raises(ValueError):
+        mesh_only_success_rollout(metrics_base_dict)
 
 
 def test_mesh_only_success_needs_a_mesh_check(metrics_base_dict):

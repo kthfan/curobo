@@ -287,6 +287,49 @@ def test_mesh_only_success_plan_pose_reaches_a_goal_whose_meshes_are_clear(cuda_
     assert plans[True] is not None and plans[True].success.any().item()
 
 
+def test_mesh_only_success_prm_connects_to_a_goal_whose_meshes_are_clear(cuda_device_cfg):
+    """The PRM graph planner validates with the meshes too, so the goal is not in collision."""
+    planners = {}
+    for mesh_only_success in (False, True):
+        config = MotionPlannerCfg.create(
+            robot=_inflated_franka(),
+            scene_model=palm_box(LOWERED_BOX),
+            mesh_collision_check=True,
+            mesh_only_success=mesh_only_success,
+            graph_planner_algorithm="prm",
+            device_cfg=cuda_device_cfg,
+            num_ik_seeds=32,
+            num_trajopt_seeds=4,
+            use_cuda_graph=False,
+        )
+        planners[mesh_only_success] = MotionPlanner(config)
+
+    ik_result = _solve(planners[True].ik_solver, cuda_device_cfg)
+    assert ik_result.success.all().item()
+    goal = ik_result.js_solution.position.reshape(-1, ik_result.js_solution.position.shape[-1])
+    goal = goal[0:1].clone()
+    start = _start(planners[True]).position.reshape(1, -1).clone()
+    for mesh_only_success, planner in planners.items():
+        feasible = planner.graph_planner.check_samples_feasibility(goal)
+        assert feasible.item() == mesh_only_success
+        path = planner.graph_planner.find_path(start.clone(), goal.clone())
+        assert path.success.any().item() == mesh_only_success
+
+
+def test_mesh_only_success_with_rrt_warns(cuda_device_cfg, caplog):
+    with caplog.at_level("WARNING"):
+        MotionPlannerCfg.create(
+            robot="franka.yml",
+            scene_model=palm_box(),
+            mesh_collision_check=True,
+            mesh_only_success=True,
+            graph_planner_algorithm="rrt",
+            device_cfg=cuda_device_cfg,
+            use_cuda_graph=False,
+        )
+    assert "RRT graph planner still validates" in caplog.text
+
+
 # =============================================================================
 # Motion planner
 # =============================================================================
