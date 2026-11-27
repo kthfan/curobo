@@ -869,6 +869,36 @@ class KinematicsParams:
             return False
         return self.get_robot_mesh_data().has_link_mesh(link_name)
 
+    def get_sphere_only_link_names(self, mesh_scene_check: bool = False) -> List[str]:
+        """Links that have collision spheres but no exact-mesh geometry.
+
+        A link counts when one of its reference spheres has a positive radius and it owns no
+        triangle slots, packed or reserved. Placeholder spheres, such as the ones reserved
+        for an attached object, have negative radii and do not count.
+
+        Args:
+            mesh_scene_check: Also count the links that the exact-mesh scene check skips,
+                :attr:`mesh_collision_ignored_link_names`.
+
+        Returns:
+            Link names, sorted.
+        """
+        spheres = (
+            self.reference_link_spheres
+            if self.reference_link_spheres is not None
+            else self.link_spheres
+        )
+        if spheres is None or self.link_sphere_idx_map is None:
+            return []
+        active = (spheres[..., 3] > 0.0).any(dim=0)
+        link_indices = set(self.link_sphere_idx_map[active].cpu().tolist())
+        idx_to_name = {idx: name for name, idx in self.link_name_to_idx_map.items()}
+        ignored = set(self.mesh_collision_ignored_link_names or []) if mesh_scene_check else set()
+        names = [idx_to_name[idx] for idx in link_indices if idx in idx_to_name]
+        return sorted(
+            name for name in names if name in ignored or not self.has_link_mesh(name)
+        )
+
     def get_link_masses_com(self, link_name: str) -> torch.Tensor:
         """Get link masses and center of mass for a link
 

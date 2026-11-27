@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -40,6 +40,8 @@ class AttachmentManager:
     with ``extra_collision_meshes``, :meth:`attach` also writes the obstacle mesh into those
     slots for the exact mesh collision check, and :meth:`detach` clears it. The link meshes
     are shared by all envs, so this needs the same obstacle-to-link offset in every env.
+    When the meshes decide success alone (``mesh_only_success``), an object left without its
+    mesh is not checked at all, and the manager warns about that.
     """
 
     def __init__(
@@ -47,6 +49,7 @@ class AttachmentManager:
         kinematics: Kinematics,
         scene_collision: Optional[SceneCollision] = None,
         device_cfg: DeviceCfg = DeviceCfg(),
+        mesh_only_checks: Sequence[str] = (),
     ):
         """Initialize attachment manager.
 
@@ -54,10 +57,15 @@ class AttachmentManager:
             kinematics: Robot kinematics model used for FK.
             scene_collision: Scene collision checker for obstacle enable/disable.
             device_cfg: Device and dtype configuration.
+            mesh_only_checks: Collision checks that the exact meshes decide without the
+                spheres, ``"scene"`` and ``"self-collision"``, as in
+                :attr:`~curobo._src.solver.solver_core_cfg.SolverCoreCfg.mesh_only_checks`.
+                They change the warnings about objects checked with spheres only.
         """
         self._kinematics = kinematics
         self._scene_collision = scene_collision
         self._device_cfg = device_cfg
+        self._mesh_only_checks = tuple(mesh_only_checks)
         self._last_fit_result: Optional[SphereFitResult] = None
         self._attached_link_name: Optional[str] = None
         self._disabled_obstacle_names: List[str] = []
@@ -134,6 +142,8 @@ class AttachmentManager:
         per-env obstacle-to-link transforms, and writes the result to
         ``link_spheres[i, attached_indices, :]`` for each env. Only the spheres are written;
         :meth:`attach` also writes the obstacle mesh for the exact mesh collision check.
+        With ``mesh_only_checks`` set, spheres alone leave the object out of those checks, so
+        this warns.
 
         Args:
             sphere_tensor: Spheres in obstacle frame [num_spheres, 4] (x, y, z, r).
@@ -142,6 +152,22 @@ class AttachmentManager:
             world_objects_pose_offset: Obstacle world pose(s) [num_envs] or [1] (broadcast).
                 When None, obstacles are assumed at the link origin (identity offset).
         """
+        self._write_spheres(sphere_tensor, joint_states, link_name, world_objects_pose_offset)
+        if self._mesh_only_checks:
+            log_warn(
+                f"update() wrote only spheres for link '{link_name}': "
+                + self._unchecked_message()
+                + "; use attach() to also write the object mesh"
+            )
+
+    def _write_spheres(
+        self,
+        sphere_tensor: torch.Tensor,
+        joint_states: JointState,
+        link_name: str,
+        world_objects_pose_offset: Optional[Pose],
+    ) -> None:
+        """Write link-local spheres for every env; see :meth:`update`."""
         q = joint_states.position
         if q.dim() == 1:
             q = q.unsqueeze(0)
@@ -225,7 +251,7 @@ class AttachmentManager:
             surface_radius=surface_radius,
             sphere_fit_type=sphere_fit_type,
         )
-        self.update(sphere_tensor, joint_states, link_name, world_objects_pose_offset)
+        self._write_spheres(sphere_tensor, joint_states, link_name, world_objects_pose_offset)
         self._update_link_mesh(combined_mesh, joint_states, link_name, world_objects_pose_offset)
 
         if disable_obstacle_names and self._scene_collision is not None:
@@ -378,8 +404,9 @@ class AttachmentManager:
             return
         if not kparams.has_link_mesh(link_name):
             log_warn(
-                f"link '{link_name}' has no triangle slots for mesh collision, so the attached "
-                "object is checked with spheres only; reserve slots with extra_collision_meshes"
+                f"link '{link_name}' has no triangle slots for mesh collision, so "
+                + self._spheres_only_message()
+                + "; reserve slots with extra_collision_meshes"
             )
             return
 
@@ -394,7 +421,7 @@ class AttachmentManager:
             if poses.position.shape[0] > 1 and not self._poses_match(poses):
                 log_warn(
                     f"link '{link_name}' meshes are shared by all envs but the attached object "
-                    "has a different offset per env, so it is checked with spheres only"
+                    "has a different offset per env, so " + self._spheres_only_message()
                 )
                 kparams.clear_link_mesh(link_name)
                 return
@@ -403,6 +430,20 @@ class AttachmentManager:
 
         triangles = vertices[torch.as_tensor(combined_mesh.faces, device=vertices.device)]
         kparams.update_link_mesh(link_name, triangles)
+
+    def _spheres_only_message(self) -> str:
+        """Describe what checks an attached object that has spheres but no mesh."""
+        if self._mesh_only_checks:
+            return self._unchecked_message()
+        return "the attached object is checked with spheres only"
+
+    def _unchecked_message(self) -> str:
+        """Describe the checks that miss an object without mesh under mesh_only_success."""
+        checks = " and ".join(self._mesh_only_checks)
+        return (
+            f"the attached object is not part of the {checks} check: with mesh_only_success "
+            "the meshes decide it and the spheres only steer the optimizers"
+        )
 
     @staticmethod
     def _poses_match(poses: Pose, atol: float = 1e-5) -> bool:

@@ -103,7 +103,9 @@ robot_cfg:
 ```
 
 Ignored links are skipped only by the mesh scene check. The collision spheres still apply to
-them, and the mesh self-collision check (see below) still tests them against the other links,
+them (unless the meshes decide success, see
+{ref}`mesh_collision_mesh_only_success`), and the mesh
+self-collision check (see below) still tests them against the other links,
 so a base link bolted to the table still cannot be hit by the hand. To leave a link pair out of
 the self-collision check, list it under `mesh_self_collision_ignore`.
 
@@ -115,6 +117,7 @@ their spheres and their meshes, and `enable_link_collision(links)` turns it back
 moves in and lifts the object, so the fingers may touch it with the mesh check on. To toggle
 only the mesh check, call `disable_link_mesh` and `enable_link_mesh` on the kinematics config.
 
+(mesh_collision_runtime_geometry)=
 ## Add geometry at runtime
 
 To check geometry that is known only at runtime, such as a grasped object, reserve triangle
@@ -132,7 +135,9 @@ without the mesh check; with it, empty slots are skipped right away.
 The attachment manager fills these slots: attaching an object writes its mesh along with its
 collision spheres, and detaching it clears both. The link meshes are shared by all
 environments, so with several environments the object must have the same offset to the link in
-each of them; otherwise the manager warns and checks the object with its spheres only.
+each of them; otherwise the manager warns and checks the object with its spheres only. With
+`mesh_only_success`, an object left without its mesh this way, or attached to a link without
+reserved slots, is not checked at all, and the warning says so.
 
 To manage the geometry yourself, write it in the link's frame, as a `[n, 3, 3]` triangle tensor
 or a mesh, and clear it when the object is released:
@@ -258,6 +263,12 @@ MotionPlannerCfg.create(
 - A solution may have spheres overlapping obstacles, and the margin the spheres kept around the
   meshes is gone. Set `mesh_collision_margin` and `mesh_self_collision_margin` to the clearance
   your application needs.
+- Geometry with spheres but no mesh is not checked. The solvers warn about links whose
+  spheres have no URDF collision mesh, and, for the scene check, links listed in
+  `mesh_collision_ignored_link_names`. To check a grasped object, reserve triangle slots for
+  its link with `extra_collision_meshes` (see {ref}`mesh_collision_runtime_geometry`)
+  and attach it with `attach` or `attach_from_scene`, which write its mesh; writing only its
+  spheres with `AttachmentManager.update` leaves it out, and warns.
 
 Success with both mesh checks on, 300 IK goals and 60 plans in a table with 40 random boxes
 (one NVIDIA Tesla T4, `benchmark/mesh_failure_benchmark.py`):

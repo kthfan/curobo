@@ -91,7 +91,9 @@ class SolverCore:
             kinematics=self.kinematics,
             scene_collision=self.scene_collision_checker,
             device_cfg=self.device_cfg,
+            mesh_only_checks=config.mesh_only_checks,
         )
+        self._warn_sphere_only_links()
 
         # Seed manager
         self.seed_manager = SeedManager(
@@ -121,6 +123,18 @@ class SolverCore:
             self.default_joint_position.unsqueeze(0),
             joint_names=self.joint_names,
         )
+
+    def _warn_sphere_only_links(self) -> None:
+        """Warn about links that no check covers once the meshes decide success alone."""
+        kinematics_config = self.kinematics.config.kinematics_config
+        for check in self.config.mesh_only_checks:
+            names = kinematics_config.get_sphere_only_link_names(mesh_scene_check=check == "scene")
+            if names:
+                log_warn(
+                    f"mesh_only_success: links {names} have collision spheres but no collision "
+                    f"mesh in the {check} check, so their {check} collisions are not checked. "
+                    "Give them URDF collision meshes, or leave mesh_only_success off"
+                )
 
     @get_profiler_decorator("solver_core/initialize_components")
     def _initialize_components(self):

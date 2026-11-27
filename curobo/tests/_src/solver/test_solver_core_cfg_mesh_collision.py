@@ -14,6 +14,7 @@ from curobo._src.solver.solver_core_cfg import (
     disable_sphere_collision_success,
     enable_mesh_collision,
     enable_mesh_self_collision,
+    mesh_only_collision_checks,
     resolve_robot_config,
     resolve_yaml_configs,
     uses_link_meshes,
@@ -89,6 +90,15 @@ def test_mesh_only_success_replaces_both_sphere_checks(metrics_base_dict):
     constraints = disable_sphere_collision_success(enabled)["rollout"]["constraint_cfg"]
     assert "scene_collision_cfg" not in constraints and "self_collision_cfg" not in constraints
     assert "cspace_cfg" in constraints
+
+
+def test_mesh_only_collision_checks_name_the_replaced_sphere_checks(metrics_base_dict):
+    scene = enable_mesh_collision(metrics_base_dict)
+    both = enable_mesh_self_collision(scene)
+    assert mesh_only_collision_checks(scene) == ("scene",)
+    assert mesh_only_collision_checks(both) == ("scene", "self-collision")
+    assert mesh_only_collision_checks(both, self_collision_check=False) == ("scene",)
+    assert mesh_only_collision_checks(metrics_base_dict) == ()
 
 
 def test_mesh_only_success_needs_a_mesh_check(metrics_base_dict):
@@ -232,6 +242,7 @@ def test_mesh_only_success_keeps_the_spheres_for_sampling(cuda_device_cfg):
         "self_collision_cfg",
         "mesh_collision_cfg",
     }
+    assert core.mesh_only_checks == ("scene",)
 
 
 def test_default_keeps_one_rollout_config(cuda_device_cfg):
@@ -243,4 +254,5 @@ def test_default_keeps_one_rollout_config(cuda_device_cfg):
         use_cuda_graph=False,
     )
     assert config.core_cfg.auxiliary_rollout_config is None
+    assert config.core_cfg.mesh_only_checks == ()
     assert "scene_collision_cfg" in _constraints(config.core_cfg.metrics_rollout_config)

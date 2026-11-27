@@ -394,8 +394,10 @@ def test_mesh_collision_check_plan_grasp_lets_gripper_touch_object(cuda_device_c
 # =============================================================================
 
 
-def _attach_rod(solver: IKSolver, result, device_cfg: DeviceCfg) -> None:
-    """Attach a rod to the hand at an IK solution, with the rod's spheres disabled.
+def _attach_rod(
+    solver: IKSolver, result, device_cfg: DeviceCfg, disable_spheres: bool = True
+) -> None:
+    """Attach a rod to the hand at an IK solution, by default with the rod's spheres disabled.
 
     The rod reaches from the fingertips (z = 0.19) down to z = 0.0, into the top of the box
     placed 25 cm below the palm box position (top at z = 0.015).
@@ -413,7 +415,8 @@ def _attach_rod(solver: IKSolver, result, device_cfg: DeviceCfg) -> None:
         sphere_fit_type=SphereFitType.VOXEL,
         world_objects_pose_offset=rod_pose,
     )
-    solver.kinematics.config.kinematics_config.disable_link_spheres("attached_object")
+    if disable_spheres:
+        solver.kinematics.config.kinematics_config.disable_link_spheres("attached_object")
 
 
 def test_attached_object_mesh_is_checked(cuda_device_cfg):
@@ -440,6 +443,60 @@ def test_attached_object_mesh_is_checked(cuda_device_cfg):
 
     solver.core.attachment_manager.detach()
     assert _solve(solver, cuda_device_cfg).success.any().item()
+
+
+def _mesh_only_rod_ik(device_cfg: DeviceCfg, robot) -> IKSolver:
+    config = IKSolverCfg.create(
+        robot=robot,
+        scene_model=palm_box(offset=(0.0, 0.0, -0.25)),
+        mesh_collision_check=True,
+        mesh_only_success=True,
+        device_cfg=device_cfg,
+        num_seeds=32,
+        use_cuda_graph=False,
+    )
+    return IKSolver(config)
+
+
+def test_mesh_only_success_checks_the_attached_object_mesh(cuda_device_cfg, caplog):
+    """Without the scene spheres deciding success, the rod's mesh still rejects the goal."""
+    solver = _mesh_only_rod_ik(cuda_device_cfg, "franka.yml")
+    result = _solve(solver, cuda_device_cfg)
+    assert result.success.any().item()
+
+    with caplog.at_level("WARNING"):
+        _attach_rod(solver, result, cuda_device_cfg, disable_spheres=False)
+    assert "not part of the" not in caplog.text
+    assert not _solve(solver, cuda_device_cfg).success.any().item()
+    solver.core.attachment_manager.detach()
+
+
+def test_mesh_only_success_warns_about_an_attached_object_without_mesh(cuda_device_cfg, caplog):
+    """Without reserved triangle slots nothing checks the rod, and attach() says so."""
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    del robot["robot_cfg"]["kinematics"]["extra_collision_meshes"]
+    solver = _mesh_only_rod_ik(cuda_device_cfg, robot)
+    result = _solve(solver, cuda_device_cfg)
+
+    with caplog.at_level("WARNING"):
+        _attach_rod(solver, result, cuda_device_cfg, disable_spheres=False)
+    assert "not part of the scene check" in caplog.text
+    # The rod's spheres reach into the box, but they no longer decide success.
+    assert _solve(solver, cuda_device_cfg).success.any().item()
+    solver.core.attachment_manager.detach()
+
+
+def test_mesh_only_success_warns_about_links_the_mesh_scene_check_skips(cuda_device_cfg, caplog):
+    robot = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+    robot["robot_cfg"]["kinematics"]["mesh_collision_ignored_link_names"] = ["panda_link0"]
+    with caplog.at_level("WARNING"):
+        _mesh_only_rod_ik(cuda_device_cfg, robot)
+    assert "['panda_link0']" in caplog.text and "scene collisions are not checked" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        _mesh_only_rod_ik(cuda_device_cfg, "franka.yml")
+    assert "collisions are not checked" not in caplog.text
 
 
 # =============================================================================

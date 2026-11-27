@@ -570,3 +570,51 @@ class TestAttachMesh:
         )
         assert "different offset per env" in caplog.text
         assert _attached_triangles(manager).shape[0] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMeshOnlyChecks:
+    """Links and attached objects that no check covers once the meshes decide success."""
+
+    def test_sphere_only_link_names_skip_placeholders_and_meshed_links(self):
+        # attached_object has placeholder spheres and, here, no triangle slots.
+        kparams = _mesh_robot_model(reserve_mesh_slots=False).config.kinematics_config
+        assert kparams.get_sphere_only_link_names() == []
+        kparams.mesh_collision_ignored_link_names = ["panda_link0"]
+        assert kparams.get_sphere_only_link_names(mesh_scene_check=True) == ["panda_link0"]
+        assert kparams.get_sphere_only_link_names() == []
+
+    def test_sphere_only_link_names_list_a_link_without_mesh(self):
+        kparams = _mesh_robot_model().config.kinematics_config
+        del kparams.link_collision_meshes["panda_link3"]
+        assert kparams.get_sphere_only_link_names() == ["panda_link3"]
+
+    def test_update_warns_only_when_the_meshes_decide(
+        self, device_cfg, grasp_joint_state, caplog
+    ):
+        model = _mesh_robot_model()
+        spheres = torch.tensor([[0.0, 0.0, 0.0, 0.02]], **device_cfg.as_torch_dict())
+        AttachmentManager(kinematics=model, device_cfg=device_cfg).update(
+            spheres, grasp_joint_state
+        )
+        assert "not part of the" not in caplog.text
+        AttachmentManager(
+            kinematics=model, device_cfg=device_cfg, mesh_only_checks=("scene",)
+        ).update(spheres, grasp_joint_state)
+        assert "update() wrote only spheres" in caplog.text
+        assert "not part of the scene check" in caplog.text
+
+    def test_attach_without_slots_says_the_object_is_unchecked(
+        self, device_cfg, grasp_joint_state, cube_obstacle, caplog
+    ):
+        manager = AttachmentManager(
+            kinematics=_mesh_robot_model(reserve_mesh_slots=False),
+            device_cfg=device_cfg,
+            mesh_only_checks=("scene", "self-collision"),
+        )
+        manager.attach(
+            grasp_joint_state, [cube_obstacle], num_spheres=10,
+            sphere_fit_type=SphereFitType.VOXEL,
+        )
+        assert "not part of the scene and self-collision check" in caplog.text
+        assert "checked with spheres only" not in caplog.text

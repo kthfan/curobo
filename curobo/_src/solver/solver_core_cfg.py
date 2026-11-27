@@ -59,6 +59,10 @@ class SolverCoreCfg:
     #: It differs when the metrics rollout leaves out the sphere collision constraints
     #: (``mesh_only_success``): sampling still rejects configurations with the spheres.
     auxiliary_rollout_config: Optional[RobotRolloutCfg] = None
+    #: Collision checks whose success the exact meshes decide without the spheres
+    #: (``mesh_only_success``): ``"scene"``, ``"self-collision"``, or both. Empty when the
+    #: spheres take part in every check they are configured for.
+    mesh_only_checks: Tuple[str, ...] = ()
 
     def __post_init__(self):
         if len(self.optimizer_configs) == 0:
@@ -316,6 +320,31 @@ def disable_sphere_collision_success(metrics_rollout_dict: Dict) -> Dict:
     return metrics_rollout_dict
 
 
+def mesh_only_collision_checks(
+    metrics_rollout_dict: Dict, self_collision_check: bool = True
+) -> Tuple[str, ...]:
+    """Name the collision checks :func:`disable_sphere_collision_success` leaves to the meshes.
+
+    Args:
+        metrics_rollout_dict: Resolved metrics rollout YAML dict, before the sphere constraints
+            are removed.
+        self_collision_check: Whether self-collision is checked at all.
+
+    Returns:
+        ``"scene"`` when the sphere scene collision constraint is replaced, and
+        ``"self-collision"`` when the sphere self-collision constraint is.
+    """
+    constraint_cfg = metrics_rollout_dict.get("rollout", {}).get("constraint_cfg") or {}
+    has_scene_spheres = constraint_cfg.get("scene_collision_cfg") is not None
+    has_self_spheres = constraint_cfg.get("self_collision_cfg") is not None
+    checks = []
+    if has_scene_spheres and uses_mesh_collision(metrics_rollout_dict):
+        checks.append("scene")
+    if has_self_spheres and self_collision_check and uses_mesh_self_collision(metrics_rollout_dict):
+        checks.append("self-collision")
+    return tuple(checks)
+
+
 def resolve_robot_config(
     robot: Union[str, Dict[str, Any], RobotCfg],
     device_cfg: DeviceCfg,
@@ -536,7 +565,9 @@ def create_solver_core_cfg(
         )
 
     auxiliary_rollout_config = None
+    mesh_only_checks = ()
     if mesh_only_success:
+        mesh_only_checks = mesh_only_collision_checks(metrics_rollout_dict, self_collision_check)
         metrics_rollout_config = metrics_config(
             disable_sphere_collision_success(metrics_rollout_dict)
         )
@@ -554,4 +585,5 @@ def create_solver_core_cfg(
         random_seed=random_seed,
         store_debug=store_debug,
         auxiliary_rollout_config=auxiliary_rollout_config,
+        mesh_only_checks=mesh_only_checks,
     )
