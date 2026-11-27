@@ -137,7 +137,8 @@ The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT 
    and `AttachmentManager` warnings: an object without mesh (no reserved slots, per-env
    offsets, `update()` with spheres only) is unchecked under the mode. Attached objects with
    reserved slots are checked by their mesh (Franka reserves 256). Only `dual_ur10e`
-   (`tool0`, `tool1`) has sphere-only links among the shipped configs. Waiting for the GPU run.
+   (`tool0`, `tool1`) has sphere-only links among the shipped configs. Targeted GPU run passed
+   (94 tests: attachment manager, mesh end-to-end, solver cfg). Full suite not run yet.
    Not done (lower value after the narrowing): keep the spheres of mesh-less links in the
    success check by masking the other spheres' radii.
 2. [ ] **Graph planner (PRM) under the mode**: PRM and RRT check feasibility with the
