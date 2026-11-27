@@ -98,6 +98,8 @@
 
 ### Bug Fixes & Misc.
 
+- Require `warp-lang>=1.13.0`: the collision kernels pass `module_options` to
+  `wp.kernel`, which older Warp versions reject with a `TypeError`.
 - Honor `self_collision_check=False` during solver validation as well as optimization.
 - Preserve omitted URDF link inertials at configured locked positions and retain
   moving mimic branches in the dynamics model. Re-export affected C++ models.
