@@ -306,8 +306,8 @@ def test_mesh_only_success_prm_connects_to_a_goal_whose_meshes_are_clear(cuda_de
 
     ik_result = _solve(planners[True].ik_solver, cuda_device_cfg)
     assert ik_result.success.all().item()
-    goal = ik_result.js_solution.position.reshape(-1, ik_result.js_solution.position.shape[-1])
-    goal = goal[0:1].clone()
+    solution = planners[True].kinematics.get_active_js(ik_result.js_solution)
+    goal = solution.position.reshape(-1, solution.position.shape[-1])[0:1].clone()
     start = _start(planners[True]).position.reshape(1, -1).clone()
     for mesh_only_success, planner in planners.items():
         feasible = planner.graph_planner.check_samples_feasibility(goal)
