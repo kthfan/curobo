@@ -34,8 +34,8 @@ One call of `plan_waypoints` runs four stages:
    TimeOpt then sets the fastest timing along that path within the joint limits. Validation checks the native samples and the dense,
    time-optimized samples.
 
-The trajectory starts at rest at the current state, passes the intermediate waypoints without
-stopping, and ends at rest at the last waypoint. If a stage fails, for example no IK solution
+The trajectory starts at the current state, with its velocity and acceleration, passes the
+intermediate waypoints without stopping, and ends at rest at the last waypoint. If a stage fails, for example no IK solution
 at a waypoint satisfies its bounds, the attempt reports why; the planner retries up to
 `max_attempts` times with new IK solutions.
 

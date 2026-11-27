@@ -11,7 +11,8 @@ upright. How the planner works is explained in {ref}`via_point_planner_note`.
 
 Create the planner once and warm it up. Waypoints are a
 {py:class}`~curobo.types.GoalToolPose` of shape `[1, N, tool frames, 1, 3/4]` in the robot
-base frame, without the current pose; the start state must be at rest.
+base frame, without the current pose. The start state can be moving; see
+{ref}`guide_via_point_moving_start`.
 
 ```python
 import torch
@@ -187,6 +188,29 @@ Both take the arguments of their `MotionPlanner` counterparts and return a
 `TrajOptSolverResult`, or `None` on failure. They use the default tool pose criteria and no tool
 pose bounds; segment criteria apply to `plan_waypoints` only. Run one plan at a time:
 `plan_pose`, `plan_cspace` and `plan_waypoints` share the optimizer.
+
+(guide_via_point_moving_start)=
+
+## Plan from a moving robot
+
+To replan while the robot moves, pass the measured velocity with the position:
+
+```python
+current = JointState(
+    position=measured_position, velocity=measured_velocity, joint_names=measured_names
+).reorder(planner.joint_names)
+result = planner.plan_waypoints(waypoints, current)
+```
+
+The trajectory starts with that velocity, and with the acceleration when the state has one.
+Plans from a moving start take longer than from rest, and fail more often as the start
+velocity grows. A start with nonzero acceleration usually fails: the trajectory optimizer
+holds the start acceleration over the first spline span and cannot keep the acceleration and
+jerk limits after it. This holds for every planner on the trajectory optimizer, including
+`MotionPlanner.plan_pose`, `plan_cspace` and `plan_pose_waypoints`. Leaving the acceleration
+out plans more reliably but starts the trajectory with an acceleration step that the
+controller has to absorb. The {ref}`measured results <waypoint_planner_moving_starts>` compare
+both planners from moving starts.
 
 ## Diagnose a failed plan
 

@@ -60,6 +60,10 @@
   single-goal mode that reproduces the terminal/path criteria of the upstream cost. After
   a via-point plan the IK criteria return to their configured values rather than to
   generic defaults.
+- `ViaPointMotionPlanner.plan_waypoints` plans from a moving start: the trajectory starts
+  with the current velocity and acceleration. A start with nonzero acceleration usually
+  fails, as with every planner on the trajectory optimizer.
+  `benchmark/via_point_moving_start_benchmark.py` compares it with `plan_pose_waypoints`.
 - Choose globally shortest IK chains in the waypoint planners. Both planners add the
   full-turn variants (`q ± 2π`) of IK solutions for joints whose limits span more
   than one turn (`expand_revolutions`), so a joint is not turned into its limit at
@@ -98,6 +102,10 @@
 
 ### Bug Fixes & Misc.
 
+- Evaluate the seed time scaling of trajectory optimization at `minimum_trajectory_dt`
+  instead of 1 s. From a moving start, the boundary velocity and acceleration displaced the
+  spline at the large evaluation dt, so the initial dt saturated at `maximum_trajectory_dt`.
+  Starts at rest get the same dt as before.
 - Require `warp-lang>=1.13.0`: the collision kernels pass `module_options` to
   `wp.kernel`, which older Warp versions reject with a `TypeError`.
 - Honor `self_collision_check=False` during solver validation as well as optimization.

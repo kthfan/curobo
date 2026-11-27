@@ -139,6 +139,45 @@ waypoints, 20 paths each (180 paths):
 
 Ranges are over the three seeds.
 
+(waypoint_planner_moving_starts)=
+
+## Moving starts
+
+`benchmark/via_point_moving_start_benchmark.py` with the defaults: 12 problems of 3 random
+waypoints per robot (the paths of `via_point_benchmark.py`). Every problem plans a first path
+from the home state and starts the second path at 30% of that trajectory. In a sample of
+eight such Franka states, a joint moved at up to 87% of its velocity limit and accelerated at
+up to 91% of its acceleration limit. The synthetic starts move from the home state at the given fraction of the velocity
+limit in a random direction, without acceleration. `plan_pose_waypoints` follows the line
+between the waypoints with a loose path tolerance (0.5 m, 3 rad).
+
+| Start | Franka, via-point | Franka, `plan_pose_waypoints` | UR10e, via-point | UR10e, `plan_pose_waypoints` |
+| --- | --- | --- | --- | --- |
+| Rest | 12 of 12, 1.35 s | 12 of 12, 1.18 s | 12 of 12, 1.34 s | 12 of 12, 1.18 s |
+| Synthetic, 10% | 12 of 12, 2.46 s | 12 of 12, 1.35 s | 12 of 12, 2.43 s | 12 of 12, 1.44 s |
+| Synthetic, 30% | 8 of 12, 3.00 s | 11 of 12, 1.60 s | 11 of 12, 2.94 s | 8 of 12, 2.56 s |
+| Synthetic, 50% | 8 of 12, 3.09 s | 4 of 12, 2.51 s | 8 of 12, 3.50 s | 5 of 12, 3.41 s |
+| Mid-trajectory, velocity only | 8 of 12, 3.45 s | 6 of 12, 1.55 s | 10 of 12, 2.80 s | 10 of 12, 2.65 s |
+| Mid-trajectory, velocity and acceleration | 0 of 12 | 0 of 12 | 0 of 12 | 0 of 12 |
+
+Each cell gives the successes and the mean motion time of the successful plans. From a moving
+start the via-point planner takes longer to plan (a mean of up to 0.8 s on the Franka) and
+gives slower motions than from rest.
+
+A start with nonzero acceleration fails with both planners, and with `MotionPlanner.plan_pose`
+and `plan_cspace` too, because the trajectory optimizer, not the waypoint planning, causes it:
+
+- The cubic B-spline holds the start acceleration constant over the first span, so the velocity
+  grows by the acceleration times the span duration before the optimizer can change it. The
+  trajectory then exceeds the acceleration and jerk limits after that span, by two to four
+  times in the measured cases.
+- Time-optimal retiming of such a trajectory returns NaN, so the dense validation fails.
+
+The optimizer used to estimate the seed's initial time step by evaluating the seed at a 1 s
+step, which a moving start pushed to `maximum_trajectory_dt`; it now evaluates at
+`minimum_trajectory_dt`. On the same problems, the success rates before and after that change
+differ by no more than the run-to-run spread of 12 problems per case.
+
 ## Run the benchmark
 
 ```bash

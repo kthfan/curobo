@@ -78,9 +78,9 @@ Step 3: Understand the pipeline
 
 .. note::
 
-   The trajectory starts at ``start_state``, which must be at rest. In an
-   application, build it from the measured joint positions and reorder it to
-   ``planner.joint_names``.
+   The trajectory starts at ``start_state``, here at rest. In an application,
+   build it from the measured joint positions, and velocities when the robot
+   moves, and reorder it to ``planner.joint_names``.
 
 To learn how the planner chooses one IK solution per waypoint and why the
 whole path is optimized at once, see :ref:`via_point_planner_note`. For more
