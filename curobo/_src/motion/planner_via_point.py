@@ -22,8 +22,10 @@ A plan runs these steps:
    run one trajectory optimization; the waypoints are enforced at their native samples and the
    segment criteria inside the segments, on native and dense validation samples.
 
-The trajectory does not stop at intermediate waypoints. It starts at rest at the current state
-and ends at rest at the last waypoint.
+The trajectory does not stop at intermediate waypoints. It starts at the current state, with its
+velocity and acceleration, and ends at rest at the last waypoint. A start with nonzero
+acceleration usually fails: the trajectory optimizer holds the start acceleration over the
+first spline span and cannot keep the limits after it.
 
 The planner also runs ordinary pose and joint-space plans (:meth:`ViaPointMotionPlanner.plan_pose`,
 :meth:`ViaPointMotionPlanner.plan_cspace`) on the same solvers. Its optimizer costs always read the
@@ -613,7 +615,9 @@ class ViaPointMotionPlanner:
         Args:
             waypoints: Targets ``[1, N, links, 1, 3/4]`` for the planner's tool frames, without
                 the current pose. ``N`` is at most :attr:`max_waypoints`.
-            current_state: Current joint state ``[1, dof]``, at rest.
+            current_state: Current joint state ``[1, dof]``. Its velocity and acceleration,
+                when given, are the trajectory's initial ones; plans from a nonzero
+                acceleration usually fail.
             segment_criteria: ``N`` entries; entry ``k`` maps tool frames to the criteria of
                 segment ``k``. Missing entries and tool frames use the default criteria.
             waypoint_tolerance: Reach tolerance (m, rad) for waypoints whose criteria set no

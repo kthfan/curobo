@@ -192,6 +192,24 @@ def test_plan_reaches_every_waypoint_without_stopping(planner):
 
 
 @cuda
+def test_plan_from_a_moving_start_keeps_its_velocity(planner):
+    """A start velocity is the trajectory's initial velocity; the waypoints are still reached."""
+    start, waypoints = _offsets(planner, [[0.15, 0.0, 0.0], [0.15, 0.2, 0.0], [0.0, 0.2, -0.1]])
+    moving = start.clone()
+    moving.velocity = torch.zeros_like(start.position)
+    moving.velocity[:, 0] = 0.2
+    moving.velocity[:, 3] = -0.2
+    moving.acceleration = torch.zeros_like(start.position)
+    result = planner.plan_waypoints(waypoints, moving)
+    assert result.success.item(), result.status
+    assert result.waypoint_position_error.max() <= 0.005 + 1e-4
+    trajectory = result.get_interpolated_plan()
+    index = [trajectory.joint_names.index(name) for name in planner.joint_names]
+    velocity = trajectory.velocity.reshape(-1, trajectory.velocity.shape[-1])[0, index]
+    torch.testing.assert_close(velocity, moving.velocity.view(-1), atol=1e-4, rtol=0.0)
+
+
+@cuda
 def test_segment_criteria_constrain_only_their_segment(planner):
     """A straight-line segment stays on its line; the free segment before it does not need to."""
     start, home = _home(planner)

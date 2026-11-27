@@ -408,6 +408,67 @@ def test_initial_budget_rejects_partial_cuda_graph_blocks(
         )
 
 
+def _first_seed_dt(
+    solver: TrajOptSolver,
+    monkeypatch: pytest.MonkeyPatch,
+    goal: JointState,
+    start: JointState,
+):
+    """Solve and return the result and the dt the seed time scaling computed first."""
+    calls = []
+    compute = solver.metrics_rollout.compute_time_scaled_dt_from_action
+
+    def spy(*args, **kwargs):
+        out = compute(*args, **kwargs)
+        calls.append(out.detach().clone().view(-1))
+        return out
+
+    monkeypatch.setattr(solver.metrics_rollout, "compute_time_scaled_dt_from_action", spy)
+    result = solver.solve_cspace(goal, start, finetune_attempts=1)
+    monkeypatch.undo()
+    return result, calls[0]
+
+
+def test_seed_dt_at_rest_does_not_depend_on_evaluation_dt(
+    trajopt_solver: TrajOptSolver,
+    sample_start_state: JointState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """From rest, the seed time scaling gives the same dt at any evaluation dt."""
+    goal = sample_start_state.clone()
+    goal.position[:, 0] += 0.3
+    _, small = _first_seed_dt(trajopt_solver, monkeypatch, goal, sample_start_state)
+    ones = trajopt_solver._seed_evaluation_dt(1, trajopt_solver.config.num_seeds).clone()
+    ones.fill_(1.0)
+    monkeypatch.setattr(trajopt_solver, "_seed_evaluation_dt", lambda *_: ones)
+    try:
+        _, large = _first_seed_dt(trajopt_solver, monkeypatch, goal, sample_start_state)
+    finally:
+        monkeypatch.undo()
+    torch.testing.assert_close(small, large, rtol=1e-3, atol=1e-6)
+
+
+def test_moving_start_seed_dt_is_not_saturated(
+    trajopt_solver: TrajOptSolver,
+    sample_start_state: JointState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start velocity does not push the seed dt to maximum_trajectory_dt."""
+    goal = sample_start_state.clone()
+    goal.position[:, 0] += 0.3
+    start = sample_start_state.clone()
+    start.velocity = torch.zeros_like(start.position)
+    start.velocity[:, 1] = 0.5
+    start.acceleration = torch.zeros_like(start.position)
+    result, seed_dt = _first_seed_dt(trajopt_solver, monkeypatch, goal, start)
+    assert bool((seed_dt < 0.5 * trajopt_solver.config.maximum_trajectory_dt).all())
+    assert bool(result.success.any())
+    js = result.js_solution
+    index = [js.joint_names.index(name) for name in trajopt_solver.joint_names]
+    velocity = js.velocity.reshape(-1, *js.velocity.shape[-2:])[0, 0, index]
+    torch.testing.assert_close(velocity, start.velocity.view(-1), atol=1e-4, rtol=0.0)
+
+
 @pytest.mark.parametrize("batched", [False, True])
 def test_payload_updates_refresh_metrics_dynamics(
     cuda_device_cfg: DeviceCfg, batched: bool

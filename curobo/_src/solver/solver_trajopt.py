@@ -87,6 +87,7 @@ class TrajOptSolver:
         self._interpolation_dt_buffer = None
         self._interpolation_buffer_is_validated = False
         self._seed_dt_buffer = None
+        self._seed_evaluation_dt_buffer: Optional[torch.Tensor] = None
         self._dense_reference_progress: Optional[torch.Tensor] = None
         self._dense_reference_counts: Optional[torch.Tensor] = None
         result_processor_config = TrajOptResultProcessorConfig(
@@ -373,6 +374,24 @@ class TrajOptSolver:
     # Goal buffer
     # -------------------------------------------------------------------
 
+    def _seed_evaluation_dt(self, batch_size: int, num_seeds: int) -> torch.Tensor:
+        """Return a ``[batch_size, num_seeds]`` tensor of the dt the seed time scaling uses.
+
+        It holds ``minimum_trajectory_dt`` and keeps its address while the shape is unchanged.
+        """
+        shape = (batch_size, num_seeds)
+        if (
+            self._seed_evaluation_dt_buffer is None
+            or self._seed_evaluation_dt_buffer.shape != shape
+        ):
+            self._seed_evaluation_dt_buffer = torch.full(
+                shape,
+                self.config.minimum_trajectory_dt,
+                device=self.device_cfg.device,
+                dtype=self.device_cfg.dtype,
+            )
+        return self._seed_evaluation_dt_buffer
+
     @get_profiler_decorator("trajopt_solver/_prepare_goal_buffer")
     def _prepare_goal_buffer(
         self,
@@ -633,6 +652,14 @@ class TrajOptSolver:
                 seed_goal_state.dt[:] = dt
 
             if seed_traj is not None or seed_config is not None:
+                if dt is None:
+                    # Evaluate the seed's time scaling at a small dt. For a start at rest the
+                    # required dt does not depend on this value; for a moving start the
+                    # boundary derivatives displace the spline by v*dt and a*dt^2, so a large
+                    # evaluation dt overestimates the required dt up to maximum_trajectory_dt.
+                    seed_goal_state.dt = self._seed_evaluation_dt(
+                        solve_state.batch_size, num_seeds
+                    )
                 goal_buffer, _ = self._prepare_goal_buffer(
                     solve_state,
                     goal_tool_poses,
