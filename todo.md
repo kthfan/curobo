@@ -1,7 +1,8 @@
 # TODO: Exact mesh collision – follow-ups
 
 Handoff notes for the next session. This file and `cpu_verify/` live only on development
-branches (`dev/mesh_followups`); **remove both before merging into `dev/main`**.
+branches (`dev/mesh_followups`, `dev/mesh_success_followups`); **remove both before merging
+into `dev/main`**.
 
 Scope: the exact robot-mesh collision checks (scene and self-collision) in
 `curobo/_src/geom/collision/wp_robot_mesh_*`, `RobotMeshData`, their constraints and solver
@@ -126,9 +127,35 @@ wiring (`mesh_collision_check`, `mesh_self_collision_check`), and the test workf
 
 ## Open items
 
-### Small, ready to do
+### In progress on `dev/mesh_success_followups` (from `dev/main` `a31d7b4`)
 
-None right now.
+The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT postponed.
+
+1. [ ] **Warn about geometry `mesh_only_success` leaves unchecked** (narrowed scope, `1a9939c`):
+   `SolverCoreCfg.mesh_only_checks`, `KinematicsParams.get_sphere_only_link_names`, a solver
+   warning for sphere-only links (and, for the scene check, `mesh_collision_ignored_link_names`),
+   and `AttachmentManager` warnings: an object without mesh (no reserved slots, per-env
+   offsets, `update()` with spheres only) is unchecked under the mode. Attached objects with
+   reserved slots are checked by their mesh (Franka reserves 256). Only `dual_ur10e`
+   (`tool0`, `tool1`) has sphere-only links among the shipped configs. Waiting for the GPU run.
+   Not done (lower value after the narrowing): keep the spheres of mesh-less links in the
+   success check by masking the other spheres' radii.
+2. [ ] **Graph planner (PRM) under the mode**: PRM and RRT check feasibility with the
+   `metrics_base.yml` rollout, spheres only, and ignore even `mesh_collision_check`. Under the
+   mode, IK goals that overlap spheres are "in collision" for the graph planner. Map the
+   feasibility rollout to the mesh config and keep the auxiliary one sphere-based.
+   **RRT postponed until upstream settles** (its projection uses sphere constraint gradients
+   from the auxiliary rollout; feasibility after projection would need the mesh rollout).
+3. [ ] **Narrow-space failures from spheres larger than meshes** (no mesh gradient): build a
+   slot benchmark (gap between mesh and sphere width), then try A: shrink the optimizer's
+   sphere cost radii under the mode (quick), and B: shrink spheres to the meshes with
+   `SphereCoverage` and refill with `cover_meshes`. C (gate sphere cost by mesh distance) and D
+   (particle refinement on mesh distance) were judged worse.
+4. [ ] **Timing with larger samples**, after 1-3: at least 20 batches per condition, off/on
+   interleaved, warm-up excluded, median and p90, Franka and UR10e, IK and plan.
+
+Environment note: upstream now imports `cuda.core`; the CPU venv needs `cuda-core[cu12]`, and
+Kaggle setup uses `pip install -q -e '.[cu12]'` on top of the warm environment.
 
 ### Postponed (user's decision)
 
@@ -145,9 +172,6 @@ None right now.
 
 ### Blocked on decisions
 
-- [ ] **Links with spheres but no mesh under `mesh_only_success`**: their spheres no longer
-  decide success; warn or document. Also: graph planner validation stays sphere-based.
-- [ ] **Graph planner ignores meshes** (benchmark). Scheduled after the mode above.
 - [ ] **MPC executes infeasible actions.** Handled on another branch; reference only.
 
 ### Noted for later (user's decision)
@@ -192,5 +216,6 @@ None right now.
   4493 passed, 38 skipped).
 - `dev/improve_mesh`, `dev/mesh_self_collision`, `dev/improve_decimation`,
   `dev/split_mesh_ignore`, `dev/faster_tests`: fully merged into `dev/main`; can be deleted.
-- `dev/mesh_followups`: this handoff branch (`todo.md`, `cpu_verify/`). Start follow-up work
+- `dev/mesh_success_followups`: current work (see "In progress").
+- `dev/mesh_followups`: previous handoff branch (`todo.md`, `cpu_verify/`). Start follow-up work
   from it, or from `dev/main` on a new branch that copies these two.
