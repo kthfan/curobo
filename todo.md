@@ -141,10 +141,15 @@ The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT 
    (94 tests: attachment manager, mesh end-to-end, solver cfg). Full suite not run yet.
    Not done (lower value after the narrowing): keep the spheres of mesh-less links in the
    success check by masking the other spheres' radii.
-2. [ ] **Graph planner (PRM) under the mode**: PRM and RRT check feasibility with the
-   `metrics_base.yml` rollout, spheres only, and ignore even `mesh_collision_check`. Under the
-   mode, IK goals that overlap spheres are "in collision" for the graph planner. Map the
-   feasibility rollout to the mesh config and keep the auxiliary one sphere-based.
+2. [x] **Graph planner (PRM) under the mode** (`4a5cb00`, test fix `HEAD`): with
+   `mesh_only_success` and `graph_planner_algorithm="prm"`, `MotionPlannerCfg.create` passes
+   the PRM a rollout from `mesh_only_success_rollout` (mesh constraints in, replaced sphere
+   constraints out). PRM's auxiliary rollout only computes states and bounds, so both PRM
+   rollouts use it. Without the mode PRM is unchanged (spheres only, even with
+   `mesh_collision_check`). RRT plus the mode logs a warning. Targeted GPU runs passed (228 +
+   25 tests). Graph planner cost with the mesh check not measured yet (belongs to step 4).
+   Noted: `PRMGraphPlannerCfg.create` accepts `self_collision_check` but never uses it
+   (upstream).
    **RRT postponed until upstream settles** (its projection uses sphere constraint gradients
    from the auxiliary rollout; feasibility after projection would need the mesh rollout).
 3. [ ] **Narrow-space failures from spheres larger than meshes** (no mesh gradient): build a
