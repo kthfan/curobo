@@ -6,8 +6,11 @@
 Franka holds a flat tool (``--tool_dims``, default 50 x 10 x 200 mm) below its fingers, along
 the hand's z axis. The tool is attached with
 :meth:`~curobo._src.collision.attachment_manager.AttachmentManager.attach`, which fits
-``--num_spheres`` spheres and writes the tool mesh for the exact mesh check. Few spheres are
-cheap but much larger than the tool; many small spheres follow it closely.
+the tool mesh for the exact mesh check, and then gets one of the ``--sphere_sets``:
+
+- ``coverN``: N spheres along the tool axis, each just large enough to cover its segment of the
+  tool. Few spheres are cheap but stick out of the thin side by far.
+- ``morphitN``: N spheres fitted by MorphIt (what ``attach`` fits by default).
 
 Scenarios, at each mesh clearance ``c`` (the gap between the tool mesh and the obstacles):
 
@@ -104,8 +107,29 @@ def make_planner(robot: Dict, mesh_only_success: bool, args) -> MotionPlanner:
     return planner
 
 
-def attach_tool(planner: MotionPlanner, num_spheres: int, args) -> torch.Tensor:
-    """Attach the tool with ``num_spheres`` spheres; returns them in the hand frame ``[n, 4]``."""
+def cover_spheres(count: int, args) -> torch.Tensor:
+    """``count`` spheres along the tool axis covering the tool, in the tool frame ``[n, 4]``."""
+    width, thickness, length = args.tool_dims
+    segment = length / count
+    radius = 0.5 * math.sqrt(width**2 + thickness**2 + segment**2)
+    z = -0.5 * length + segment * (np.arange(count) + 0.5)
+    spheres = np.zeros((count, 4), dtype=np.float32)
+    spheres[:, 2] = z
+    spheres[:, 3] = radius
+    return torch.as_tensor(spheres, device=DeviceCfg().device)
+
+
+def parse_sphere_set(name: str) -> Tuple[str, int]:
+    """Split ``cover4`` into ``("cover", 4)``."""
+    for kind in ("cover", "morphit"):
+        if name.startswith(kind):
+            return kind, int(name[len(kind) :])
+    raise ValueError(f"unknown sphere set {name}")
+
+
+def attach_tool(planner: MotionPlanner, sphere_set: str, args) -> torch.Tensor:
+    """Attach the tool with a sphere set; returns the spheres in the hand frame ``[n, 4]``."""
+    kind, count = parse_sphere_set(sphere_set)
     manager = planner.attachment_manager
     manager.detach()
     planner.update_world(SceneCfg(cuboid=[TABLE]))
@@ -116,13 +140,17 @@ def attach_tool(planner: MotionPlanner, num_spheres: int, args) -> torch.Tensor:
     hand = Pose(position=hand.position.view(1, 3), quaternion=hand.quaternion.view(1, 4))
     local = Pose.from_list([0.0, 0.0, args.tool_center, 1.0, 0.0, 0.0, 0.0], DeviceCfg())
     tool = Cuboid(name="tool", pose=[0, 0, 0, 1, 0, 0, 0], dims=list(args.tool_dims))
+    offset = hand.multiply(local)
     manager.attach(
         state,
         [tool],
-        num_spheres=num_spheres,
+        num_spheres=count,
         sphere_fit_type=SphereFitType.MORPHIT,
-        world_objects_pose_offset=hand.multiply(local),
+        world_objects_pose_offset=offset,
     )
+    if kind == "cover":
+        # Keep the mesh attach() wrote; replace its spheres.
+        manager.update(cover_spheres(count, args), state, world_objects_pose_offset=offset)
     kparams = planner.kinematics.config.kinematics_config
     index = kparams.get_sphere_index_from_link_name("attached_object")
     spheres = kparams.link_spheres[0, index]
@@ -252,8 +280,33 @@ def case_scene(case: Dict, scenario: str, clearance: float, gripper_tip: float, 
     ]
 
 
-def plan(planner: MotionPlanner, case: Dict, scenario: str, args) -> Tuple[bool, float]:
-    """Plan one case; returns success and time in ms."""
+def failure_reason(result) -> str:
+    """Why a plan failed: no result, or the best seed's unmet tolerances and constraints."""
+    if result is None:
+        return "no_result"
+    metrics = getattr(result, "metrics", None)
+    if metrics is None:
+        return "no_metrics"
+    reasons = []
+    best = int(result.seed_rank.view(-1)[0]) if result.seed_rank is not None else 0
+    num_seeds = metrics.convergence.values[0].shape[0]
+    for name, values in zip(metrics.convergence.names, metrics.convergence.values):
+        last = values[:, -1].reshape(num_seeds, -1)[best]
+        if "position_tolerance" in name and bool((last >= result.position_tolerance).any()):
+            reasons.append("position")
+        elif "orientation_tolerance" in name and bool(
+            (last >= result.orientation_tolerance).any()
+        ):
+            reasons.append("orientation")
+    constraints = metrics.costs_and_constraints.constraints
+    for name, values in zip(constraints.names, constraints.values):
+        if bool(values.reshape(num_seeds, -1)[best].sum() > 0.0):
+            reasons.append(name)
+    return "+".join(reasons) or "other"
+
+
+def plan(planner: MotionPlanner, case: Dict, scenario: str, args) -> Tuple[bool, float, str]:
+    """Plan one case; returns success, time in ms and the failure reason."""
     start = JointState.from_position(case["q_start"].clone(), joint_names=planner.joint_names)
     goal = goal_from(case["position"], case["rotation"], planner)
     t0 = time.perf_counter()
@@ -271,7 +324,14 @@ def plan(planner: MotionPlanner, case: Dict, scenario: str, args) -> Tuple[bool,
         )
     torch.cuda.synchronize()
     elapsed = 1000.0 * (time.perf_counter() - t0)
-    return result is not None and bool(result.success.any()), elapsed
+    success = result is not None and bool(result.success.any())
+    reason = ""
+    if not success:
+        try:
+            reason = failure_reason(result)
+        except Exception as error:  # Diagnosis only: never fail the benchmark on it.
+            reason = f"unknown ({type(error).__name__})"
+    return success, elapsed, reason
 
 
 def tool_sphere_stats(spheres: torch.Tensor, args) -> Dict[str, float]:
@@ -293,7 +353,9 @@ def main() -> None:
     """Run both scenarios for each sphere count and clearance, in both modes."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=SCENARIOS)
-    parser.add_argument("--num_spheres", type=int, nargs="+", default=[3, 30])
+    parser.add_argument(
+        "--sphere_sets", nargs="+", default=["cover4", "cover8", "morphit30"]
+    )
     parser.add_argument("--clearances", type=float, nargs="+", default=[0.005, 0.01, 0.02])
     parser.add_argument("--tool_dims", type=float, nargs=3, default=[0.05, 0.01, 0.2])
     parser.add_argument(
@@ -317,27 +379,27 @@ def main() -> None:
     init_warp(device_cfg=DeviceCfg())
     rng = np.random.default_rng(args.seed)
 
-    robot = tool_robot(max(args.num_spheres))
+    robot = tool_robot(max(parse_sphere_set(name)[1] for name in args.sphere_sets))
     planners = {mode: make_planner(robot, mode, args) for mode in (False, True)}
     reference = planners[False]
     gripper_tip = float(end_link_vertices(robot, GRIPPER_LINKS, "panda_hand")[:, 2].max())
 
     # The same cases for every sphere count, solved with the many-sphere tool.
-    attach_tool(reference, max(args.num_spheres), args)
+    attach_tool(reference, args.sphere_sets[-1], args)
     all_cases = {s: sample_cases(reference, s, args, rng) for s in args.scenarios}
     print({s: len(c) for s, c in all_cases.items()}, "cases", flush=True)
 
     rows = []
-    for num_spheres in args.num_spheres:
-        spheres = {mode: attach_tool(p, num_spheres, args) for mode, p in planners.items()}
+    for sphere_set in args.sphere_sets:
+        spheres = {mode: attach_tool(p, sphere_set, args) for mode, p in planners.items()}
         fit = tool_sphere_stats(spheres[False], args)
-        print(f"{num_spheres} requested spheres: {fit}", flush=True)
+        print(f"{sphere_set}: {fit}", flush=True)
         for scenario in args.scenarios:
             cases = all_cases[scenario]
             for clearance in args.clearances:
                 row = {
                     "scenario": scenario,
-                    "requested_spheres": num_spheres,
+                    "sphere_set": sphere_set,
                     **fit,
                     "clearance_mm": 1000.0 * clearance,
                 }
@@ -370,9 +432,12 @@ def main() -> None:
                     row["sphere_clearance_mm"] = 1000.0 * float(np.median(sphere_clear))
                     for mode, values in results.items():
                         tag = "meshes" if mode else "spheres"
-                        values = np.asarray(values, dtype=np.float64)
-                        row[f"plan_{tag}_%"] = 100.0 * float(values[:, 0].mean())
-                        row[f"plan_{tag}_ms"] = float(np.median(values[:, 1]))
+                        row[f"plan_{tag}_%"] = 100.0 * float(np.mean([v[0] for v in values]))
+                        row[f"plan_{tag}_ms"] = float(np.median([v[1] for v in values]))
+                        failures = [v[2] for v in values if not v[0]]
+                        row[f"failures_{tag}"] = {
+                            reason: failures.count(reason) for reason in sorted(set(failures))
+                        }
                 rows.append(row)
                 print(row, flush=True)
 
@@ -390,7 +455,8 @@ def main() -> None:
     ]
     for r in rows:
         prefix = (
-            f"| {r['scenario']} | {r['num_spheres']} | {r['max_radius_mm']:.0f} | "
+            f"| {r['scenario']} | {r['sphere_set']} ({r['num_spheres']}) | "
+            f"{r['max_radius_mm']:.0f} | "
             f"{r['max_protrusion_mm']:.0f} | {r['clearance_mm']:.0f} | {r['goals']} | "
         )
         if not r["goals"]:
@@ -400,6 +466,15 @@ def main() -> None:
             prefix + f"{r['sphere_clearance_mm']:.1f} | {r['plan_spheres_%']:.0f} | "
             f"{r['plan_meshes_%']:.0f} | {r['plan_spheres_ms']:.0f} | {r['plan_meshes_ms']:.0f} |"
         )
+    lines += ["", "Failure reasons of the best seed (count):", ""]
+    for r in rows:
+        for tag in ("spheres", "meshes"):
+            failures = r.get(f"failures_{tag}")
+            if failures:
+                lines.append(
+                    f"- {r['scenario']}, {r['sphere_set']}, {r['clearance_mm']:.0f} mm, "
+                    f"{tag} decide: {failures}"
+                )
     text = "\n".join(lines)
     print(text)
     if args.save_path is not None:
