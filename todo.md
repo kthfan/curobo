@@ -184,6 +184,10 @@ The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT 
      44-48 ms in both.
    - A 2 mm path tolerance failed `path_valid` even at 50 mm clearance in the smoke run, so it
      is a waypoint-planner limit, not a collision one.
+   Same run on unmodified `dev/main` (`a31d7b4`, same cases): insert identical; beside with
+   cover4/cover8 at 5-10 mm 85-90 % (7 `collision_valid` in 120) vs 100 % here, because the
+   `dev/main` PRM still validates with the spheres. So the PRM change (item 2) is what the
+   beside rows need. Report: `reports/mesh_attached_tool_benchmark.md` (branch only).
    So for this tool a few large spheres plus `mesh_only_success` suffice; A/B are not needed
    for it. Margin 0 lets the mesh touch; a few mm of mesh margin is advisable in practice.
 4. [ ] **Timing with larger samples**, after 1-3: at least 20 batches per condition, off/on

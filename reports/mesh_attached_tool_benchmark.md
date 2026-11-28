@@ -33,9 +33,9 @@
 |---|---|---|---|
 | cover4 | 4 | 36 | 31 |
 | cover8 | 8 | 28 | 23 |
-| morphit30 | 30 | 14–16 | 9–11 |
+| morphit30 | 30 | 13–16 | 9–11 |
 
-MORPHIT 有隨機性，兩次執行的最大半徑分別是 14 與 16 mm。
+MORPHIT 有隨機性，各次執行的最大半徑在 13–16 mm 之間；cover 組每次都一樣。
 
 ### 情境
 
@@ -102,6 +102,35 @@ sphere 間隙是起點與終點上，sphere 到障礙物最近距離的中位數
 | insert | 50–52（多半是很早就失敗） | 64–72 |
 | beside | 44–47（有兩列 228、241：改走 PRM 後仍失敗） | 44–48 |
 
+## 是否需要這個分支的程式修改
+
+同一個 benchmark 在未修改的 `dev/main`（`a31d7b4`）上又跑了一次。
+環境與案例都相同：cover 組的 sphere 間隙逐列一致。
+`mesh_only_success` 本身已經在 `dev/main`；這個分支多了兩項修改：
+
+1. 對 `mesh_only_success` 沒檢查到的幾何（有球沒 mesh 的連結、沒有 mesh 的夾持物）發出警告。只有警告，不影響成功率。
+2. PRM 在 `mesh_only_success` 下改用 mesh 驗證路徑（`MotionPlannerCfg.create` 與 `mesh_only_success_rollout`）。
+   在 `dev/main` 上，PRM 即使開了這個模式，仍用 sphere 驗證。
+
+mesh 判定的成功率 (%)，c = 5 / 10 / 20 mm，路徑容差 5 mm：
+
+| 情境 | 球組 | `dev/main` | 本分支 |
+|---|---|---|---|
+| insert | cover4 | 100 / 100 / 100 | 100 / 100 / 100 |
+| insert | cover8 | 90 / 100 / 100 | 90 / 100 / 100 |
+| insert | morphit30 | 100 / 100 / 100 | 100 / 100 / 100 |
+| beside | cover4 | **85** / 100 / 100 | 100 / 100 / 100 |
+| beside | cover8 | **90 / 90** / 100 | 100 / 100 / 100 |
+| beside | morphit30 | 100 / 100 / 100 | 100 / 100 / 100 |
+
+路徑容差 10 mm 的 insert，兩邊都是全部 100 %。sphere 判定的成功率在兩邊相同。
+
+- **insert**：`dev/main` 就已經 100 %，只靠 `mesh_only_success` 即可。
+- **beside**：`dev/main` 在 `cover4` / `cover8`、5–10 mm 時失敗 7 次（120 次中）；本分支 0 次。
+  原因都是 `collision_valid`：直接最佳化沒成功後改走 PRM，而 `dev/main` 的 PRM 用 sphere 驗證，
+  起點與終點附近的大球一碰到牆就被否決。
+  每列只有 20 個案例，但 7 次對 0 次的方向一致，而且符合這項修改的作用。
+
 ## 另外的發現
 
 - **路徑容差**：先前的短測中，2 mm 路徑容差即使在 50 mm 間隙下也全部 `path_valid` 失敗。
@@ -111,6 +140,7 @@ sphere 間隙是起點與終點上，sphere 到障礙物最近距離的中位數
 ## 結論
 
 - 少量大球加上 `mesh_only_success`，在 5–20 mm 的插孔與貼牆情境下，成功率 90–100 %。
+- 插孔：`dev/main` 已達到。起點與終點在障礙物旁、需要 PRM 時，要再加上這個分支的 PRM 修改。
 - 只要球碰到障礙物，sphere 判定就是 0 %。
 - 縮小最佳化用的 sphere（A）或把 sphere 擬合在 mesh 內（B），對這個工具不需要。
 
