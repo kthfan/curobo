@@ -372,7 +372,7 @@ def main() -> None:
     parser.add_argument("--depth", type=float, default=0.05, help="Insertion depth (m).")
     parser.add_argument("--wall", type=float, default=0.03, help="Slab thickness (m).")
     parser.add_argument("--start_gap", type=float, default=0.01)
-    parser.add_argument("--path_tolerance", type=float, default=0.002)
+    parser.add_argument("--path_tolerance", type=float, default=0.005)
     parser.add_argument("--num_goals", type=int, default=20)
     parser.add_argument("--margin", type=float, default=0.0)
     parser.add_argument("--max_attempts", type=int, default=4)
