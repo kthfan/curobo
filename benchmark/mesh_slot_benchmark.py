@@ -17,11 +17,12 @@ clear them by ``clearance``:
 - ``y``: two plates across the tool y axis (Franka: the finger direction),
 - ``pocket``: all four.
 
-The plates cover the end links from ``clearance`` below their top (toward the arm) to past
-their tip. The true mesh clearance of the goal configuration is measured with the exact mesh
-distance query; goals where another link comes closer than ``clearance`` are dropped. Plans
-start from a configuration ``--approach`` meters straight above the goal, chosen as the IK
-solution closest to the goal configuration.
+The plates reach from past the end links' tip up to ``clearance`` below the top of the end
+links, or below the rigid links above them, whichever is lower (toward the tip). The true
+mesh clearance of the goal configuration is measured with the exact mesh distance query;
+goals where another link comes closer than ``clearance`` are dropped. Plans start from a
+configuration ``--approach`` meters straight above the goal, chosen as the IK solution closest
+to the goal configuration.
 
 Both exact mesh checks are on in both modes, with margin ``--margin``. The graph planner is
 PRM, which validates with the meshes under ``mesh_only_success``.
@@ -57,10 +58,16 @@ from curobo._src.util.logging import setup_curobo_logger
 from curobo._src.util.warp import init_warp
 from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml, write_yaml
 
-#: Base link (left out of the mesh scene check: it sits on the table) and end links per robot.
+#: Per robot: base link (left out of the mesh scene check: it sits on the table), end links
+#: that the slot surrounds, and links rigid with the tool frame above them that the plates
+#: must stay below (Franka's ``panda_link7`` is wider than the hand and overlaps its top).
 ROBOTS = {
-    "franka.yml": ("panda_link0", ["panda_hand", "panda_leftfinger", "panda_rightfinger"]),
-    "ur10e.yml": ("base_link", ["wrist_3_link"]),
+    "franka.yml": (
+        "panda_link0",
+        ["panda_hand", "panda_leftfinger", "panda_rightfinger"],
+        ["panda_link7"],
+    ),
+    "ur10e.yml": ("base_link", ["wrist_3_link"], []),
 }
 SLOT_KINDS = ("x", "y", "pocket")
 PLATE_THICKNESS = 0.02
@@ -102,7 +109,12 @@ def end_link_vertices(robot: Dict, end_links: List[str], tool_frame: str) -> np.
 
 
 def slot_plates(
-    position: np.ndarray, rotation: np.ndarray, extents: np.ndarray, kind: str, clearance: float
+    position: np.ndarray,
+    rotation: np.ndarray,
+    extents: np.ndarray,
+    kind: str,
+    clearance: float,
+    top: float,
 ) -> List[Cuboid]:
     """Plates around the end links of a tool at ``position``, ``rotation`` (world frame).
 
@@ -112,10 +124,12 @@ def slot_plates(
         extents: End-link bounds in the tool frame, ``[[x, y, z] min, [x, y, z] max]``.
         kind: ``"x"``, ``"y"`` or ``"pocket"``.
         clearance: Gap between the end-link meshes and the plates, in meters.
+        top: Tool-frame z the plates must stay ``clearance`` below (toward the tip) to clear
+            the links above the end links.
     """
     low, high = extents
     t = PLATE_THICKNESS
-    z_low = low[2] + clearance
+    z_low = max(low[2], top) + clearance
     z_high = high[2] + PLATE_OVERHANG
     z_center, z_dim = 0.5 * (z_low + z_high), z_high - z_low
     center = 0.5 * (low + high)
@@ -265,17 +279,21 @@ def run_case(
 
 def bench_robot(robot_file: str, args, rng: np.random.Generator) -> Tuple[List[Dict], List[str]]:
     """All slot kinds and clearances for one robot."""
-    base_link, end_links = ROBOTS[robot_file]
+    base_link, end_links, cap_links = ROBOTS[robot_file]
     robot = load_robot(robot_file, base_link)
     planners = {mode: make_planner(robot, mode, args) for mode in (False, True)}
     reference = planners[False]
     tool_frame = reference.kinematics.tool_frames[0]
     vertices = end_link_vertices(robot, end_links, tool_frame)
     extents = np.stack([vertices.min(axis=0), vertices.max(axis=0)])
+    top = -np.inf
+    if cap_links:
+        top = float(end_link_vertices(robot, cap_links, tool_frame)[:, 2].max())
     goals = sample_goals(reference, extents, args, rng)
     print(
         f"{robot_file}: end-link bounds in {tool_frame} (mm) "
-        f"{np.round(1000 * extents, 1).tolist()}, {len(goals)} goals",
+        f"{np.round(1000 * extents, 1).tolist()}, plates start at z = "
+        f"{1000 * max(extents[0][2], top):.1f} mm + clearance, {len(goals)} goals",
         flush=True,
     )
 
@@ -288,7 +306,7 @@ def bench_robot(robot_file: str, args, rng: np.random.Generator) -> Tuple[List[D
             dropped = 0
             for goal in goals:
                 plates = slot_plates(
-                    goal["position"], goal["rotation"], extents, kind, clearance
+                    goal["position"], goal["rotation"], extents, kind, clearance, top
                 )
                 scene = SceneCfg(cuboid=[TABLE, *plates])
                 reference.update_world(scene)
