@@ -274,9 +274,7 @@ def case_scene(case: Dict, scenario: str, clearance: float, gripper_tip: float, 
             gripper_tip,
             args,
         ),
-        wall_beside(
-            "wall_goal", case["position"], case["rotation"], clearance, gripper_tip, args
-        ),
+        wall_beside("wall_goal", case["position"], case["rotation"], clearance, gripper_tip, args),
     ]
 
 
@@ -361,9 +359,7 @@ def main() -> None:
     """Run both scenarios for each sphere count and clearance, in both modes."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS), choices=SCENARIOS)
-    parser.add_argument(
-        "--sphere_sets", nargs="+", default=["cover4", "cover8", "morphit30"]
-    )
+    parser.add_argument("--sphere_sets", nargs="+", default=["cover4", "cover8", "morphit30"])
     parser.add_argument("--clearances", type=float, nargs="+", default=[0.005, 0.01, 0.02])
     parser.add_argument("--tool_dims", type=float, nargs=3, default=[0.05, 0.01, 0.2])
     parser.add_argument(

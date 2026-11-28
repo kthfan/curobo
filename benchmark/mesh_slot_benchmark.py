@@ -373,9 +373,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--robot_files", nargs="+", default=["franka.yml"], choices=list(ROBOTS))
     parser.add_argument("--kinds", nargs="+", default=list(SLOT_KINDS), choices=SLOT_KINDS)
-    parser.add_argument(
-        "--clearances", type=float, nargs="+", default=[0.005, 0.01, 0.02, 0.03]
-    )
+    parser.add_argument("--clearances", type=float, nargs="+", default=[0.005, 0.01, 0.02, 0.03])
     parser.add_argument("--num_goals", type=int, default=20)
     parser.add_argument("--approach", type=float, default=0.2)
     parser.add_argument("--margin", type=float, default=0.0)

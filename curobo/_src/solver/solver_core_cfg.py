@@ -375,7 +375,8 @@ def mesh_only_collision_checks(
     checks = []
     if has_scene_spheres and uses_mesh_collision(metrics_rollout_dict):
         checks.append("scene")
-    if has_self_spheres and self_collision_check and uses_mesh_self_collision(metrics_rollout_dict):
+    uses_self_mesh = uses_mesh_self_collision(metrics_rollout_dict)
+    if has_self_spheres and self_collision_check and uses_self_mesh:
         checks.append("self-collision")
     return tuple(checks)
 
