@@ -286,7 +286,15 @@ def failure_reason(result) -> str:
         return "no_result"
     metrics = getattr(result, "metrics", None)
     if metrics is None:
-        return "no_metrics"
+        debug = result.debug_info or {}
+        reasons = []
+        terminal = debug.get("terminal_ik_valid")
+        if terminal is not None and not bool(terminal.all()):
+            reasons.append("terminal_ik")
+        for name, mask in debug.get("validation", {}).items():
+            if not bool(mask.reshape(-1)[0]):
+                reasons.append(name)
+        return "+".join(reasons) or "no_metrics"
     reasons = []
     best = int(result.seed_rank.view(-1)[0]) if result.seed_rank is not None else 0
     num_seeds = metrics.convergence.values[0].shape[0]
