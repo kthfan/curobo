@@ -157,6 +157,19 @@ The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT 
    sphere cost radii under the mode (quick), and B: shrink spheres to the meshes with
    `SphereCoverage` and refill with `cover_meshes`. C (gate sphere cost by mesh distance) and D
    (particle refinement on mesh distance) were judged worse.
+   Slot benchmark done: `benchmark/mesh_slot_benchmark.py` (plates around the end links at a
+   set mesh clearance; top-down goals; start 20 cm above; PRM; both mesh checks, margin 0).
+   T4, 20 goals per case:
+   - Franka (hand + fingers): the gripper spheres stay inside the meshes across the slot
+     (sphere clearance 3.4 mm at 5 mm in y, 10.6 mm in x): 100 % in every case and mode. The
+     gripper is not where Franka's spheres are too large.
+   - UR10e (`wrist_3_link`): spheres stick out 17 mm; at 5 and 10 mm the spheres overlap the
+     plates in every goal: IK and plan 0 % with the spheres deciding, IK 100 % and plan
+     95-100 % with `mesh_only_success`. At 20 mm (sphere clearance 1 mm) the pocket plans fail
+     with the spheres (0 %, 855 ms) and succeed with the meshes (100 %, 430 ms).
+   - Plan time is the same in both modes (about 450-480 ms).
+   So the mode already handles goals inside a slot; A/B would matter only when the spheres
+   block the optimizer elsewhere along the path (a passage mid-path, larger links in the gap).
 4. [ ] **Timing with larger samples**, after 1-3: at least 20 batches per condition, off/on
    interleaved, warm-up excluded, median and p90, Franka and UR10e, IK and plan.
 
