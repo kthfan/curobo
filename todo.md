@@ -170,6 +170,22 @@ The user's order after the evaluation of 2026-11-27: 1 -> 2 -> 4 -> 3, with RRT 
    - Plan time is the same in both modes (about 450-480 ms).
    So the mode already handles goals inside a slot; A/B would matter only when the spheres
    block the optimizer elsewhere along the path (a passage mid-path, larger links in the gap).
+   Attached-tool benchmark (the user's scenario): `benchmark/mesh_attached_tool_benchmark.py`,
+   Franka holding a 50 x 10 x 200 mm tool, PRM, both mesh checks, margin 0, 20 cases per row,
+   T4. Sphere sets: cover4 (r 36 mm, sticks out 31 mm), cover8 (r 28, 23 mm), MORPHIT 30 (r
+   14-16, 9-11 mm). Insert: `plan_pose_waypoints` straight down 50 mm into a slab hole (tool +
+   2c) from 10 mm above. Beside: `plan_pose` with start and goal next to a wall at c.
+   - Spheres deciding: 0 % whenever the spheres overlap the obstacles (cover4 and cover8 at
+     5/10/20 mm, MORPHIT 30 at 5 mm; mostly `no_result`, i.e. the start or goal IK fails); 100 %
+     only for MORPHIT 30 at 10-20 mm.
+   - Meshes deciding (`mesh_only_success`): 100 % in every row except insert, cover8, 5 mm at a
+     5 mm path tolerance (90 %, two `path_valid`); 100 % at a 10 mm tolerance.
+   - Time: insert 66-72 ms with meshes vs 51 ms with spheres (the spheres fail early); beside
+     44-48 ms in both.
+   - A 2 mm path tolerance failed `path_valid` even at 50 mm clearance in the smoke run, so it
+     is a waypoint-planner limit, not a collision one.
+   So for this tool a few large spheres plus `mesh_only_success` suffice; A/B are not needed
+   for it. Margin 0 lets the mesh touch; a few mm of mesh margin is advisable in practice.
 4. [ ] **Timing with larger samples**, after 1-3: at least 20 batches per condition, off/on
    interleaved, warm-up excluded, median and p90, Franka and UR10e, IK and plan.
 
